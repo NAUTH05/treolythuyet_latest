@@ -589,7 +589,17 @@ function startPairForQueue(queue) {
   });
 
   sessions.set(sessionId, session);
-  session.start();
+  session.start().catch((err) => {
+    addLog({
+      timestamp: formatVN(new Date()),
+      account: queue.account.name,
+      msg: `❌ Lỗi khởi động session: ${err.message}`,
+      level: 'error',
+    });
+    queue.status = 'error';
+    queue.completedAt = new Date().toISOString();
+    updateQueue(queue);
+  });
 
   addLog({
     timestamp: new Date().toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }),

@@ -471,32 +471,32 @@ class BotSession extends EventEmitter {
   async start() {
     this.log(`🚀 Khởi động bot cho ${this.account.name} - ${this.lessonUrls.length} bài`, 'info');
 
-    this.browser = await chromium.launch({
-      headless: this.options.headless,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-      ],
-    });
-
-    this.context = await this.browser.newContext({
-      viewport: { width: 1366, height: 768 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      locale: 'vi-VN',
-      timezoneId: 'Asia/Ho_Chi_Minh',
-    });
-
-    await this.context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
-    });
-
-    this.page = await this.context.newPage();
-
     try {
+      this.browser = await chromium.launch({
+        headless: this.options.headless,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+        ],
+      });
+
+      this.context = await this.browser.newContext({
+        viewport: { width: 1366, height: 768 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        locale: 'vi-VN',
+        timezoneId: 'Asia/Ho_Chi_Minh',
+      });
+
+      await this.context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+      });
+
+      this.page = await this.context.newPage();
+
       await this.login();
 
       const startIdx = this.options.startLessonIndex || 0;
@@ -532,7 +532,7 @@ class BotSession extends EventEmitter {
     } catch (err) {
       this.status = 'error';
       this.errorMsg = err.message;
-      this.log(`❌ Lỗi: ${err.message}`, 'error');
+      this.log(`❌ Lỗi khởi động Playwright: ${err.message}. (Gợi ý: Chạy 'npx playwright install chromium' trên VPS)`, 'error');
       this.emit('status', this.getStatus());
     } finally {
       await this.stop();
