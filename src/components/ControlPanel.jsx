@@ -207,7 +207,7 @@ export default function ControlPanel({ accounts, onStart }) {
 
   return (
     <div className="card">
-      <div className="card-header">🎮 Điều khiển</div>
+      <div className="card-header">Điều khiển</div>
       <div className="card-body">
         <div className="form-group">
           <label>📋 Danh sách Box bài học</label>

@@ -30,24 +30,25 @@ export default function LogPanel({ logs, onClear }) {
 
   return (
     <div className="card log-container">
-      <div className="card-header">
-        📝 Log
+      <div className="card-header" style={{ display: 'flex', alignItems: 'center' }}>
+        Nhật ký hệ thống
         <div style={{ display: 'flex', gap: 8, marginLeft: 'auto', alignItems: 'center' }}>
           <select
             value={filterAccount}
             onChange={e => setFilterAccount(e.target.value)}
             style={{
               padding: '4px 10px',
-              background: 'var(--surface2)',
+              background: 'var(--surface)',
               border: '1px solid var(--border)',
-              borderRadius: '6px',
+              borderRadius: '4px',
               color: 'var(--text)',
-              fontSize: '12px',
+              fontSize: '11px',
               cursor: 'pointer',
               outline: 'none',
+              fontFamily: 'inherit',
             }}
           >
-            <option value="">👥 Tất cả tài khoản</option>
+            <option value="">Tất cả tài khoản</option>
             {accountList.map(a => (
               <option key={a} value={a}>{a}</option>
             ))}
@@ -58,7 +59,7 @@ export default function LogPanel({ logs, onClear }) {
       <div className="card-body" style={{ padding: 12 }}>
         <div className="log-box" ref={boxRef}>
           {filteredLogs.length === 0 ? (
-            <div style={{ color: '#555', textAlign: 'center', padding: '20px 0' }}>Chưa có log{filterAccount ? ` cho ${filterAccount}` : ''}</div>
+            <div style={{ color: 'var(--text2)', textAlign: 'center', padding: '20px 0', fontSize: 12 }}>Chưa có log{filterAccount ? ` cho ${filterAccount}` : ''}</div>
           ) : (
             filteredLogs.map((entry, i) => (
               <div key={i} className="log-line">

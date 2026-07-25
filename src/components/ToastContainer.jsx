@@ -1,8 +1,8 @@
 export default function ToastContainer({ toasts }) {
-  const borderColors = {
-    success: 'var(--success)',
-    error: 'var(--danger)',
-    info: 'var(--primary)',
+  const styles = {
+    success: { background: '#1a1a1a', borderLeftColor: '#1a6640' },
+    error:   { background: '#1a1a1a', borderLeftColor: '#b83232' },
+    info:    { background: '#1a1a1a', borderLeftColor: '#2e7fc1' },
   };
 
   return (
@@ -11,7 +11,7 @@ export default function ToastContainer({ toasts }) {
         <div
           key={t.id}
           className="toast"
-          style={{ borderLeftColor: borderColors[t.type] || 'var(--border)' }}
+          style={styles[t.type] || styles.info}
         >
           {t.msg}
         </div>

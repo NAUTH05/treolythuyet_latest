@@ -19,7 +19,7 @@ function App() {
   const { toasts, toast } = useToast();
   const [accounts, setAccounts] = useState([]);
   const [activeTab, setActiveTab] = useState('dashboard');
-  
+
   // Admin auth state
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(() => {
     return !!sessionStorage.getItem(ADMIN_TOKEN_KEY);
@@ -28,13 +28,13 @@ function App() {
   const handleAdminVerify = (token) => {
     sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
     setIsAdminAuthenticated(true);
-    toast('🔓 Đăng nhập Admin thành công', 'success');
+    toast('Đăng nhập Admin thành công', 'success');
   };
 
   const handleLogout = () => {
     sessionStorage.removeItem(ADMIN_TOKEN_KEY);
     setIsAdminAuthenticated(false);
-    toast('🔑 Đã đăng xuất Admin', 'info');
+    toast('Đã đăng xuất Admin', 'info');
   };
 
   const loadAccounts = useCallback(async () => {
@@ -43,7 +43,7 @@ function App() {
       const data = await api.fetchAccounts();
       setAccounts(data);
     } catch {
-      toast('❌ Không thể tải danh sách tài khoản', 'error');
+      toast('Không thể tải danh sách tài khoản', 'error');
     }
   }, [isAdminAuthenticated, toast]);
 
@@ -55,20 +55,20 @@ function App() {
     try {
       const data = await api.startBot(payload);
       if (data.ok) {
-        toast(`🚀 Đã khởi động ${data.started.length} phiên`, 'success');
+        toast(`Đã khởi động ${data.started.length} phiên`, 'success');
         setActiveTab('queues');
       } else {
-        toast(`❌ ${data.error}`, 'error');
+        toast(data.error, 'error');
       }
     } catch (err) {
-      toast(`❌ Lỗi kết nối: ${err.message}`, 'error');
+      toast(`Lỗi kết nối: ${err.message}`, 'error');
     }
   };
 
   const handleStopAll = async () => {
     if (!window.confirm('Dừng tất cả phiên?')) return;
     await api.stopAll();
-    toast('⏹ Đã dừng tất cả', 'info');
+    toast('Đã dừng tất cả phiên', 'info');
   };
 
   const activeSessionsCount = Object.values(sessions || {}).filter(
@@ -102,17 +102,17 @@ function App() {
         <main className="main-content">
           <header className="top-header">
             <div className="top-header-title">
-              {activeTab === 'dashboard' && '📊 Tổng quan hệ thống'}
-              {activeTab === 'control' && '🎮 Bảng điều khiển Box bài học'}
-              {activeTab === 'accounts' && '👤 Quản lý danh sách tài khoản'}
-              {activeTab === 'queues' && '📋 Tiến độ Hàng chờ & Các phiên đang chạy'}
-              {activeTab === 'logs' && '📜 Nhật ký hoạt động hệ thống (Logs)'}
-              {activeTab === 'settings' && '⚙️ Cấu hình hệ thống & Firebase'}
+              {activeTab === 'dashboard' && 'Tổng quan hệ thống'}
+              {activeTab === 'control' && 'Bảng điều khiển Box bài học'}
+              {activeTab === 'accounts' && 'Quản lý danh sách tài khoản'}
+              {activeTab === 'queues' && 'Tiến độ Hàng chờ & Các phiên đang chạy'}
+              {activeTab === 'logs' && 'Nhật ký hoạt động hệ thống'}
+              {activeTab === 'settings' && 'Cấu hình hệ thống & Firebase'}
             </div>
 
             <div className="top-header-actions">
               <span className={`status-badge ${connected ? 'connected' : 'disconnected'}`}>
-                {connected ? '⚡ Online' : '⚪ Offline'}
+                {connected ? 'Online' : 'Offline'}
               </span>
             </div>
           </header>

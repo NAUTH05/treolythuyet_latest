@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { initFirebaseClient, syncDocClient } from '../firebaseClient';
 
 export default function SettingsPanel({ toast }) {
@@ -101,7 +101,7 @@ export default function SettingsPanel({ toast }) {
     <div className="settings-container" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
       {/* Admin Password Management */}
       <div className="card">
-        <div className="card-header">🔑 Bảo Mật Mật Khẩu Admin</div>
+        <div className="card-header">Bảo Mật Mật Khẩu Admin</div>
         <div className="card-body">
           <form onSubmit={handleChangePassword}>
             <div className="form-group">

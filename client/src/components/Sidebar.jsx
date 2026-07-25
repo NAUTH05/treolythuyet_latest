@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const SIDEBAR_WIDTH_KEY = 'treohoc_sidebar_width';
 const SIDEBAR_COLLAPSED_KEY = 'treohoc_sidebar_collapsed';
@@ -45,12 +45,12 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
   };
 
   const navItems = [
-    { id: 'dashboard', label: 'Tổng quan', icon: '📊' },
-    { id: 'control', label: 'Điều khiển Box', icon: '🎮' },
-    { id: 'accounts', label: 'Tài khoản', icon: '👤' },
-    { id: 'queues', label: 'Hàng chờ & Phiên', icon: '📋', badge: activeQueuesCount + activeSessionsCount },
-    { id: 'logs', label: 'Nhật ký hệ thống', icon: '📜' },
-    { id: 'settings', label: 'Cài đặt & Firebase', icon: '⚙️' },
+    { id: 'dashboard', label: 'Tổng quan', icon: '◈' },
+    { id: 'control', label: 'Điều khiển Box', icon: '▶' },
+    { id: 'accounts', label: 'Tài khoản', icon: '○' },
+    { id: 'queues', label: 'Hàng chờ & Phiên', icon: '≡', badge: activeQueuesCount + activeSessionsCount },
+    { id: 'logs', label: 'Nhật ký hệ thống', icon: '∷' },
+    { id: 'settings', label: 'Cài đặt & Firebase', icon: '◎' },
   ];
 
   const sidebarWidth = collapsed ? 70 : width;
@@ -59,7 +59,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`} style={{ width: sidebarWidth }}>
       {/* Brand Header */}
       <div className="sidebar-brand">
-        <div className="brand-logo">🚗</div>
+        <div className="brand-logo" style={{ fontSize: 16, fontWeight: 800, letterSpacing: '-0.5px', fontFamily: 'serif' }}>TLT</div>
         {!collapsed && (
           <div className="brand-info">
             <span className="brand-title">Treo Lý Thuyết</span>
@@ -71,7 +71,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
           onClick={() => setCollapsed(!collapsed)}
           title={collapsed ? 'Mở rộng menu' : 'Thu gọn menu'}
         >
-          {collapsed ? '❯' : '❮'}
+          {collapsed ? '›' : '‹'}
         </button>
       </div>
 
@@ -113,7 +113,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
           onClick={onStopAll}
           title={collapsed ? 'Dừng tất cả' : undefined}
         >
-          <span>⏹</span>
+          <span>■</span>
           {!collapsed && <span>Dừng tất cả</span>}
         </button>
 
@@ -122,7 +122,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
           onClick={onLogout}
           title={collapsed ? 'Đăng xuất' : undefined}
         >
-          <span>🔑</span>
+          <span>→</span>
           {!collapsed && <span>Đăng xuất</span>}
         </button>
       </div>

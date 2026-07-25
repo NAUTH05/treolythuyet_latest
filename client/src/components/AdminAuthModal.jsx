@@ -33,14 +33,14 @@ export default function AdminAuthModal({ onVerify }) {
     <div className="admin-lock-overlay">
       <div className="admin-lock-card">
         <div className="admin-lock-header">
-          <div className="admin-lock-icon">🔒</div>
-          <h2>Xác Thực Tài Khoản Admin</h2>
-          <p>Dự án Treo Học Lý Thuyết được bảo vệ. Vui lòng nhập mật khẩu Admin để tiếp tục.</p>
+          <div className="admin-lock-icon">◉</div>
+          <h2>Xác Thực Admin</h2>
+          <p>Nhập mật khẩu Admin để truy cập hệ thống Treo Học Lý Thuyết.</p>
         </div>
 
         <form onSubmit={handleSubmit} className="admin-lock-form">
-          {error && <div className="admin-lock-error">❌ {error}</div>}
-          
+          {error && <div className="admin-lock-error">{error}</div>}
+
           <div className="form-group">
             <label>Mật khẩu Admin</label>
             <input
@@ -54,7 +54,7 @@ export default function AdminAuthModal({ onVerify }) {
           </div>
 
           <button type="submit" className="btn btn-primary btn-block" disabled={loading}>
-            {loading ? '⏳ Đang kiểm tra...' : '🔓 Đăng Nhập Admin'}
+            {loading ? 'Đang kiểm tra...' : 'Đăng Nhập'}
           </button>
         </form>
 

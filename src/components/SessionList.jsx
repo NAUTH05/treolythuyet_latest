@@ -23,12 +23,12 @@ function SessionCard({ session, toast }) {
 
   const handleStop = async () => {
     await api.stopSession(session.id);
-    toast('⏹ Đã gửi lệnh dừng', 'info');
+    toast('Đã gửi lệnh dừng phiên', 'info');
   };
 
   const handleRefresh = async () => {
     await api.refreshSession(session.id);
-    toast('🔄 Đã gửi lệnh F5', 'info');
+    toast('Đã gửi lệnh F5', 'info');
   };
 
   return (
@@ -40,10 +40,10 @@ function SessionCard({ session, toast }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span className={`session-badge ${badgeClass}`}>{statusText}</span>
           {session.status === 'running' && (
-            <button className="btn btn-sm" style={{ background: 'var(--primary)', color: '#fff' }} onClick={handleRefresh}>🔄 F5</button>
+            <button className="btn btn-sm btn-outline" onClick={handleRefresh}>F5</button>
           )}
           {(session.status === 'running' || session.status === 'logging-in') && (
-            <button className="btn btn-sm btn-danger" onClick={handleStop}>⏹</button>
+            <button className="btn btn-sm btn-danger" onClick={handleStop}>■</button>
           )}
         </div>
       </div>
@@ -72,21 +72,21 @@ function SessionCard({ session, toast }) {
       </div>
 
       {session.error && (
-        <div style={{ color: 'var(--danger)', fontSize: 13 }}>❌ {session.error}</div>
+        <div style={{ color: 'var(--danger)', fontSize: 12, marginTop: 6 }}>{session.error}</div>
       )}
-      <div style={{ fontSize: 11, color: 'var(--text2)', wordBreak: 'break-all' }}>
-        🔗 Bài {(session.currentLessonIndex || 0) + 1}/{session.totalLessons || 1}: {session.currentUrl || ''}
+      <div style={{ fontSize: 11, color: 'var(--text2)', wordBreak: 'break-all', marginTop: 4 }}>
+        Bài {(session.currentLessonIndex || 0) + 1}/{session.totalLessons || 1}: {session.currentUrl || ''}
       </div>
     </div>
   );
 }
 
 const QUEUE_STATUS = {
-  running: { text: 'Đang chạy', color: '#4fc3f7', badge: 'badge-running' },
-  waiting: { text: 'Đang chờ', color: '#f0ad4e', badge: 'badge-logging-in' },
-  completed: { text: 'Hoàn thành', color: '#66bb6a', badge: 'badge-completed' },
-  cancelled: { text: 'Đã hủy', color: '#999', badge: 'badge-idle' },
-  error: { text: 'Lỗi', color: '#e74c3c', badge: 'badge-error' },
+  running: { text: 'Đang chạy', color: '#2e7fc1', badge: 'badge-running' },
+  waiting: { text: 'Đang chờ', color: '#a0660a', badge: 'badge-logging-in' },
+  completed: { text: 'Hoàn thành', color: '#1a6640', badge: 'badge-completed' },
+  cancelled: { text: 'Đã hủy', color: '#888', badge: 'badge-idle' },
+  error: { text: 'Lỗi', color: '#b83232', badge: 'badge-error' },
 };
 
 function formatCompletedAt(isoStr, status) {
@@ -111,10 +111,10 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
     const pairLabel = `${queue.totalPairs} box`;
     return (
       <div style={{
-        border: `1px solid ${info.color}22`,
-        borderRadius: 8,
+        border: '1px solid var(--border)',
+        borderRadius: 4,
         marginBottom: 4,
-        background: `${info.color}06`,
+        background: 'var(--surface)',
         overflow: 'hidden',
       }}>
         {/* Header row */}
@@ -135,7 +135,7 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
 
         {/* Expandable detail */}
         {expanded && (
-          <div style={{ borderTop: `1px solid ${info.color}22`, padding: '8px 12px', fontSize: 12, color: 'var(--text2)' }}>
+          <div style={{ borderTop: '1px solid var(--border)', padding: '8px 12px', fontSize: 12, color: 'var(--text2)' }}>
             {queue.pairs.map((pair, i) => {
               const isDone = i < queue.currentPairIndex || queue.status === 'completed';
               const isCancelled = queue.status === 'cancelled' || queue.status === 'error';
@@ -158,18 +158,19 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
   // ── FULL CARD (active queues) ──────────────────────────────
   return (
     <div style={{
-      border: `1px solid ${info.color}33`,
-      borderRadius: 10,
+      border: '1px solid var(--border)',
+      borderLeft: `3px solid ${info.color}`,
+      borderRadius: 4,
       padding: 14,
       marginBottom: 10,
-      background: `${info.color}08`,
+      background: 'var(--surface)',
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <span style={{ fontWeight: 700, fontSize: 15 }}>📋 {queue.account}</span>
+        <span style={{ fontWeight: 700, fontSize: 14, letterSpacing: '-0.2px' }}>{queue.account}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           <span className={`session-badge ${info.badge}`}>{info.text}</span>
           {queue.status === 'waiting' && (
-            <button className="btn btn-sm" style={{ background: '#f0ad4e', color: '#000', fontWeight: 600 }} onClick={() => onRush(queue.id)}>⚡ Đôn</button>
+            <button className="btn btn-sm btn-outline" style={{ borderColor: '#a0660a', color: '#a0660a' }} onClick={() => onRush(queue.id)}>Đôn</button>
           )}
           <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>➕ Thêm</button>
           <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>✕ Hủy</button>
@@ -179,7 +180,7 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
       <div style={{ fontSize: 13, marginBottom: 8, color: 'var(--text2)' }}>
         Box <strong style={{ color: 'var(--text)' }}>{queue.currentPairIndex + 1}</strong> / {queue.totalPairs}
         {(queue.randomStartMin != null && queue.randomStartMax != null && queue.randomStartMax > queue.randomStartMin) && (
-          <span style={{ marginLeft: 8, fontSize: 11, color: '#a78bfa' }}>🎲 +{queue.randomStartMin}–{queue.randomStartMax}m</span>
+          <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--text2)' }}>+{queue.randomStartMin}–{queue.randomStartMax}m random</span>
         )}
       </div>
 
@@ -192,7 +193,7 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
           const url2 = pair.urls ? pair.urls[1]?.url : pair.url2;
           const name2 = url2?.split('/').pop();
           return (
-            <div key={i} style={{ padding: '3px 0', color: isCurrent ? 'var(--primary)' : isDone ? '#66bb6a' : 'var(--text2)', fontWeight: isCurrent ? 600 : 400 }}>
+            <div key={i} style={{ padding: '3px 0', color: isCurrent ? 'var(--primary)' : isDone ? 'var(--success)' : 'var(--text2)', fontWeight: isCurrent ? 600 : 400 }}>
               {icon} Box {i + 1}: {name1}{name2 ? ` + ${name2}` : ''}
             </div>
           );
@@ -200,8 +201,8 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
       </div>
 
       {queue.nextRunTime && (
-        <div style={{ marginTop: 8, padding: '6px 10px', background: `${info.color}18`, borderRadius: 6, fontSize: 12 }}>
-          ⏰ Chạy lúc: <strong>{new Date(queue.nextRunTime).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}</strong>
+        <div style={{ marginTop: 8, padding: '6px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 4, fontSize: 12 }}>
+          Chạy lúc: <strong>{new Date(queue.nextRunTime).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}</strong>
         </div>
       )}
     </div>
@@ -226,33 +227,33 @@ function AddPairsModal({ queueId, onClose, onSubmit }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 480, width: '90vw' }} onClick={e => e.stopPropagation()}>
-        <h3 style={{ marginBottom: 6 }}>➕ Thêm cặp bài học</h3>
-        <p style={{ color: 'var(--text2)', fontSize: 13, marginBottom: 16 }}>
+        <h3 style={{ marginBottom: 6, fontSize: 16, fontWeight: 700, letterSpacing: '-0.3px' }}>Thêm cặp bài học</h3>
+        <p style={{ color: 'var(--text2)', fontSize: 12, marginBottom: 16 }}>
           Cặp mới sẽ được xếp vào cuối hàng chờ của tài khoản này
         </p>
 
         {pairs.map((pair, i) => (
-          <div key={i} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 10 }}>
+          <div key={i} style={{ border: '1px solid var(--border)', borderRadius: 4, padding: 10, marginBottom: 10 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--primary)' }}>Cặp {i + 1}</span>
+              <span style={{ fontWeight: 700, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text2)' }}>Cặp {i + 1}</span>
               {pairs.length > 1 && (
                 <button className="btn btn-sm btn-danger" style={{ padding: '2px 8px', fontSize: 11 }} onClick={() => removePair(i)}>✕</button>
               )}
             </div>
             <input type="url" placeholder="Link bài 1 (bắt buộc)" value={pair.url1}
               onChange={e => updatePair(i, 'url1', e.target.value)}
-              style={{ marginBottom: 6, width: '100%', padding: '8px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 13 }} />
+              style={{ marginBottom: 6, width: '100%', padding: '8px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', fontSize: 12, fontFamily: 'inherit', outline: 'none' }} />
             <input type="url" placeholder="Link bài 2 (tùy chọn)" value={pair.url2}
               onChange={e => updatePair(i, 'url2', e.target.value)}
-              style={{ width: '100%', padding: '8px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 13 }} />
+              style={{ width: '100%', padding: '8px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 4, color: 'var(--text)', fontSize: 12, fontFamily: 'inherit', outline: 'none' }} />
           </div>
         ))}
 
-        <button className="btn btn-outline" style={{ width: '100%', marginBottom: 12 }} onClick={addPair}>➕ Thêm một cặp nữa</button>
+        <button className="btn btn-outline" style={{ width: '100%', marginBottom: 12 }} onClick={addPair}>+ Thêm một cặp nữa</button>
 
         <div className="btn-group">
           <button className="btn btn-primary" onClick={handleSubmit}
-            disabled={!pairs.some(p => p.url1?.trim())}>💾 Lưu vào hàng chờ</button>
+            disabled={!pairs.some(p => p.url1?.trim())}>Lưu vào hàng chờ</button>
           <button className="btn btn-outline" onClick={onClose}>Hủy</button>
         </div>
       </div>
@@ -271,12 +272,12 @@ export default function SessionList({ sessions, queues, toast }) {
 
   const handleCancelQueue = async (queueId) => {
     await api.cancelQueue(queueId);
-    toast('✕ Đã hủy hàng chờ', 'info');
+    toast('Đã hủy hàng chờ', 'info');
   };
 
   const handleRushQueue = async (queueId) => {
     await api.rushQueue(queueId);
-    toast('⚡ Đã đôn hàng chờ - chạy ngay!', 'success');
+    toast('Đã đôn hàng chờ — chạy ngay!', 'success');
   };
 
   const handleAddPairs = (queueId) => setAddPairsId(queueId);
@@ -304,7 +305,7 @@ export default function SessionList({ sessions, queues, toast }) {
       )}
 
       <div className="card" style={{ gridColumn: '1/-1' }}>
-        <div className="card-header">📊 Phiên đang chạy</div>
+        <div className="card-header">Phiên đang chạy</div>
         <div className="card-body">
           {sessionEntries.length === 0 ? (
             <div className="empty">
@@ -319,7 +320,7 @@ export default function SessionList({ sessions, queues, toast }) {
 
       <div className="card" style={{ gridColumn: '1/-1' }}>
         <div className="card-header">
-          📋 Hàng chờ cặp
+          Hàng chờ cặp bài
           {activeQueues.length > 0 && (
             <span style={{ marginLeft: 8, background: 'var(--primary)', color: '#fff', borderRadius: 10, padding: '1px 8px', fontSize: 11 }}>{activeQueues.length}</span>
           )}
