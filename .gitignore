@@ -4,6 +4,8 @@ client/dist/
 logs/
 accounts.json
 queue-state.json
+admin-config.json
+firebase-config.json
 .env
 .DS_Store
 treohoclythuyet_correctUI/

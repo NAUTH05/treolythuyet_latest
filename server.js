@@ -4,6 +4,28 @@ const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
 const { BotSession } = require('./bot');
+const fbService = require('./firebase-service');
+
+const ADMIN_CONFIG_FILE = path.join(__dirname, 'admin-config.json');
+
+function getAdminConfig() {
+  if (!fs.existsSync(ADMIN_CONFIG_FILE)) {
+    return { adminPassword: 'admin123' };
+  }
+  try {
+    return JSON.parse(fs.readFileSync(ADMIN_CONFIG_FILE, 'utf8'));
+  } catch {
+    return { adminPassword: 'admin123' };
+  }
+}
+
+function saveAdminConfig(cfg) {
+  try {
+    fs.writeFileSync(ADMIN_CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[ADMIN] Không thể lưu admin config:', e.message);
+  }
+}
 
 // ============================================================
 //  WEB SERVER - Dashboard quản lý bot
@@ -681,6 +703,60 @@ function saveAccounts(accounts) {
     'utf8'
   );
 }
+
+// ===================== ADMIN & FIREBASE API ==================
+
+// Xác thực Admin password
+app.post('/lythuyet/api/admin/verify', (req, res) => {
+  const { password } = req.body;
+  const cfg = getAdminConfig();
+  if (password === cfg.adminPassword) {
+    return res.json({ ok: true, token: 'admin_verified_' + Date.now() });
+  }
+  res.status(401).json({ ok: false, error: 'Mật khẩu Admin không chính xác' });
+});
+
+// Đổi mật khẩu Admin
+app.post('/lythuyet/api/admin/change-password', (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+  if (!newPassword || newPassword.length < 4) {
+    return res.status(400).json({ error: 'Mật khẩu mới phải có ít nhất 4 ký tự' });
+  }
+  const cfg = getAdminConfig();
+  if (oldPassword !== cfg.adminPassword) {
+    return res.status(401).json({ error: 'Mật khẩu cũ không chính xác' });
+  }
+  cfg.adminPassword = newPassword;
+  saveAdminConfig(cfg);
+  res.json({ ok: true });
+});
+
+// Lấy Firebase config & status
+app.get('/lythuyet/api/admin/firebase-config', (req, res) => {
+  const config = fbService.loadFirebaseConfig();
+  res.json({
+    config: config || {},
+    connected: !!(config && config.projectId && config.apiKey),
+  });
+});
+
+// Lưu Firebase config
+app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
+  const { config } = req.body;
+  if (!config || !config.projectId || !config.apiKey) {
+    return res.status(400).json({ error: 'Cần nhập ít nhất apiKey và projectId' });
+  }
+  const saved = fbService.saveFirebaseConfig(config);
+  if (saved) {
+    // Test sync
+    await fbService.syncToFirebaseREST('system_settings', 'config_info', {
+      updatedAt: new Date().toISOString(),
+      status: 'connected',
+    }, config);
+    return res.json({ ok: true, connected: true });
+  }
+  res.status(500).json({ error: 'Không thể lưu file cấu hình Firebase' });
+});
 
 // ===================== API ROUTES ==========================
 
