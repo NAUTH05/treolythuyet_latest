@@ -99,7 +99,7 @@ async function scanCourseDetails(page, courseUrl) {
         let progressPercent = 0;
         if (container) {
           // Tìm badge chứa phần trăm
-          const badgeEl = container.querySelector('.badge') || container.querySelector('[class*="badge"]') || container.querySelector('span:has-text("%")');
+          const badgeEl = container.querySelector('.badge, [class*="badge"]');
           const containerText = container.innerText || container.textContent || '';
           
           const matchBadge = badgeEl ? badgeEl.textContent.match(/(\d+)%/) : null;

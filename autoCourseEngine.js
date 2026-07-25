@@ -118,6 +118,9 @@ class AutoCourseSession extends EventEmitter {
         }
 
         this.log(`📚 Khóa [${scanResult.courseTitle}]: Tìm thấy ${scanResult.uncompletedLessons.length}/${scanResult.totalLessons} bài chưa xong (<100%)`, 'info');
+        scanResult.allLessons.forEach((l, idx) => {
+          this.log(`   └─ Bài ${idx + 1}: ${l.title} -> ${l.progressPercent}% (${l.isCompleted ? 'Đã hoàn thành' : 'CHƯA XONG'})`, l.isCompleted ? 'info' : 'warn');
+        });
 
         if (scanResult.uncompletedLessons.length === 0) {
           this.log(`🎉 Tất cả ${scanResult.totalLessons} bài học trong Khóa [${scanResult.courseTitle}] đều đã hoàn thành 100%! Bỏ qua khóa này.`, 'success');
