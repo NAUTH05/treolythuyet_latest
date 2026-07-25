@@ -133,13 +133,24 @@ class AutoCourseSession extends EventEmitter {
           continue;
         }
 
-        let courseStudiedMins = 0;
+        let courseStudiedMins = scanResult.actualStudiedMinutes || 0;
         this.courseProgress[cConfig.courseUrl] = {
           title: scanResult.courseTitle,
           targetMinutes,
-          studiedMinutes: 0,
+          studiedMinutes: courseStudiedMins,
           completed: false,
         };
+
+        if (scanResult.actualStudiedText) {
+          this.log(`⏱️ Thời gian đã hoàn thành tích lũy trên web: ${scanResult.actualStudiedText} (${courseStudiedMins} phút)`, 'info');
+        }
+
+        // Kiểm tra xem thời gian thực tế đã hoàn thành trên hệ thống có đạt/vượt mục tiêu yêu cầu chưa!
+        if (targetMinutes > 0 && courseStudiedMins >= targetMinutes) {
+          this.log(`🎉 Khóa học [${scanResult.courseTitle}] trên web đã đạt ${scanResult.actualStudiedText || (courseStudiedMins + ' phút')} (Đã đạt/vượt mục tiêu ${cConfig.targetHours}h ${cConfig.targetMinutes}m)! Bỏ qua khóa này.`, 'success');
+          this.courseProgress[cConfig.courseUrl].completed = true;
+          continue;
+        }
 
         // Vòng lặp qua các bài chưa hoàn thành trong khóa
         for (let lIdx = 0; lIdx < scanResult.uncompletedLessons.length; lIdx++) {

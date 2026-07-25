@@ -80,6 +80,18 @@ async function scanCourseDetails(page, courseUrl) {
       const titleEl = document.querySelector('h1') || document.querySelector('.o_wslides_course_header h1');
       const courseTitle = titleEl ? titleEl.textContent.trim() : document.title;
 
+      // Extract "Thời gian hoàn thành" từ card thông tin bên trái
+      let actualStudiedMinutes = 0;
+      let actualStudiedText = '';
+      const sidebarText = document.body.innerText || document.body.textContent || '';
+      const timeMatch = sidebarText.match(/Thời\s*gian\s*hoàn\s*thành[\s\n\r:]*(\d+)\s*(?:giờ|h)\s*(\d+)?\s*(?:phút|m)?/i);
+      if (timeMatch) {
+        const h = parseInt(timeMatch[1], 10) || 0;
+        const m = parseInt(timeMatch[2], 10) || 0;
+        actualStudiedMinutes = h * 60 + m;
+        actualStudiedText = `${h} giờ ${m} phút`;
+      }
+
       // Extract all lesson items
       const lessonItems = [];
       const links = Array.from(document.querySelectorAll('a[href*="/slides/slide/"]'));
@@ -126,6 +138,8 @@ async function scanCourseDetails(page, courseUrl) {
 
       return {
         courseTitle,
+        actualStudiedMinutes,
+        actualStudiedText,
         totalLessons: lessonItems.length,
         uncompletedLessons: lessonItems.filter(l => !l.isCompleted),
         allLessons: lessonItems,
@@ -164,8 +178,9 @@ async function readDomTimer(page) {
             body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { slide_id: slideId } }),
           });
           const json = await response.json();
-          if (json && json.result && json.result.end_time) {
-            const endTimeSec = parseInt(json.result.end_time, 10);
+          const payload = json.result || json;
+          if (payload && payload.end_time) {
+            const endTimeSec = parseInt(payload.end_time, 10);
             const nowSec = Math.floor(Date.now() / 1000);
             const remainingSec = endTimeSec - nowSec;
             if (remainingSec > 0) {
