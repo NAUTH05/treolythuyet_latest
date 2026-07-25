@@ -119,6 +119,17 @@ class AutoCourseSession extends EventEmitter {
 
         this.log(`📚 Khóa [${scanResult.courseTitle}]: Tìm thấy ${scanResult.uncompletedLessons.length}/${scanResult.totalLessons} bài chưa xong (<100%)`, 'info');
 
+        if (scanResult.uncompletedLessons.length === 0) {
+          this.log(`🎉 Tất cả ${scanResult.totalLessons} bài học trong Khóa [${scanResult.courseTitle}] đều đã hoàn thành 100%! Bỏ qua khóa này.`, 'success');
+          this.courseProgress[cConfig.courseUrl] = {
+            title: scanResult.courseTitle,
+            targetMinutes,
+            studiedMinutes: targetMinutes,
+            completed: true,
+          };
+          continue;
+        }
+
         let courseStudiedMins = 0;
         this.courseProgress[cConfig.courseUrl] = {
           title: scanResult.courseTitle,

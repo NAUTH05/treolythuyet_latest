@@ -72,8 +72,8 @@ function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = []) {
 async function scanCourseDetails(page, courseUrl) {
   if (!page) return null;
   try {
-    await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(2000);
+    await page.goto(courseUrl, { waitUntil: 'load', timeout: 60000 });
+    await page.waitForTimeout(3000); // Chờ JS render xong danh sách bài
 
     const data = await page.evaluate(() => {
       // Title
@@ -89,19 +89,31 @@ async function scanCourseDetails(page, courseUrl) {
         const fullUrl = href.startsWith('http') ? href : `${window.location.origin}${href}`;
         const title = a.textContent.trim();
 
-        // Check completion badge (0%, 25%, 100%)
-        const parentRow = a.closest('li') || a.closest('tr') || a.closest('div');
+        // Tìm container chứa bài học này (li, tr, list-group-item hoặc d-flex)
+        let container = a.closest('li') || a.closest('tr') || a.closest('.list-group-item') || a.closest('.o_wslides_slide_list_record');
+        if (!container) {
+          // Fallback: leo ngược 2 cấp cha
+          container = a.parentElement ? a.parentElement.parentElement : a.parentElement;
+        }
+
         let progressPercent = 0;
-        if (parentRow) {
-          const badgeEl = parentRow.querySelector('.badge') || parentRow.querySelector('[class*="badge"]');
-          if (badgeEl) {
-            const badgeText = badgeEl.textContent.trim();
-            const match = badgeText.match(/(\d+)%/);
-            if (match) progressPercent = parseInt(match[1], 10);
+        if (container) {
+          // Tìm badge chứa phần trăm
+          const badgeEl = container.querySelector('.badge') || container.querySelector('[class*="badge"]') || container.querySelector('span:has-text("%")');
+          const containerText = container.innerText || container.textContent || '';
+          
+          const matchBadge = badgeEl ? badgeEl.textContent.match(/(\d+)%/) : null;
+          const matchText = containerText.match(/(\d+)%/);
+          
+          if (matchBadge) {
+            progressPercent = parseInt(matchBadge[1], 10);
+          } else if (matchText) {
+            progressPercent = parseInt(matchText[1], 10);
           }
         }
 
         const isCompleted = progressPercent >= 100;
+
         if (!lessonItems.some(item => item.url === fullUrl)) {
           lessonItems.push({
             title,
@@ -127,42 +139,66 @@ async function scanCourseDetails(page, courseUrl) {
   }
 }
 
-// Đọc bộ đếm ngược DOM Timer (Vòng tròn đếm ngược 3 Giờ | 59 Phút | 58 Giây)
+// Đọc bộ đếm ngược DOM Timer (ECT Countdown: Vòng tròn đếm ngược 3 Giờ | 59 Phút | 58 Giây)
 async function readDomTimer(page) {
   if (!page) return null;
   try {
+    // Chờ ECT Countdown JS khởi tạo và render xong
+    await page.waitForTimeout(3000);
+
     const timer = await page.evaluate(() => {
+      // 1. Kiểm tra phần tử .ect_countdown hoặc section[data-snippet="ect_countdown"]
+      const ectSection = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
+      if (ectSection) {
+        // Tìm tất cả text chứa trong ectSection
+        const text = ectSection.innerText || ectSection.textContent || '';
+        
+        // Pattern A: "3 Giờ 59 Phút 58 Giây" hoặc "3 Giờ 59 Phút"
+        const matchHMS = text.match(/(\d+)\s*(?:Giờ|h)\s*(\d+)\s*(?:Phút|m)\s*(\d+)?\s*(?:Giây|s)?/i);
+        if (matchHMS) {
+          const h = parseInt(matchHMS[1], 10) || 0;
+          const m = parseInt(matchHMS[2], 10) || 0;
+          const s = parseInt(matchHMS[3], 10) || 0;
+          if (h > 0 || m > 0) {
+            return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
+          }
+        }
+
+        // Pattern B: Đọc từ các flex items bên trong ect_countdown_canvas_wrapper
+        const flexItems = Array.from(ectSection.querySelectorAll('.ect_countdown_canvas_flex, .ect_countdown_flex, div'));
+        const numbers = [];
+        flexItems.forEach(el => {
+          const txt = el.innerText.trim();
+          const numMatch = txt.match(/^(\d+)$/);
+          if (numMatch) {
+            numbers.push(parseInt(numMatch[1], 10));
+          }
+        });
+
+        if (numbers.length >= 2) {
+          const h = numbers.length === 3 ? numbers[0] : 0;
+          const m = numbers.length === 3 ? numbers[1] : numbers[0];
+          const s = numbers.length === 3 ? numbers[2] : numbers[1];
+          return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
+        }
+      }
+
+      // 2. Scan toàn bộ body text
       const bodyText = document.body.innerText;
       
-      // Pattern 1: "3 Giờ 59 Phút 58 Giây"
-      const match1 = bodyText.match(/(\d+)\s*Giờ\s*(\d+)\s*Phút\s*(\d+)\s*Giây/i);
+      const match1 = bodyText.match(/(\d+)\s*Giờ\s*(\d+)\s*Phút\s*(\d+)?\s*Giây?/i);
       if (match1) {
-        const h = parseInt(match1[1], 10);
-        const m = parseInt(match1[2], 10);
-        const s = parseInt(match1[3], 10);
+        const h = parseInt(match1[1], 10) || 0;
+        const m = parseInt(match1[2], 10) || 0;
+        const s = parseInt(match1[3], 10) || 0;
         return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
       }
 
-      // Pattern 2: "59 Phút 58 Giây"
-      const match2 = bodyText.match(/(\d+)\s*Phút\s*(\d+)\s*Giây/i);
+      const match2 = bodyText.match(/(\d+)\s*Phút\s*(\d+)?\s*Giây?/i);
       if (match2) {
-        const m = parseInt(match2[1], 10);
-        const s = parseInt(match2[2], 10);
+        const m = parseInt(match2[1], 10) || 0;
+        const s = parseInt(match2[2], 10) || 0;
         return { hours: 0, minutes: m, seconds: s, totalMinutes: m + (s > 0 ? 1 : 0) };
-      }
-
-      // Pattern 3: Circular SVG or badges with numbers
-      const badges = Array.from(document.querySelectorAll('.badge, [class*="timer"], [class*="circle"]'));
-      let h = 0, m = 0, s = 0, found = false;
-      badges.forEach(b => {
-        const txt = b.textContent.trim();
-        if (/^\d+\s*Giờ$/i.test(txt)) { h = parseInt(txt, 10); found = true; }
-        if (/^\d+\s*Phút$/i.test(txt)) { m = parseInt(txt, 10); found = true; }
-        if (/^\d+\s*Giây$/i.test(txt)) { s = parseInt(txt, 10); found = true; }
-      });
-
-      if (found) {
-        return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
       }
 
       return null;
