@@ -139,13 +139,13 @@ async function scanCourseDetails(page, courseUrl) {
   }
 }
 
-// Đọc bộ đếm ngược DOM Timer (Tích hợp Odoo Widget & Multiple Fallbacks)
+// Đọc bộ đếm ngược DOM Timer (Gọi RPC Odoo /slide/countdown-start/ & Odoo Widget instance)
 async function readDomTimer(page) {
   if (!page) return null;
   try {
-    await page.waitForTimeout(3500);
+    await page.waitForTimeout(3000);
 
-    const timer = await page.evaluate(() => {
+    const timer = await page.evaluate(async () => {
       const makeTimer = (h, m, s, source) => {
         if (h > 0 || m > 0 || s > 0) {
           return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source };
@@ -153,26 +153,64 @@ async function readDomTimer(page) {
         return null;
       };
 
-      // 1. Đọc thuộc tính endTime trực tiếp từ Odoo PublicWidget instance
+      // 1. Gọi trực tiếp Odoo RPC Route /slide/countdown-start/ từ trong trang
       try {
-        const ectEl = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"]');
-        if (ectEl && window.jQuery) {
-          const widget = window.jQuery(ectEl).data('ect_employees.ect_countdown') || window.jQuery(ectEl).data('publicWidget');
-          if (widget && widget.endTime) {
+        const slideIdMatch = location.href.match(/-(\d+)\b/);
+        if (slideIdMatch) {
+          const slideId = parseInt(slideIdMatch[1], 10);
+          const response = await fetch('/slide/countdown-start/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { slide_id: slideId } }),
+          });
+          const json = await response.json();
+          if (json && json.result && json.result.end_time) {
+            const endTimeSec = parseInt(json.result.end_time, 10);
             const nowSec = Math.floor(Date.now() / 1000);
-            const remainingSec = widget.endTime - nowSec;
+            const remainingSec = endTimeSec - nowSec;
             if (remainingSec > 0) {
               const h = Math.floor(remainingSec / 3600);
               const m = Math.floor((remainingSec % 3600) / 60);
               const s = remainingSec % 60;
-              return makeTimer(h, m, s, 'odoo_widget_instance');
+              return makeTimer(h, m, s, 'odoo_rpc_fetch');
             }
           }
         }
       } catch { /* ignore */ }
 
-      // 2. Quét trong khung chứa bộ đếm .ect_countdown_canvas_wrapper
-      const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
+      // 2. Đọc thuộc tính endTime trực tiếp từ Odoo PublicWidget instance trên DOM
+      try {
+        const ectEl = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"]');
+        if (ectEl && window.jQuery) {
+          const widget = window.jQuery(ectEl).data('publicWidget') || window.jQuery(ectEl).data('ect_employees.ect_countdown');
+          if (widget) {
+            if (widget.diff && Array.isArray(widget.diff)) {
+              let h = 0, m = 0, s = 0;
+              widget.diff.forEach(item => {
+                if (item.label && item.label.toLowerCase().includes('hour')) h = item.nb || 0;
+                if (item.label && item.label.toLowerCase().includes('minute')) m = item.nb || 0;
+                if (item.label && item.label.toLowerCase().includes('second')) s = item.nb || 0;
+              });
+              const resDiff = makeTimer(h, m, s, 'odoo_widget_diff');
+              if (resDiff) return resDiff;
+            }
+
+            if (widget.endTime) {
+              const nowSec = Math.floor(Date.now() / 1000);
+              const remainingSec = widget.endTime - nowSec;
+              if (remainingSec > 0) {
+                const h = Math.floor(remainingSec / 3600);
+                const m = Math.floor((remainingSec % 3600) / 60);
+                const s = remainingSec % 60;
+                return makeTimer(h, m, s, 'odoo_widget_endtime');
+              }
+            }
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 3. Quét duy nhất trong khung chứa bộ đếm .ect_countdown_canvas_wrapper
+      const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"]');
       if (ectSection) {
         const text = ectSection.innerText || ectSection.textContent || '';
         const hMatch = text.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
@@ -186,21 +224,6 @@ async function readDomTimer(page) {
         const res = makeTimer(h, m, s, 'ect_section_text');
         if (res) return res;
       }
-
-      // 3. Quét trong khu vực nội dung chính bài học (Loại trừ header & sidebar navigation)
-      const mainContent = document.querySelector('.o_wslides_lesson_main, #wrap, main, .o_wslides_slide_main') || document.body;
-      const mainText = mainContent.innerText || mainContent.textContent || '';
-
-      const hMatch = mainText.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
-      const mMatch = mainText.match(/(\d+)[\s\n\r]*(?:Phút|m)/i);
-      const sMatch = mainText.match(/(\d+)[\s\n\r]*(?:Giây|s)/i);
-
-      const h = hMatch ? parseInt(hMatch[1], 10) : 0;
-      const m = mMatch ? parseInt(mMatch[1], 10) : 0;
-      const s = sMatch ? parseInt(sMatch[1], 10) : 0;
-
-      const resMain = makeTimer(h, m, s, 'main_content_text');
-      if (resMain) return resMain;
 
       return null;
     });

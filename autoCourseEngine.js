@@ -169,8 +169,9 @@ class AutoCourseSession extends EventEmitter {
             if (res.url().includes('countdown-start')) {
               try {
                 const data = await res.json();
-                if (data && data.end_time) {
-                  const endSec = parseInt(data.end_time, 10);
+                const payload = data.result || data;
+                if (payload && payload.end_time) {
+                  const endSec = parseInt(payload.end_time, 10);
                   const nowSec = Math.floor(Date.now() / 1000);
                   if (endSec > nowSec) {
                     apiTimerSec = endSec - nowSec;
