@@ -7,7 +7,11 @@ function loadSettings() {
 
 export default function ControlPanel({ accounts, onStart }) {
   const [saved] = useState(loadSettings);
-  const [pairs, setPairs] = useState(saved.pairs?.length ? saved.pairs : [{ url1: '', url2: '' }]);
+  const normalizePairs = (raw) => (raw || []).map(p => ({
+    url1: p.url1 ?? p.urls?.[0]?.url ?? '',
+    url2: p.url2 ?? p.urls?.[1]?.url ?? '',
+  }));
+  const [pairs, setPairs] = useState(saved.pairs?.length ? normalizePairs(saved.pairs) : [{ url1: '', url2: '' }]);
   const [startHour, setStartHour] = useState(saved.startHour ?? 7);
   const [time, setTime] = useState(saved.time ?? 240);
   const [refreshInterval, setRefreshInterval] = useState(saved.refreshInterval ?? 15);
@@ -56,7 +60,7 @@ export default function ControlPanel({ accounts, onStart }) {
   };
 
   const handleStart = async () => {
-    const validPairs = pairs.filter(p => p.url1.trim());
+    const validPairs = pairs.filter(p => p.url1?.trim());
     if (validPairs.length === 0 || selected.size === 0) return;
     setLoading(true);
 
@@ -90,7 +94,7 @@ export default function ControlPanel({ accounts, onStart }) {
     setLoading(false);
   };
 
-  const hasValidPair = pairs.some(p => p.url1.trim());
+  const hasValidPair = pairs.some(p => p.url1?.trim());
 
   return (
     <div className="card">

@@ -89,10 +89,73 @@ const QUEUE_STATUS = {
   error: { text: 'Lỗi', color: '#e74c3c', badge: 'badge-error' },
 };
 
+function formatCompletedAt(isoStr, status) {
+  if (!isoStr) return null;
+  const d = new Date(isoStr);
+  const timeStr = d.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: '2-digit', year: 'numeric' });
+  if (status === 'completed') return { icon: '✅', label: 'Hoàn thành lúc', time: timeStr, color: '#66bb6a' };
+  if (status === 'cancelled') return { icon: '✕', label: 'Đã hủy lúc', time: timeStr, color: '#999' };
+  if (status === 'error') return { icon: '❌', label: 'Lỗi lúc', time: timeStr, color: '#e74c3c' };
+  return null;
+}
+
 function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
   const info = QUEUE_STATUS[queue.status] || QUEUE_STATUS.running;
   const isActive = queue.status === 'running' || queue.status === 'waiting';
+  const [expanded, setExpanded] = useState(false);
 
+  const comp = !isActive ? formatCompletedAt(queue.completedAt, queue.status) : null;
+
+  // ── COMPACT ROW (done queues) ──────────────────────────────
+  if (!isActive) {
+    const pairLabel = `${queue.totalPairs} box`;
+    return (
+      <div style={{
+        border: `1px solid ${info.color}22`,
+        borderRadius: 8,
+        marginBottom: 4,
+        background: `${info.color}06`,
+        overflow: 'hidden',
+      }}>
+        {/* Header row */}
+        <div
+          style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 12px', cursor: 'pointer' }}
+          onClick={() => setExpanded(e => !e)}
+        >
+          <span style={{ fontSize: 13, fontWeight: 600, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {queue.account}
+          </span>
+          <span className={`session-badge ${info.badge}`} style={{ fontSize: 11, padding: '1px 7px', flexShrink: 0 }}>{info.text}</span>
+          <span style={{ fontSize: 11, color: 'var(--text2)', flexShrink: 0 }}>{pairLabel}</span>
+          {comp && (
+            <span style={{ fontSize: 11, color: comp.color, flexShrink: 0 }}>{comp.time}</span>
+          )}
+          <span style={{ fontSize: 12, color: 'var(--text2)', flexShrink: 0 }}>{expanded ? '▲' : '▼'}</span>
+        </div>
+
+        {/* Expandable detail */}
+        {expanded && (
+          <div style={{ borderTop: `1px solid ${info.color}22`, padding: '8px 12px', fontSize: 12, color: 'var(--text2)' }}>
+            {queue.pairs.map((pair, i) => {
+              const isDone = i < queue.currentPairIndex || queue.status === 'completed';
+              const isCancelled = queue.status === 'cancelled' || queue.status === 'error';
+              const icon = isDone && !isCancelled ? '✅' : isCancelled ? '—' : '✅';
+              const name1 = (pair.urls ? pair.urls[0]?.url : pair.url1 || '')?.split('/').pop() || '?';
+              const url2 = pair.urls ? pair.urls[1]?.url : pair.url2;
+              const name2 = url2?.split('/').pop();
+              return (
+                <div key={i} style={{ padding: '2px 0' }}>
+                  {icon} Box {i + 1}: {name1}{name2 ? ` + ${name2}` : ''}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── FULL CARD (active queues) ──────────────────────────────
   return (
     <div style={{
       border: `1px solid ${info.color}33`,
@@ -100,7 +163,6 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
       padding: 14,
       marginBottom: 10,
       background: `${info.color}08`,
-      transition: 'border-color .2s',
     }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <span style={{ fontWeight: 700, fontSize: 15 }}>📋 {queue.account}</span>
@@ -109,17 +171,13 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
           {queue.status === 'waiting' && (
             <button className="btn btn-sm" style={{ background: '#f0ad4e', color: '#000', fontWeight: 600 }} onClick={() => onRush(queue.id)}>⚡ Đôn</button>
           )}
-          {isActive && (
-            <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>➕ Thêm</button>
-          )}
-          {isActive && (
-            <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>✕ Hủy</button>
-          )}
+          <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>➕ Thêm</button>
+          <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>✕ Hủy</button>
         </div>
       </div>
 
       <div style={{ fontSize: 13, marginBottom: 8, color: 'var(--text2)' }}>
-        Cặp <strong style={{ color: 'var(--text)' }}>{queue.currentPairIndex + 1}</strong> / {queue.totalPairs}
+        Box <strong style={{ color: 'var(--text)' }}>{queue.currentPairIndex + 1}</strong> / {queue.totalPairs}
         {(queue.randomStartMin != null && queue.randomStartMax != null && queue.randomStartMax > queue.randomStartMin) && (
           <span style={{ marginLeft: 8, fontSize: 11, color: '#a78bfa' }}>🎲 +{queue.randomStartMin}–{queue.randomStartMax}m</span>
         )}
@@ -130,19 +188,18 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
           const isCurrent = i === queue.currentPairIndex;
           const isDone = i < queue.currentPairIndex;
           const icon = isDone ? '✅' : isCurrent ? '▶️' : '⏳';
+          const name1 = (pair.urls ? pair.urls[0]?.url : pair.url1 || '')?.split('/').pop() || '?';
+          const url2 = pair.urls ? pair.urls[1]?.url : pair.url2;
+          const name2 = url2?.split('/').pop();
           return (
-            <div key={i} style={{
-              padding: '4px 0',
-              color: isCurrent ? 'var(--primary)' : isDone ? '#66bb6a' : 'var(--text2)',
-              fontWeight: isCurrent ? 600 : 400,
-            }}>
-              {icon} Cặp {i + 1}: {pair.url1.split('/').pop()}{pair.url2 ? ' + ' + pair.url2.split('/').pop() : ''}
+            <div key={i} style={{ padding: '3px 0', color: isCurrent ? 'var(--primary)' : isDone ? '#66bb6a' : 'var(--text2)', fontWeight: isCurrent ? 600 : 400 }}>
+              {icon} Box {i + 1}: {name1}{name2 ? ` + ${name2}` : ''}
             </div>
           );
         })}
       </div>
 
-      {queue.nextRunTime && isActive && (
+      {queue.nextRunTime && (
         <div style={{ marginTop: 8, padding: '6px 10px', background: `${info.color}18`, borderRadius: 6, fontSize: 12 }}>
           ⏰ Chạy lúc: <strong>{new Date(queue.nextRunTime).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}</strong>
         </div>
@@ -161,7 +218,7 @@ function AddPairsModal({ queueId, onClose, onSubmit }) {
   const removePair = (i) => pairs.length > 1 && setPairs(prev => prev.filter((_, j) => j !== i));
 
   const handleSubmit = () => {
-    const valid = pairs.filter(p => p.url1.trim());
+    const valid = pairs.filter(p => p.url1?.trim());
     if (!valid.length) return;
     onSubmit(queueId, valid);
   };
@@ -195,7 +252,7 @@ function AddPairsModal({ queueId, onClose, onSubmit }) {
 
         <div className="btn-group">
           <button className="btn btn-primary" onClick={handleSubmit}
-            disabled={!pairs.some(p => p.url1.trim())}>💾 Lưu vào hàng chờ</button>
+            disabled={!pairs.some(p => p.url1?.trim())}>💾 Lưu vào hàng chờ</button>
           <button className="btn btn-outline" onClick={onClose}>Hủy</button>
         </div>
       </div>
