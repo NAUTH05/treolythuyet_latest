@@ -139,86 +139,80 @@ async function scanCourseDetails(page, courseUrl) {
   }
 }
 
-// Đọc bộ đếm ngược DOM Timer (ECT Countdown: Vòng tròn đếm ngược 3 Giờ | 59 Phút | 58 Giây)
+// Đọc bộ đếm ngược DOM Timer (Hỗ trợ đọc 3 vòng tròn đếm ngược: 1 Giờ | 36 Phút | 36 Giây)
 async function readDomTimer(page) {
   if (!page) return null;
   try {
-    // Chờ ECT Countdown JS khởi tạo và render xong
+    // Chờ 3.5 giây để JS và API /slide/countdown-start/ hoàn tất
     await page.waitForTimeout(3500);
 
     const timer = await page.evaluate(() => {
-      // 1. Kiểm tra phần tử .ect_countdown hoặc section[data-snippet="ect_countdown"]
-      const ectSection = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"], #oe_structure_website_slides_lesson_top_1');
+      const bodyText = document.body.innerText || document.body.textContent || '';
+
+      // Pattern 1: Tìm độc lập từng thành phần "X Giờ", "Y Phút", "Z Giây" (hỗ trợ xuống dòng \n giữa số và chữ)
+      const hMatch = bodyText.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
+      const mMatch = bodyText.match(/(\d+)[\s\n\r]*(?:Phút|m)/i);
+      const sMatch = bodyText.match(/(\d+)[\s\n\r]*(?:Giây|s)/i);
+
+      const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+      const m = mMatch ? parseInt(mMatch[1], 10) : 0;
+      const s = sMatch ? parseInt(sMatch[1], 10) : 0;
+
+      if (h > 0 || m > 0 || s > 0) {
+        return {
+          hours: h,
+          minutes: m,
+          seconds: s,
+          totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
+          source: 'multiline-regex',
+        };
+      }
+
+      // Pattern 2: Đọc các số nguyên trong các container chứa canvas/vòng tròn
+      const flexItems = Array.from(document.querySelectorAll('.ect_countdown_canvas_flex, .ect_countdown_flex, [class*="circle"], [class*="countdown"]'));
+      const numbers = [];
+      flexItems.forEach(el => {
+        const txt = (el.innerText || el.textContent || '').trim();
+        const matches = txt.match(/\d+/g);
+        if (matches) {
+          matches.forEach(num => numbers.push(parseInt(num, 10)));
+        }
+      });
+
+      if (numbers.length >= 2) {
+        const hours = numbers.length === 3 ? numbers[0] : 0;
+        const minutes = numbers.length === 3 ? numbers[1] : numbers[0];
+        const seconds = numbers.length === 3 ? numbers[2] : numbers[1];
+        return {
+          hours,
+          minutes,
+          seconds,
+          totalMinutes: hours * 60 + minutes + (seconds > 0 ? 1 : 0),
+          source: 'circle-numbers',
+        };
+      }
+
+      // Pattern 3: Đọc data-end-time nếu có và nằm ở tương lai
+      const ectSection = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
       if (ectSection) {
-        // Đọc data-end-time attribute (Unix timestamp)
         const endTimeAttr = ectSection.getAttribute('data-end-time');
         if (endTimeAttr) {
           const endTimeSec = parseFloat(endTimeAttr);
           const nowSec = Date.now() / 1000;
           if (endTimeSec > nowSec) {
             const diffSec = Math.round(endTimeSec - nowSec);
-            const h = Math.floor(diffSec / 3600);
-            const m = Math.floor((diffSec % 3600) / 60);
-            const s = diffSec % 60;
+            const hours = Math.floor(diffSec / 3600);
+            const minutes = Math.floor((diffSec % 3600) / 60);
+            const seconds = diffSec % 60;
             return {
-              hours: h,
-              minutes: m,
-              seconds: s,
-              totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
+              hours,
+              minutes,
+              seconds,
+              totalMinutes: hours * 60 + minutes + (seconds > 0 ? 1 : 0),
               source: 'data-end-time',
             };
           }
         }
-
-        // Tìm tất cả text chứa trong ectSection
-        const text = ectSection.innerText || ectSection.textContent || '';
-        
-        // Pattern A: "3 Giờ 59 Phút 58 Giây" hoặc "3 Giờ 59 Phút"
-        const matchHMS = text.match(/(\d+)\s*(?:Giờ|h)\s*(\d+)\s*(?:Phút|m)\s*(\d+)?\s*(?:Giây|s)?/i);
-        if (matchHMS) {
-          const h = parseInt(matchHMS[1], 10) || 0;
-          const m = parseInt(matchHMS[2], 10) || 0;
-          const s = parseInt(matchHMS[3], 10) || 0;
-          if (h > 0 || m > 0) {
-            return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source: 'text-hms' };
-          }
-        }
-
-        // Pattern B: Đọc từ các flex items bên trong ect_countdown_canvas_wrapper
-        const flexItems = Array.from(ectSection.querySelectorAll('.ect_countdown_canvas_flex, .ect_countdown_flex, div'));
-        const numbers = [];
-        flexItems.forEach(el => {
-          const txt = el.innerText.trim();
-          const numMatch = txt.match(/^(\d+)$/);
-          if (numMatch) {
-            numbers.push(parseInt(numMatch[1], 10));
-          }
-        });
-
-        if (numbers.length >= 2) {
-          const h = numbers.length === 3 ? numbers[0] : 0;
-          const m = numbers.length === 3 ? numbers[1] : numbers[0];
-          const s = numbers.length === 3 ? numbers[2] : numbers[1];
-          return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source: 'canvas-flex' };
-        }
-      }
-
-      // 2. Scan toàn bộ body text
-      const bodyText = document.body.innerText;
-      
-      const match1 = bodyText.match(/(\d+)\s*Giờ\s*(\d+)\s*Phút\s*(\d+)?\s*Giây?/i);
-      if (match1) {
-        const h = parseInt(match1[1], 10) || 0;
-        const m = parseInt(match1[2], 10) || 0;
-        const s = parseInt(match1[3], 10) || 0;
-        return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source: 'body-hms' };
-      }
-
-      const match2 = bodyText.match(/(\d+)\s*Phút\s*(\d+)?\s*Giây?/i);
-      if (match2) {
-        const m = parseInt(match2[1], 10) || 0;
-        const s = parseInt(match2[2], 10) || 0;
-        return { hours: 0, minutes: m, seconds: s, totalMinutes: m + (s > 0 ? 1 : 0), source: 'body-ms' };
       }
 
       return null;
