@@ -89,19 +89,9 @@ const QUEUE_STATUS = {
   error: { text: 'Lỗi', color: '#b83232', badge: 'badge-error' },
 };
 
-function formatCompletedAt(isoStr, status) {
-  if (!isoStr) return null;
-  const d = new Date(isoStr);
-  const timeStr = d.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: '2-digit', year: 'numeric' });
-  if (status === 'completed') return { icon: '✅', label: 'Hoàn thành lúc', time: timeStr, color: '#66bb6a' };
-  if (status === 'cancelled') return { icon: '✕', label: 'Đã hủy lúc', time: timeStr, color: '#999' };
-  if (status === 'error') return { icon: '❌', label: 'Lỗi lúc', time: timeStr, color: '#e74c3c' };
-  return null;
-}
-
-function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
+function QueueCard({ queue, onCancel, onDelete, onRush, onAddPairs }) {
   const info = QUEUE_STATUS[queue.status] || QUEUE_STATUS.running;
-  const isActive = queue.status === 'running' || queue.status === 'waiting';
+  const isEnded = queue.status === 'completed' || queue.status === 'cancelled' || queue.status === 'error';
 
   return (
     <div style={{
@@ -118,8 +108,15 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
           {queue.status === 'waiting' && (
             <button className="btn btn-sm" style={{ background: '#f0ad4e', color: '#000', fontWeight: 600 }} onClick={() => onRush(queue.id)}>⚡ Đôn</button>
           )}
-          <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>➕ Thêm</button>
-          <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>✕ Hủy</button>
+          {!isEnded && (
+            <>
+              <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>➕ Thêm</button>
+              <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>✕ Hủy</button>
+            </>
+          )}
+          {isEnded && (
+            <button className="btn btn-sm btn-danger" onClick={() => onDelete(queue.id)} title="Xóa thẻ hàng chờ này">🗑 Xóa</button>
+          )}
         </div>
       </div>
 
@@ -255,6 +252,19 @@ export default function SessionList({ sessions, queues, toast }) {
     toast('Đã hủy hàng chờ', 'info');
   };
 
+  const handleDeleteQueue = async (queueId) => {
+    await api.deleteQueue(queueId);
+    toast('🗑 Đã xóa thẻ hàng chờ', 'info');
+  };
+
+  const handleClearCompletedQueues = async () => {
+    if (!window.confirm('Xóa tất cả hàng chờ đã hoàn thành / kết thúc / lỗi?')) return;
+    const res = await api.clearCompletedQueues();
+    if (res.ok) {
+      toast(`🧹 Đã xóa ${res.count} hàng chờ đã xong`, 'success');
+    }
+  };
+
   const handleRushQueue = async (queueId) => {
     await api.rushQueue(queueId);
     toast('Đã đôn hàng chờ — chạy ngay!', 'success');
@@ -272,7 +282,7 @@ export default function SessionList({ sessions, queues, toast }) {
     }
   };
 
-  const queueCardProps = { onCancel: handleCancelQueue, onRush: handleRushQueue, onAddPairs: handleAddPairs };
+  const queueCardProps = { onCancel: handleCancelQueue, onDelete: handleDeleteQueue, onRush: handleRushQueue, onAddPairs: handleAddPairs };
 
   return (
     <>
@@ -288,7 +298,7 @@ export default function SessionList({ sessions, queues, toast }) {
       <div className="card" style={{ gridColumn: '1/-1', marginBottom: -8 }}>
         <div className="card-body" style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text2)' }}>🔍 Lọc theo Tài khoản:</span>
-          
+
           <select
             value={filterAccount}
             onChange={e => setFilterAccount(e.target.value)}
@@ -371,12 +381,25 @@ export default function SessionList({ sessions, queues, toast }) {
 
       {/* Queues List */}
       <div className="card" style={{ gridColumn: '1/-1' }}>
-        <div className="card-header">
-          Hàng chờ Box bài học
-          {activeQueues.length > 0 && (
-            <span style={{ marginLeft: 8, background: 'var(--primary)', color: '#fff', borderRadius: 10, padding: '1px 8px', fontSize: 11 }}>{activeQueues.length}</span>
+        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>
+            Hàng chờ Box bài học
+            {activeQueues.length > 0 && (
+              <span style={{ marginLeft: 8, background: 'var(--primary)', color: '#fff', borderRadius: 10, padding: '1px 8px', fontSize: 11 }}>{activeQueues.length}</span>
+            )}
+          </span>
+
+          {doneQueues.length > 0 && (
+            <button
+              className="btn btn-sm btn-danger"
+              onClick={handleClearCompletedQueues}
+              style={{ fontSize: 11, padding: '3px 8px' }}
+            >
+              🧹 Xóa tất cả đã xong ({doneQueues.length})
+            </button>
           )}
         </div>
+
         <div className="card-body">
           {filteredQueues.length === 0 ? (
             <div className="empty">
@@ -396,8 +419,17 @@ export default function SessionList({ sessions, queues, toast }) {
 
               {doneQueues.length > 0 && (
                 <div style={{ marginTop: activeQueues.length > 0 ? 16 : 0 }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8, paddingBottom: 6, borderBottom: '1px solid var(--border)' }}>
-                    ✅ Đã hoàn thành / Kết thúc ({doneQueues.length})
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, paddingBottom: 6, borderBottom: '1px solid var(--border)' }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 1 }}>
+                      ✅ Đã hoàn thành / Kết thúc ({doneQueues.length})
+                    </span>
+                    <button
+                      className="btn btn-sm btn-danger"
+                      onClick={handleClearCompletedQueues}
+                      style={{ fontSize: 10, padding: '2px 6px' }}
+                    >
+                      🧹 Xóa tất cả ({doneQueues.length})
+                    </button>
                   </div>
                   {doneQueues.map(q => <QueueCard key={q.id} queue={q} {...queueCardProps} />)}
                 </div>

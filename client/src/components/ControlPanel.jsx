@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import * as api from '../api';
 
 const STORAGE_KEY = 'treohoc_settings';
 
@@ -8,12 +9,6 @@ function loadSettings() {
   } catch {
     return {};
   }
-}
-
-function getTomorrowDateStr() {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  return d.toISOString().split('T')[0];
 }
 
 function parseTimeMinutes(h, m) {
@@ -46,13 +41,13 @@ function createDefaultBox() {
   };
 }
 
-function convertSavedToBox(savedBox, globalSettings) {
+function convertSavedToBox(savedBox, globalSettings = {}) {
   let urls = [];
   if (savedBox.urls && Array.isArray(savedBox.urls)) {
     urls = savedBox.urls.map(u => ({
       url: u.url || '',
-      timeH: u.time ? String(Math.floor(u.time / 60)) : '',
-      timeM: u.time ? String(u.time % 60) : '',
+      timeH: u.timeH != null ? String(u.timeH) : (u.time ? String(Math.floor(u.time / 60)) : ''),
+      timeM: u.timeM != null ? String(u.timeM) : (u.time ? String(u.time % 60) : ''),
     }));
   } else {
     if (savedBox.url1) urls.push({ url: savedBox.url1, timeH: '', timeM: '' });
@@ -92,6 +87,20 @@ export default function ControlPanel({ accounts, onStart }) {
   const [selectedAccounts, setSelectedAccounts] = useState(new Set());
   const [loading, setLoading] = useState(false);
 
+  // Preset states
+  const [presets, setPresets] = useState([]);
+  const [selectedPresetId, setSelectedPresetId] = useState('');
+  const [showSavePresetModal, setShowSavePresetModal] = useState(false);
+  const [newPresetName, setNewPresetName] = useState('');
+  const [presetSaving, setPresetSaving] = useState(false);
+
+  // Load presets list
+  useEffect(() => {
+    api.fetchPresets()
+      .then(data => { if (Array.isArray(data)) setPresets(data); })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     localStorage.setItem(
       STORAGE_KEY,
@@ -104,31 +113,75 @@ export default function ControlPanel({ accounts, onStart }) {
     );
   }, [boxes, randomStart, randomStartMin, randomStartMax]);
 
-  const toggleAccount = idx => {
-    setSelectedAccounts(prev => {
-      const next = new Set(prev);
-      next.has(idx) ? next.delete(idx) : next.add(idx);
-      return next;
-    });
+  const handleSelectPreset = (presetId) => {
+    setSelectedPresetId(presetId);
+    if (!presetId) return;
+
+    const preset = presets.find(p => p.id === presetId);
+    if (!preset || !preset.boxes) return;
+
+    // Convert preset boxes to local boxes state
+    const newBoxes = preset.boxes.map(p => convertSavedToBox(p));
+    setBoxes(newBoxes);
   };
 
-  const selectAllAccounts = () => {
-    setSelectedAccounts(new Set(accounts.map(a => a.index)));
+  const handleSavePresetSubmit = async (e) => {
+    e.preventDefault();
+    if (!newPresetName.trim()) return;
+
+    setPresetSaving(true);
+    try {
+      const res = await api.savePreset({
+        name: newPresetName.trim(),
+        boxes,
+      });
+
+      if (res.ok && res.preset) {
+        setPresets(prev => [res.preset, ...prev]);
+        setSelectedPresetId(res.preset.id);
+        setShowSavePresetModal(false);
+        setNewPresetName('');
+      } else {
+        alert(res.error || 'Lỗi lưu Preset');
+      }
+    } catch {
+      alert('Lỗi kết nối lưu Preset');
+    } finally {
+      setPresetSaving(false);
+    }
   };
 
-  const updateBoxField = (boxIdx, field, val) => {
+  const handleDeletePreset = async () => {
+    if (!selectedPresetId) return;
+    const preset = presets.find(p => p.id === selectedPresetId);
+    if (!preset) return;
+
+    if (!window.confirm(`Xóa mẫu Preset "${preset.name}"?`)) return;
+
+    try {
+      const res = await api.deletePreset(selectedPresetId);
+      if (res.ok) {
+        setPresets(prev => prev.filter(p => p.id !== selectedPresetId));
+        setSelectedPresetId('');
+      }
+    } catch {
+      alert('Lỗi xóa Preset');
+    }
+  };
+
+  const updateBox = (boxIdx, field, value) => {
     setBoxes(prev => {
       const next = [...prev];
-      next[boxIdx] = { ...next[boxIdx], [field]: val };
+      next[boxIdx] = { ...next[boxIdx], [field]: value };
       return next;
     });
   };
 
-  const updateUrlField = (boxIdx, urlIdx, field, val) => {
+  const updateBoxUrl = (boxIdx, urlIdx, field, value) => {
     setBoxes(prev => {
       const next = [...prev];
       const urls = [...next[boxIdx].urls];
-      urls[urlIdx] = { ...urls[urlIdx], [field]: val };
+      urls[urlIdx] = { ...urls[urlIdx], [field]: value };
       next[boxIdx] = { ...next[boxIdx], urls };
       return next;
     });
@@ -183,10 +236,12 @@ export default function ControlPanel({ accounts, onStart }) {
             })),
           pairOptions: {
             time: defaultTotal,
-            startHour: Number(box.startHour ?? 7),
-            refreshInterval: Number(box.refreshInterval || 15),
-            stealthInterval: Number(box.stealthInterval || 30),
-            timeWindows: box.useTimeWindows ? box.timeWindows || [] : [],
+            startHour: parseInt(box.startHour, 10) || 7,
+            refreshInterval: parseInt(box.refreshInterval, 10) || 15,
+            stealthInterval: parseInt(box.stealthInterval, 10) || 30,
+            ...(box.useTimeWindows && {
+              timeWindows: box.timeWindows.filter(w => w.start && w.end),
+            }),
           },
         };
 
@@ -205,10 +260,122 @@ export default function ControlPanel({ accounts, onStart }) {
   const hasValidLink = boxes.some(b => b.urls.some(u => u.url.trim()));
   const numStyle = { width: 48, textAlign: 'center', padding: '6px 4px' };
 
+  const totalLinksCount = boxes.reduce((acc, b) => acc + b.urls.filter(u => u.url.trim()).length, 0);
+
   return (
     <div className="card">
-      <div className="card-header">Điều khiển</div>
+      <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span>🎮 Bảng Điều Khiển Box Bài Học</span>
+      </div>
+
       <div className="card-body">
+        {/* Preset Management Toolbar */}
+        <div style={{
+          background: 'rgba(124, 111, 255, 0.06)',
+          border: '1px solid rgba(124, 111, 255, 0.2)',
+          borderRadius: 10,
+          padding: '12px 16px',
+          marginBottom: 20,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          flexWrap: 'wrap',
+        }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            📂 Mẫu Preset Bài Học:
+          </span>
+
+          <select
+            value={selectedPresetId}
+            onChange={e => handleSelectPreset(e.target.value)}
+            style={{
+              padding: '6px 12px',
+              background: 'var(--surface2)',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+              color: 'var(--text)',
+              fontSize: 13,
+              cursor: 'pointer',
+              outline: 'none',
+              minWidth: 220,
+            }}
+          >
+            <option value="">-- Chọn mẫu đã lưu --</option>
+            {presets.map(p => (
+              <option key={p.id} value={p.id}>
+                📦 {p.name} ({p.boxes ? p.boxes.length : 0} box)
+              </option>
+            ))}
+          </select>
+
+          {selectedPresetId && (
+            <button
+              type="button"
+              className="btn btn-sm btn-danger"
+              onClick={handleDeletePreset}
+              title="Xóa mẫu Preset này"
+            >
+              🗑 Xóa Mẫu
+            </button>
+          )}
+
+          <button
+            type="button"
+            className="btn btn-sm btn-primary"
+            onClick={() => setShowSavePresetModal(true)}
+            style={{ marginLeft: 'auto' }}
+            disabled={!hasValidLink}
+          >
+            💾 Lưu làm Preset Mới
+          </button>
+        </div>
+
+        {/* Save Preset Modal */}
+        {showSavePresetModal && (
+          <div style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.7)',
+            backdropFilter: 'blur(8px)',
+            zIndex: 1000,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+            <div className="card" style={{ width: '90%', maxWidth: 440, padding: 24 }}>
+              <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 8, color: 'var(--primary)' }}>
+                💾 Lưu Mẫu Preset Mới
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 16 }}>
+                Lưu lại toàn bộ cấu hình {boxes.length} Box ({totalLinksCount} link bài học kèm thời gian) để nạp lại nhanh cho các học viên khác.
+              </p>
+
+              <form onSubmit={handleSavePresetSubmit}>
+                <div className="form-group">
+                  <label>Tên Mẫu Preset</label>
+                  <input
+                    type="text"
+                    placeholder="VD: Bộ Lý Thuyết Hạng B2 - 32 bài..."
+                    value={newPresetName}
+                    onChange={e => setNewPresetName(e.target.value)}
+                    autoFocus
+                    required
+                  />
+                </div>
+
+                <div className="btn-group" style={{ justifyContent: 'flex-end', marginTop: 20 }}>
+                  <button type="button" className="btn btn-outline" onClick={() => setShowSavePresetModal(false)}>
+                    Hủy
+                  </button>
+                  <button type="submit" className="btn btn-primary" disabled={presetSaving || !newPresetName.trim()}>
+                    {presetSaving ? '⏳ Đang lưu...' : '💾 Lưu Preset'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
         <div className="form-group">
           <label>📋 Danh sách Box bài học</label>
           <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 8 }}>
@@ -251,51 +418,66 @@ export default function ControlPanel({ accounts, onStart }) {
                         onClick={() => removeBox(boxIdx)}
                         style={{ padding: '2px 8px', fontSize: 11 }}
                       >
-                        ✕ Xóa
+                        ✕ Xoá
                       </button>
                     )}
                   </div>
                 </div>
 
-                {box.urls.map((uObj, urlIdx) => (
-                  <div key={urlIdx} style={{ display: 'flex', gap: 4, marginBottom: 4, alignItems: 'center' }}>
-                    <span style={{ fontSize: 11, color: 'var(--text2)', width: 18, textAlign: 'center', flexShrink: 0 }}>
-                      {urlIdx + 1}
+                {box.urls.map((urlObj, urlIdx) => (
+                  <div
+                    key={urlIdx}
+                    style={{
+                      display: 'flex',
+                      gap: 6,
+                      alignItems: 'center',
+                      marginBottom: 6,
+                    }}
+                  >
+                    <span style={{ fontSize: 12, color: 'var(--text2)', minWidth: 20 }}>
+                      {urlIdx + 1}.
                     </span>
                     <input
                       type="url"
-                      placeholder={`Link bài ${urlIdx + 1}`}
-                      value={uObj.url}
-                      onChange={e => updateUrlField(boxIdx, urlIdx, 'url', e.target.value)}
+                      placeholder={`URL bài học ${urlIdx + 1} *`}
+                      value={urlObj.url}
+                      onChange={e => updateBoxUrl(boxIdx, urlIdx, 'url', e.target.value)}
                       style={{ flex: 1 }}
                     />
                     <input
                       type="number"
-                      value={uObj.timeH}
-                      placeholder={box.timeH || '4'}
-                      min={0}
-                      max={99}
-                      onChange={e => updateUrlField(boxIdx, urlIdx, 'timeH', e.target.value)}
-                      title="Giờ treo riêng"
-                      style={{ ...numStyle, width: 38 }}
+                      placeholder="h"
+                      min="0"
+                      max="24"
+                      value={urlObj.timeH}
+                      onChange={e => updateBoxUrl(boxIdx, urlIdx, 'timeH', e.target.value)}
+                      style={numStyle}
+                      title="Số giờ riêng cho bài này (để trống = dùng tổng Box)"
                     />
-                    <span style={{ fontSize: 11, color: 'var(--text2)' }}>h</span>
+                    <span style={{ fontSize: 12, color: 'var(--text2)' }}>:</span>
                     <input
                       type="number"
-                      value={uObj.timeM}
-                      placeholder={box.timeM || '0'}
-                      min={0}
-                      max={59}
-                      onChange={e => updateUrlField(boxIdx, urlIdx, 'timeM', e.target.value)}
-                      title="Phút treo riêng"
-                      style={{ ...numStyle, width: 38 }}
+                      placeholder="m"
+                      min="0"
+                      max="59"
+                      value={urlObj.timeM}
+                      onChange={e => updateBoxUrl(boxIdx, urlIdx, 'timeM', e.target.value)}
+                      style={numStyle}
+                      title="Số phút riêng cho bài này (để trống = dùng tổng Box)"
                     />
-                    <span style={{ fontSize: 11, color: 'var(--text2)' }}>m</span>
                     {box.urls.length > 1 && (
                       <button
-                        className="btn btn-sm btn-danger"
+                        type="button"
                         onClick={() => removeUrlFromBox(boxIdx, urlIdx)}
-                        style={{ padding: '2px 6px', fontSize: 10, flexShrink: 0 }}
+                        style={{
+                          background: 'none',
+                          border: 'none',
+                          color: 'var(--danger)',
+                          cursor: 'pointer',
+                          padding: '0 4px',
+                          fontSize: 14,
+                        }}
+                        title="Xoá link này"
                       >
                         ✕
                       </button>
@@ -303,361 +485,219 @@ export default function ControlPanel({ accounts, onStart }) {
                   </div>
                 ))}
 
-                <div
-                  style={{
-                    display: 'flex',
-                    gap: 12,
-                    marginTop: 6,
-                    padding: '6px 8px',
-                    background: 'rgba(124, 111, 255, 0.08)',
-                    borderRadius: 6,
-                    fontSize: 12,
-                    color: 'var(--primary)',
-                  }}
-                >
+                <div style={{ fontSize: 11, color: 'var(--text2)', marginTop: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span>
-                    ⏱ Tổng:{' '}
-                    <b>
-                      {Math.floor(totalBoxMinutes / 60)}h
-                      {totalBoxMinutes % 60 > 0 ? ` ${totalBoxMinutes % 60}m` : ''}
-                    </b>
+                    ⏱️ Tổng: <strong>{(totalBoxMinutes / 60).toFixed(1)}h</strong> ({totalBoxMinutes} phút)
                   </span>
-                  <span style={{ color: 'var(--text2)' }}>
-                    = <b>{totalBoxMinutes} phút</b>
-                  </span>
+
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline"
+                    onClick={() => updateBox(boxIdx, 'showOptions', !box.showOptions)}
+                    style={{ fontSize: 11, padding: '2px 8px' }}
+                  >
+                    ⚙️ Cài đặt Box {box.showOptions ? '▲' : '▼'}
+                  </button>
                 </div>
 
-                <div style={{ marginTop: 8, borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                  <div
-                    onClick={() => updateBoxField(boxIdx, 'showOptions', !box.showOptions)}
-                    style={{
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      fontSize: 12,
-                      color: 'var(--text2)',
-                      userSelect: 'none',
-                    }}
-                  >
-                    <span
-                      style={{
-                        transform: box.showOptions ? 'rotate(90deg)' : 'none',
-                        transition: 'transform 0.2s',
-                        fontSize: 14,
-                      }}
-                    >
-                      ▶
-                    </span>
-                    ⚙️ Cài đặt Box {boxIdx + 1}
-                    {!box.showOptions && (
-                      <span style={{ fontSize: 10, color: 'var(--text2)', marginLeft: 'auto' }}>
-                        {formatTimeStr(box.timeH, box.timeM) || '4h'} · {box.startHour}h · F5 {box.refreshInterval}ph
-                        {box.useSchedule && box.scheduleDate ? ' · 📅' : ''}
-                      </span>
-                    )}
-                  </div>
-
-                  {box.showOptions && (
-                    <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 8 }}>
-                        <div>
-                          <label style={{ fontSize: 11, color: 'var(--text2)', display: 'block', marginBottom: 3 }}>
-                            ⏱ Thời gian mặc định
-                          </label>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                            <input
-                              type="number"
-                              value={box.timeH}
-                              min={0}
-                              max={99}
-                              onChange={e => updateBoxField(boxIdx, 'timeH', e.target.value)}
-                              style={numStyle}
-                            />
-                            <span style={{ fontSize: 11, color: 'var(--text2)' }}>h</span>
-                            <input
-                              type="number"
-                              value={box.timeM}
-                              min={0}
-                              max={59}
-                              onChange={e => updateBoxField(boxIdx, 'timeM', e.target.value)}
-                              style={numStyle}
-                            />
-                            <span style={{ fontSize: 11, color: 'var(--text2)' }}>m</span>
-                          </div>
-                        </div>
-
-                        <div>
-                          <label style={{ fontSize: 11, color: 'var(--text2)', display: 'block', marginBottom: 3 }}>
-                            ⏰ Giờ chạy ngày mới
-                          </label>
+                {box.showOptions && (
+                  <div style={{
+                    marginTop: 10,
+                    paddingTop: 10,
+                    borderTop: '1px dashed var(--border)',
+                    fontSize: 12,
+                  }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 8 }}>
+                      <div>
+                        <label style={{ fontSize: 11 }}>Thời gian mặc định Box</label>
+                        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
                           <input
                             type="number"
-                            value={box.startHour}
-                            min={0}
-                            max={23}
-                            onChange={e => updateBoxField(boxIdx, 'startHour', Number(e.target.value))}
+                            placeholder="4"
+                            value={box.timeH}
+                            onChange={e => updateBox(boxIdx, 'timeH', e.target.value)}
+                            style={numStyle}
                           />
-                        </div>
-
-                        <div>
-                          <label style={{ fontSize: 11, color: 'var(--text2)', display: 'block', marginBottom: 3 }}>
-                            🔄 F5 mỗi (phút)
-                          </label>
+                          <span>h</span>
                           <input
                             type="number"
-                            value={box.refreshInterval}
-                            min={1}
-                            max={120}
-                            onChange={e => updateBoxField(boxIdx, 'refreshInterval', Number(e.target.value))}
+                            placeholder="0"
+                            value={box.timeM}
+                            onChange={e => updateBox(boxIdx, 'timeM', e.target.value)}
+                            style={numStyle}
                           />
-                        </div>
-
-                        <div>
-                          <label style={{ fontSize: 11, color: 'var(--text2)', display: 'block', marginBottom: 3 }}>
-                            🎭 Stealth (giây)
-                          </label>
-                          <input
-                            type="number"
-                            value={box.stealthInterval}
-                            min={5}
-                            max={300}
-                            onChange={e => updateBoxField(boxIdx, 'stealthInterval', Number(e.target.value))}
-                          />
+                          <span>m</span>
                         </div>
                       </div>
 
-                      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer', color: 'var(--text2)' }}>
-                          <input
-                            type="checkbox"
-                            checked={box.useTimeWindows || false}
-                            onChange={e => updateBoxField(boxIdx, 'useTimeWindows', e.target.checked)}
-                            style={{ accentColor: 'var(--primary)' }}
-                          />
-                          ⏰ Giới hạn khung giờ học
-                        </label>
-
-                        {box.useTimeWindows && (
-                          <div style={{ marginTop: 6 }}>
-                            <div style={{ fontSize: 11, color: 'var(--text2)', marginBottom: 4 }}>
-                              Bot sẽ F5 lưu checkpoint và tạm dừng khi hết giờ khung học
-                            </div>
-                            {(box.timeWindows || []).map((tw, twIdx) => (
-                              <div key={twIdx} style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
-                                <span style={{ fontSize: 11, color: 'var(--text2)', width: 20, textAlign: 'center' }}>
-                                  {twIdx + 1}.
-                                </span>
-                                <input
-                                  type="time"
-                                  value={tw.start}
-                                  onChange={e => {
-                                    const nextTW = [...box.timeWindows];
-                                    nextTW[twIdx] = { ...nextTW[twIdx], start: e.target.value };
-                                    updateBoxField(boxIdx, 'timeWindows', nextTW);
-                                  }}
-                                  style={{
-                                    flex: 1,
-                                    padding: '5px 8px',
-                                    background: 'var(--surface2)',
-                                    border: '1px solid var(--border)',
-                                    borderRadius: 6,
-                                    color: 'var(--text)',
-                                    fontSize: 12,
-                                  }}
-                                />
-                                <span style={{ fontSize: 11, color: 'var(--text2)' }}>→</span>
-                                <input
-                                  type="time"
-                                  value={tw.end}
-                                  onChange={e => {
-                                    const nextTW = [...box.timeWindows];
-                                    nextTW[twIdx] = { ...nextTW[twIdx], end: e.target.value };
-                                    updateBoxField(boxIdx, 'timeWindows', nextTW);
-                                  }}
-                                  style={{
-                                    flex: 1,
-                                    padding: '5px 8px',
-                                    background: 'var(--surface2)',
-                                    border: '1px solid var(--border)',
-                                    borderRadius: 6,
-                                    color: 'var(--text)',
-                                    fontSize: 12,
-                                  }}
-                                />
-                                {(box.timeWindows || []).length > 1 && (
-                                  <button
-                                    className="btn btn-sm btn-danger"
-                                    onClick={() =>
-                                      updateBoxField(
-                                        boxIdx,
-                                        'timeWindows',
-                                        box.timeWindows.filter((_, i) => i !== twIdx)
-                                      )
-                                    }
-                                    style={{ padding: '2px 6px', fontSize: 10, flexShrink: 0 }}
-                                  >
-                                    ✕
-                                  </button>
-                                )}
-                              </div>
-                            ))}
-                            <button
-                              className="btn btn-sm btn-outline"
-                              onClick={() =>
-                                updateBoxField(boxIdx, 'timeWindows', [
-                                  ...(box.timeWindows || []),
-                                  { start: '07:00', end: '23:00' },
-                                ])
-                              }
-                              style={{ padding: '2px 10px', fontSize: 11, marginTop: 2 }}
-                            >
-                              + Thêm khung giờ
-                            </button>
-                          </div>
-                        )}
+                      <div>
+                        <label style={{ fontSize: 11 }}>F5 Refresh (phút)</label>
+                        <input
+                          type="number"
+                          value={box.refreshInterval}
+                          onChange={e => updateBox(boxIdx, 'refreshInterval', e.target.value)}
+                          style={{ width: '100%' }}
+                        />
                       </div>
 
-                      <div style={{ borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, cursor: 'pointer', color: 'var(--text2)' }}>
-                          <input
-                            type="checkbox"
-                            checked={box.useSchedule || false}
-                            onChange={e => {
-                              const checked = e.target.checked;
-                              setBoxes(prev => {
-                                const next = [...prev];
-                                next[boxIdx] = {
-                                  ...next[boxIdx],
-                                  useSchedule: checked,
-                                };
-                                if (checked && !next[boxIdx].scheduleDate) {
-                                  next[boxIdx].scheduleDate = getTomorrowDateStr();
-                                }
-                                return next;
-                              });
-                            }}
-                            style={{ accentColor: 'var(--primary)' }}
-                          />
-                          📅 Hẹn ngày giờ bắt đầu box này
-                        </label>
-
-                        {box.useSchedule && (
-                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginTop: 6 }}>
-                            <div>
-                              <label style={{ fontSize: 11, color: 'var(--text2)', display: 'block', marginBottom: 3 }}>
-                                📆 Ngày
-                              </label>
-                              <input
-                                type="date"
-                                value={box.scheduleDate}
-                                onChange={e => updateBoxField(boxIdx, 'scheduleDate', e.target.value)}
-                              />
-                            </div>
-                            <div>
-                              <label style={{ fontSize: 11, color: 'var(--text2)', display: 'block', marginBottom: 3 }}>
-                                🕐 Giờ
-                              </label>
-                              <input
-                                type="time"
-                                value={box.scheduleTime}
-                                onChange={e => updateBoxField(boxIdx, 'scheduleTime', e.target.value)}
-                              />
-                            </div>
-                          </div>
-                        )}
+                      <div>
+                        <label style={{ fontSize: 11 }}>Stealth (giây)</label>
+                        <input
+                          type="number"
+                          value={box.stealthInterval}
+                          onChange={e => updateBox(boxIdx, 'stealthInterval', e.target.value)}
+                          style={{ width: '100%' }}
+                        />
                       </div>
                     </div>
-                  )}
-                </div>
+
+                    <div style={{ marginBottom: 8 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={box.useTimeWindows}
+                          onChange={e => updateBox(boxIdx, 'useTimeWindows', e.target.checked)}
+                        />
+                        <span>⏰ Giới hạn khung giờ học cho Box này</span>
+                      </label>
+
+                      {box.useTimeWindows && (
+                        <div style={{ marginTop: 6, paddingLeft: 20 }}>
+                          {box.timeWindows.map((tw, twIdx) => (
+                            <div key={twIdx} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4 }}>
+                              <input
+                                type="time"
+                                value={tw.start}
+                                onChange={e => {
+                                  const next = [...box.timeWindows];
+                                  next[twIdx] = { ...next[twIdx], start: e.target.value };
+                                  updateBox(boxIdx, 'timeWindows', next);
+                                }}
+                              />
+                              <span>-</span>
+                              <input
+                                type="time"
+                                value={tw.end}
+                                onChange={e => {
+                                  const next = [...box.timeWindows];
+                                  next[twIdx] = { ...next[twIdx], end: e.target.value };
+                                  updateBox(boxIdx, 'timeWindows', next);
+                                }}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12 }}>
+                        <input
+                          type="checkbox"
+                          checked={box.useSchedule}
+                          onChange={e => updateBox(boxIdx, 'useSchedule', e.target.checked)}
+                        />
+                        <span>📅 Hẹn ngày giờ bắt đầu cho Box này</span>
+                      </label>
+
+                      {box.useSchedule && (
+                        <div style={{ display: 'flex', gap: 8, marginTop: 6, paddingLeft: 20 }}>
+                          <input
+                            type="date"
+                            value={box.scheduleDate}
+                            onChange={e => updateBox(boxIdx, 'scheduleDate', e.target.value)}
+                          />
+                          <input
+                            type="time"
+                            value={box.scheduleTime}
+                            onChange={e => updateBox(boxIdx, 'scheduleTime', e.target.value)}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
 
-          <button className="btn btn-outline" onClick={addBox} style={{ marginTop: 4, width: '100%' }}>
-            ➕ Thêm box
+          <button
+            type="button"
+            className="btn btn-outline btn-sm"
+            onClick={addBox}
+            style={{ width: '100%', marginTop: 4 }}
+          >
+            + Thêm Box Bài Học Mới
           </button>
         </div>
 
-        <div className="form-group">
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', marginBottom: 0 }}>
+        {/* Random delay start */}
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
             <input
               type="checkbox"
-              className="account-check"
               checked={randomStart}
               onChange={e => setRandomStart(e.target.checked)}
             />
-            🎲 Random Start Time{' '}
-            <span style={{ fontSize: 11, color: 'var(--text2)', fontWeight: 400 }}>(tránh cố định giờ)</span>
+            <span>🎲 Random delay giờ khởi động (mỗi account trễ ngẫu nhiên)</span>
           </label>
 
           {randomStart && (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 10 }}>
-              <div>
-                <label style={{ fontSize: 12, color: 'var(--text2)', display: 'block', marginBottom: 4 }}>
-                  Delay tối thiểu (phút)
-                </label>
-                <input
-                  type="number"
-                  value={randomStartMin}
-                  min={0}
-                  max={120}
-                  onChange={e => setRandomStartMin(Number(e.target.value))}
-                />
-              </div>
-              <div>
-                <label style={{ fontSize: 12, color: 'var(--text2)', display: 'block', marginBottom: 4 }}>
-                  Delay tối đa (phút)
-                </label>
-                <input
-                  type="number"
-                  value={randomStartMax}
-                  min={0}
-                  max={120}
-                  onChange={e => setRandomStartMax(Number(e.target.value))}
-                />
-              </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6, paddingLeft: 22 }}>
+              <input
+                type="number"
+                value={randomStartMin}
+                onChange={e => setRandomStartMin(Number(e.target.value))}
+                style={{ width: 60 }}
+              />
+              <span>-</span>
+              <input
+                type="number"
+                value={randomStartMax}
+                onChange={e => setRandomStartMax(Number(e.target.value))}
+                style={{ width: 60 }}
+              />
+              <span style={{ fontSize: 12, color: 'var(--text2)' }}>phút</span>
             </div>
           )}
         </div>
 
+        {/* Account Selector */}
         <div className="form-group">
-          <label>👤 Chọn tài khoản</label>
-          <div style={{ maxHeight: 150, overflowY: 'auto' }}>
-            {accounts.length === 0 ? (
-              <span style={{ color: 'var(--text2)', fontSize: 13 }}>Chưa có tài khoản</span>
-            ) : (
-              accounts.map(acc => (
-                <label
+          <label>👤 Chọn tài khoản áp dụng</label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+            {accounts.map(acc => {
+              const isSelected = selectedAccounts.has(acc.index);
+              return (
+                <button
                   key={acc.index}
-                  style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0', cursor: 'pointer', fontSize: 14 }}
+                  type="button"
+                  className={`btn btn-sm ${isSelected ? 'btn-primary' : 'btn-outline'}`}
+                  onClick={() => {
+                    setSelectedAccounts(prev => {
+                      const next = new Set(prev);
+                      if (next.has(acc.index)) next.delete(acc.index);
+                      else next.add(acc.index);
+                      return next;
+                    });
+                  }}
                 >
-                  <input
-                    type="checkbox"
-                    className="account-check"
-                    checked={selectedAccounts.has(acc.index)}
-                    onChange={() => toggleAccount(acc.index)}
-                  />
-                  {acc.name}{' '}
-                  <span style={{ color: 'var(--text2)', fontSize: 12 }}>({acc.email})</span>
-                </label>
-              ))
-            )}
+                  {acc.name}
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        <div className="btn-group">
-          <button
-            className="btn btn-primary"
-            disabled={loading || !hasValidLink || selectedAccounts.size === 0}
-            onClick={handleStart}
-          >
-            {loading ? '⏳ Đang khởi động...' : '🚀 Bắt đầu treo'}
-          </button>
-          <button className="btn btn-outline" onClick={selectAllAccounts}>
-            ☑ Chọn tất cả
-          </button>
-        </div>
+        {/* Action Button */}
+        <button
+          type="button"
+          className="btn btn-primary btn-block"
+          onClick={handleStart}
+          disabled={loading || !hasValidLink || selectedAccounts.size === 0}
+        >
+          {loading ? '⏳ Đang khởi động...' : '🚀 Bắt Đầu Treo Bài Học'}
+        </button>
       </div>
     </div>
   );

@@ -27,6 +27,31 @@ function saveAdminConfig(cfg) {
   }
 }
 
+// =================== PRESETS PERSISTENCE ===================
+
+const PRESETS_FILE = path.join(__dirname, 'presets.json');
+
+function loadPresets() {
+  if (!fs.existsSync(PRESETS_FILE)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(PRESETS_FILE, 'utf8')).presets || [];
+  } catch {
+    return [];
+  }
+}
+
+function savePresets(presets) {
+  try {
+    fs.writeFileSync(PRESETS_FILE, JSON.stringify({ presets }, null, 2), 'utf8');
+    const fbConfig = fbService.loadFirebaseConfig();
+    if (fbConfig && fbConfig.projectId) {
+      fbService.syncToFirebaseREST('system_presets', 'list', { presets, updatedAt: new Date().toISOString() }, fbConfig);
+    }
+  } catch (e) {
+    console.error('[PRESETS] Không thể lưu presets:', e.message);
+  }
+}
+
 // ============================================================
 //  WEB SERVER - Dashboard quản lý bot
 // ============================================================
@@ -1103,6 +1128,85 @@ app.post('/lythuyet/api/cancel-queue/:id', async (req, res) => {
   }
   updateQueue(queue);
   res.json({ ok: true });
+});
+
+// =================== PRESETS API ===========================
+
+// Lấy danh sách Mẫu Preset
+app.get('/lythuyet/api/presets', (req, res) => {
+  res.json(loadPresets());
+});
+
+// Tạo hoặc Cập nhật Mẫu Preset
+app.post('/lythuyet/api/presets', (req, res) => {
+  const { name, boxes } = req.body;
+  if (!name || !boxes || !Array.isArray(boxes) || boxes.length === 0) {
+    return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách Box hợp lệ' });
+  }
+
+  const presets = loadPresets();
+  const newPreset = {
+    id: `preset_${Date.now()}`,
+    name,
+    boxes,
+    createdAt: new Date().toISOString(),
+  };
+
+  presets.unshift(newPreset);
+  savePresets(presets);
+  res.json({ ok: true, preset: newPreset });
+});
+
+// Xóa Mẫu Preset
+app.delete('/lythuyet/api/presets/:id', (req, res) => {
+  const { id } = req.params;
+  let presets = loadPresets();
+  const initialLen = presets.length;
+  presets = presets.filter(p => p.id !== id);
+  if (presets.length === initialLen) {
+    return res.status(404).json({ error: 'Không tìm thấy Preset' });
+  }
+  savePresets(presets);
+  res.json({ ok: true });
+});
+
+// =================== DELETE QUEUES API =====================
+
+// Xóa 1 hàng chờ
+app.delete('/lythuyet/api/queues/:id', async (req, res) => {
+  const queueId = req.params.id;
+  const queue = queues.get(queueId);
+  if (!queue) return res.status(404).json({ error: 'Hàng chờ không tồn tại' });
+
+  if (queue.timer) clearTimeout(queue.timer);
+  if (queue.currentSessionId) {
+    const session = sessions.get(queue.currentSessionId);
+    if (session) await session.stop();
+  }
+
+  queues.delete(queueId);
+  saveQueueState();
+  io.emit('queue-deleted', queueId);
+  res.json({ ok: true });
+});
+
+// Xóa tất cả hàng chờ đã hoàn thành / kết thúc / lỗi / hủy
+app.post('/lythuyet/api/queues/clear-completed', async (req, res) => {
+  let clearedCount = 0;
+  for (const [id, queue] of queues) {
+    if (queue.status === 'completed' || queue.status === 'cancelled' || queue.status === 'error') {
+      if (queue.timer) clearTimeout(queue.timer);
+      if (queue.currentSessionId) {
+        const session = sessions.get(queue.currentSessionId);
+        if (session) await session.stop();
+      }
+      queues.delete(id);
+      clearedCount++;
+    }
+  }
+  saveQueueState();
+  io.emit('queues-cleared');
+  res.json({ ok: true, count: clearedCount });
 });
 
 // Tạm dừng hàng chờ

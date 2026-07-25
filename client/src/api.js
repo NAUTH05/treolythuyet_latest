@@ -54,6 +54,16 @@ export async function cancelQueue(queueId) {
   return res.json();
 }
 
+export async function deleteQueue(queueId) {
+  const res = await fetch(`${API}/api/queues/${queueId}`, { method: 'DELETE' });
+  return res.json();
+}
+
+export async function clearCompletedQueues() {
+  const res = await fetch(`${API}/api/queues/clear-completed`, { method: 'POST' });
+  return res.json();
+}
+
 export async function rushQueue(queueId) {
   const res = await fetch(`${API}/api/rush-queue/${queueId}`, { method: 'POST' });
   return res.json();
@@ -65,5 +75,24 @@ export async function addPairsToQueue(queueId, pairs) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pairs }),
   });
+  return res.json();
+}
+
+export async function fetchPresets() {
+  const res = await fetch(`${API}/api/presets`);
+  return res.json();
+}
+
+export async function savePreset(payload) {
+  const res = await fetch(`${API}/api/presets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return res.json();
+}
+
+export async function deletePreset(id) {
+  const res = await fetch(`${API}/api/presets/${id}`, { method: 'DELETE' });
   return res.json();
 }
