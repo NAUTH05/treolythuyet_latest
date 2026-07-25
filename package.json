@@ -1,0 +1,22 @@
+{
+  "name": "treo-hoc-ly-thuyet",
+  "version": "2.0.0",
+  "description": "Auto treo bài học lý thuyết lái xe - Web Dashboard + CLI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node index.js",
+    "dev": "node server.js",
+    "dev:client": "cd client && npm run dev",
+    "build": "cd client && npm run build",
+    "install-browser": "npx playwright install chromium",
+    "setup": "npm install && cd client && npm install && npm run build && cd .. && npx playwright install chromium"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "express": "^4.22.1",
+    "playwright": "^1.59.1",
+    "socket.io": "^4.8.3",
+    "yargs": "^17.7.2"
+  }
+}

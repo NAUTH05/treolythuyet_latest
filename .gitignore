@@ -1,0 +1,8 @@
+node_modules/
+public/
+client/dist/
+logs/
+accounts.json
+queue-state.json
+.env
+.DS_Store
