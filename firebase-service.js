@@ -45,7 +45,14 @@ async function syncToFirebaseREST(collection, id, data, config) {
       body: JSON.stringify({ fields }),
     });
 
-    return res.ok;
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[FIREBASE] Lỗi HTTP ${res.status} khi sync ${collection}/${id}:`, errText);
+      return false;
+    }
+
+    console.log(`[FIREBASE] ✅ Sync thành công ${collection}/${id}`);
+    return true;
   } catch (err) {
     console.error(`[FIREBASE] Lỗi sync ${collection}/${id}:`, err.message);
     return false;

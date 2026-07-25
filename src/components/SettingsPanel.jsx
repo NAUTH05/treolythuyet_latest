@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { initFirebaseClient, syncDocClient } from '../firebaseClient';
 
 export default function SettingsPanel({ toast }) {
   // Password state
@@ -28,6 +29,9 @@ export default function SettingsPanel({ toast }) {
         if (data.config) {
           setFirebaseConfig(data.config);
           setFbConnected(!!data.connected);
+          if (data.config.projectId && data.config.apiKey) {
+            initFirebaseClient(data.config);
+          }
         }
       })
       .catch(() => {});
@@ -66,6 +70,14 @@ export default function SettingsPanel({ toast }) {
     e.preventDefault();
     setFbLoading(true);
     try {
+      // 1. Initialize client-side Firebase
+      initFirebaseClient(firebaseConfig);
+      await syncDocClient('system_settings', 'config_info', {
+        status: 'connected',
+        updatedBy: 'client',
+      });
+
+      // 2. Save on server & trigger server-side sync
       const res = await fetch('/lythuyet/api/admin/firebase-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -74,7 +86,7 @@ export default function SettingsPanel({ toast }) {
       const data = await res.json();
       if (data.ok) {
         setFbConnected(!!data.connected);
-        toast('🔥 Đã lưu cấu hình Firebase thành công', 'success');
+        toast('🔥 Đã lưu cấu hình và đồng bộ Firebase thành công!', 'success');
       } else {
         toast(`❌ ${data.error || 'Lỗi kết nối Firebase'}`, 'error');
       }
@@ -222,12 +234,12 @@ export default function SettingsPanel({ toast }) {
 
           {/* Tutorial step by step */}
           <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--text2)' }}>
-            <h4 style={{ color: 'var(--primary)', marginBottom: 8, fontSize: 13 }}>📖 Hướng dẫn lấy tham số từ console.firebase.google.com:</h4>
-            <ol style={{ paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <h4 style={{ color: 'var(--primary)', marginBottom: 8, fontSize: 13 }}>📖 Hướng dẫn lấy tham số & Mở quyền Firestore Database:</h4>
+            <ol style={{ paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
               <li>Truy cập <b>console.firebase.google.com</b> $\rightarrow$ Bấm <b>Add Project</b> tạo project mới.</li>
-              <li>Tại trang chủ dự án, bấm biểu tượng Web <b>&lt;/&gt;</b> (Add app) để tạo Web App.</li>
-              <li>Copy đoạn mã <code>firebaseConfig</code> (gồm 6-7 dòng apiKey, projectId...) dán vào các ô tương ứng phía trên.</li>
-              <li>Vào menu <b>Build</b> $\rightarrow$ <b>Firestore Database</b> $\rightarrow$ Bấm <b>Create Database</b> (chọn Start in test mode).</li>
+              <li>Tại trang chủ dự án, bấm biểu tượng Web <b>&lt;/&gt;</b> (Add app) để lấy mã Config.</li>
+              <li>Vào menu <b>Build</b> $\rightarrow$ <b>Firestore Database</b> $\rightarrow$ Bấm <b>Create Database</b>.</li>
+              <li><b>Rất quan trọng</b>: Vào tab <b>Rules</b> của Firestore Database, sửa <code>allow read, write: if false;</code> thành <code>allow read, write: if true;</code> rồi bấm <b>Publish</b> thì mới cho phép tạo Data Collections!</li>
             </ol>
           </div>
         </div>
