@@ -89,21 +89,21 @@ async function scanCourseDetails(page, courseUrl) {
         const fullUrl = href.startsWith('http') ? href : `${window.location.origin}${href}`;
         const title = a.textContent.trim();
 
-        // Tìm container chứa bài học này (li, tr, list-group-item hoặc d-flex)
-        let container = a.closest('li') || a.closest('tr') || a.closest('.list-group-item') || a.closest('.o_wslides_slide_list_record');
+        // Tìm container chứa bài học này (li, tr, list-group-item hoặc o_wslides_slides_list_slide)
+        let container = a.closest('li') || a.closest('tr') || a.closest('.list-group-item') || a.closest('.o_wslides_slides_list_slide') || a.closest('.o_wslides_slide_list_record');
         if (!container) {
-          // Fallback: leo ngược 2 cấp cha
           container = a.parentElement ? a.parentElement.parentElement : a.parentElement;
         }
 
         let progressPercent = 0;
         if (container) {
-          // Tìm badge chứa phần trăm
+          // Tìm badge chứa phần trăm (hỗ trợ cả "100 %", "100%", "15 %")
           const badgeEl = container.querySelector('.badge, [class*="badge"]');
           const containerText = container.innerText || container.textContent || '';
           
-          const matchBadge = badgeEl ? badgeEl.textContent.match(/(\d+)%/) : null;
-          const matchText = containerText.match(/(\d+)%/);
+          // Pattern mở rộng: match cả khoảng trắng giữa số và dấu % (/(\d+)\s*%/)
+          const matchBadge = badgeEl ? badgeEl.textContent.match(/(\d+)\s*%/) : null;
+          const matchText = containerText.match(/(\d+)\s*%/);
           
           if (matchBadge) {
             progressPercent = parseInt(matchBadge[1], 10);
@@ -144,12 +144,32 @@ async function readDomTimer(page) {
   if (!page) return null;
   try {
     // Chờ ECT Countdown JS khởi tạo và render xong
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(3500);
 
     const timer = await page.evaluate(() => {
       // 1. Kiểm tra phần tử .ect_countdown hoặc section[data-snippet="ect_countdown"]
-      const ectSection = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
+      const ectSection = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"], #oe_structure_website_slides_lesson_top_1');
       if (ectSection) {
+        // Đọc data-end-time attribute (Unix timestamp)
+        const endTimeAttr = ectSection.getAttribute('data-end-time');
+        if (endTimeAttr) {
+          const endTimeSec = parseFloat(endTimeAttr);
+          const nowSec = Date.now() / 1000;
+          if (endTimeSec > nowSec) {
+            const diffSec = Math.round(endTimeSec - nowSec);
+            const h = Math.floor(diffSec / 3600);
+            const m = Math.floor((diffSec % 3600) / 60);
+            const s = diffSec % 60;
+            return {
+              hours: h,
+              minutes: m,
+              seconds: s,
+              totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
+              source: 'data-end-time',
+            };
+          }
+        }
+
         // Tìm tất cả text chứa trong ectSection
         const text = ectSection.innerText || ectSection.textContent || '';
         
@@ -160,7 +180,7 @@ async function readDomTimer(page) {
           const m = parseInt(matchHMS[2], 10) || 0;
           const s = parseInt(matchHMS[3], 10) || 0;
           if (h > 0 || m > 0) {
-            return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
+            return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source: 'text-hms' };
           }
         }
 
@@ -179,7 +199,7 @@ async function readDomTimer(page) {
           const h = numbers.length === 3 ? numbers[0] : 0;
           const m = numbers.length === 3 ? numbers[1] : numbers[0];
           const s = numbers.length === 3 ? numbers[2] : numbers[1];
-          return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
+          return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source: 'canvas-flex' };
         }
       }
 
@@ -191,14 +211,14 @@ async function readDomTimer(page) {
         const h = parseInt(match1[1], 10) || 0;
         const m = parseInt(match1[2], 10) || 0;
         const s = parseInt(match1[3], 10) || 0;
-        return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0) };
+        return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source: 'body-hms' };
       }
 
       const match2 = bodyText.match(/(\d+)\s*Phút\s*(\d+)?\s*Giây?/i);
       if (match2) {
         const m = parseInt(match2[1], 10) || 0;
         const s = parseInt(match2[2], 10) || 0;
-        return { hours: 0, minutes: m, seconds: s, totalMinutes: m + (s > 0 ? 1 : 0) };
+        return { hours: 0, minutes: m, seconds: s, totalMinutes: m + (s > 0 ? 1 : 0), source: 'body-ms' };
       }
 
       return null;
