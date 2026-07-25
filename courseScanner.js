@@ -139,79 +139,78 @@ async function scanCourseDetails(page, courseUrl) {
   }
 }
 
-// Đọc bộ đếm ngược DOM Timer (Hỗ trợ đọc 3 vòng tròn đếm ngược: 1 Giờ | 36 Phút | 36 Giây)
+// Đọc bộ đếm ngược DOM Timer (Hỗ trợ đọc 3 vòng tròn đếm ngược: 1 Giờ | 38 Phút | 5 Giây)
 async function readDomTimer(page) {
   if (!page) return null;
   try {
-    // Chờ 3.5 giây để JS và API /slide/countdown-start/ hoàn tất
+    // Chờ 3.5 giây để JS render 3 vòng tròn đếm ngược
     await page.waitForTimeout(3500);
 
     const timer = await page.evaluate(() => {
-      const bodyText = document.body.innerText || document.body.textContent || '';
+      // Ưu tiên 1: Quét trực tiếp bên trong 3 khung vòng tròn (.ect_countdown_canvas_flex)
+      const flexItems = Array.from(document.querySelectorAll('.ect_countdown_canvas_flex, .ect_countdown_flex'));
+      if (flexItems.length >= 2) {
+        const parsed = flexItems.map(item => {
+          const txt = (item.innerText || item.textContent || '').trim();
+          const match = txt.match(/(\d+)/);
+          return match ? parseInt(match[1], 10) : 0;
+        });
 
-      // Pattern 1: Tìm độc lập từng thành phần "X Giờ", "Y Phút", "Z Giây" (hỗ trợ xuống dòng \n giữa số và chữ)
-      const hMatch = bodyText.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
-      const mMatch = bodyText.match(/(\d+)[\s\n\r]*(?:Phút|m)/i);
-      const sMatch = bodyText.match(/(\d+)[\s\n\r]*(?:Giây|s)/i);
+        const h = flexItems.length === 3 ? parsed[0] : 0;
+        const m = flexItems.length === 3 ? parsed[1] : parsed[0];
+        const s = flexItems.length === 3 ? parsed[2] : parsed[1];
 
-      const h = hMatch ? parseInt(hMatch[1], 10) : 0;
-      const m = mMatch ? parseInt(mMatch[1], 10) : 0;
-      const s = sMatch ? parseInt(sMatch[1], 10) : 0;
-
-      if (h > 0 || m > 0 || s > 0) {
-        return {
-          hours: h,
-          minutes: m,
-          seconds: s,
-          totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
-          source: 'multiline-regex',
-        };
-      }
-
-      // Pattern 2: Đọc các số nguyên trong các container chứa canvas/vòng tròn
-      const flexItems = Array.from(document.querySelectorAll('.ect_countdown_canvas_flex, .ect_countdown_flex, [class*="circle"], [class*="countdown"]'));
-      const numbers = [];
-      flexItems.forEach(el => {
-        const txt = (el.innerText || el.textContent || '').trim();
-        const matches = txt.match(/\d+/g);
-        if (matches) {
-          matches.forEach(num => numbers.push(parseInt(num, 10)));
+        if (h > 0 || m > 0 || s > 0) {
+          return {
+            hours: h,
+            minutes: m,
+            seconds: s,
+            totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
+            source: 'ect_countdown_canvas_flex',
+          };
         }
-      });
-
-      if (numbers.length >= 2) {
-        const hours = numbers.length === 3 ? numbers[0] : 0;
-        const minutes = numbers.length === 3 ? numbers[1] : numbers[0];
-        const seconds = numbers.length === 3 ? numbers[2] : numbers[1];
-        return {
-          hours,
-          minutes,
-          seconds,
-          totalMinutes: hours * 60 + minutes + (seconds > 0 ? 1 : 0),
-          source: 'circle-numbers',
-        };
       }
 
-      // Pattern 3: Đọc data-end-time nếu có và nằm ở tương lai
-      const ectSection = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
+      // Ưu tiên 2: Bóc tách text trong khung chứa bộ đếm .ect_countdown / [data-name="ECT Countdown"]
+      const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
       if (ectSection) {
-        const endTimeAttr = ectSection.getAttribute('data-end-time');
-        if (endTimeAttr) {
-          const endTimeSec = parseFloat(endTimeAttr);
-          const nowSec = Date.now() / 1000;
-          if (endTimeSec > nowSec) {
-            const diffSec = Math.round(endTimeSec - nowSec);
-            const hours = Math.floor(diffSec / 3600);
-            const minutes = Math.floor((diffSec % 3600) / 60);
-            const seconds = diffSec % 60;
-            return {
-              hours,
-              minutes,
-              seconds,
-              totalMinutes: hours * 60 + minutes + (seconds > 0 ? 1 : 0),
-              source: 'data-end-time',
-            };
-          }
+        const text = ectSection.innerText || ectSection.textContent || '';
+        const hMatch = text.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
+        const mMatch = text.match(/(\d+)[\s\n\r]*(?:Phút|m)/i);
+        const sMatch = text.match(/(\d+)[\s\n\r]*(?:Giây|s)/i);
+
+        const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+        const m = mMatch ? parseInt(mMatch[1], 10) : 0;
+        const s = sMatch ? parseInt(sMatch[1], 10) : 0;
+
+        if (h > 0 || m > 0 || s > 0) {
+          return {
+            hours: h,
+            minutes: m,
+            seconds: s,
+            totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
+            source: 'ect_section_text',
+          };
+        }
+      }
+
+      // Ưu tiên 3: Đọc thuộc tính tương lai data-end-time
+      const ectElem = document.querySelector('[data-end-time]');
+      if (ectElem) {
+        const endTimeSec = parseFloat(ectElem.getAttribute('data-end-time'));
+        const nowSec = Date.now() / 1000;
+        if (endTimeSec > nowSec) {
+          const diffSec = Math.round(endTimeSec - nowSec);
+          const h = Math.floor(diffSec / 3600);
+          const m = Math.floor((diffSec % 3600) / 60);
+          const s = diffSec % 60;
+          return {
+            hours: h,
+            minutes: m,
+            seconds: s,
+            totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
+            source: 'data-end-time',
+          };
         }
       }
 
