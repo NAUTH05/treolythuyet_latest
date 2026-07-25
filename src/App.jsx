@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import * as api from './api';
 import AccountPanel from './components/AccountPanel';
 import AdminAuthModal from './components/AdminAuthModal';
+import AutoScanPanel from './components/AutoScanPanel';
 import ControlPanel from './components/ControlPanel';
 import DashboardOverview from './components/DashboardOverview';
 import LogPanel from './components/LogPanel';
@@ -114,6 +115,7 @@ function App() {
           <header className="top-header">
             <div className="top-header-title">
               {activeTab === 'dashboard' && 'Tổng quan hệ thống'}
+              {activeTab === 'autoscan' && '🤖 Auto Scan & Treo Học Khóa Học'}
               {activeTab === 'control' && 'Bảng điều khiển Box bài học'}
               {activeTab === 'accounts' && 'Quản lý danh sách tài khoản'}
               {activeTab === 'queues' && 'Tiến độ Hàng chờ & Các phiên đang chạy'}
@@ -143,6 +145,10 @@ function App() {
                 queues={queues}
                 onNavigate={setActiveTab}
               />
+            )}
+
+            {activeTab === 'autoscan' && (
+              <AutoScanPanel accounts={accounts} toast={toast} />
             )}
 
             {activeTab === 'control' && (

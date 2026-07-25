@@ -4,6 +4,7 @@ const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
 const { BotSession } = require('./bot');
+const { AutoCourseSession } = require('./autoCourseEngine');
 const fbService = require('./firebase-service');
 
 const ADMIN_CONFIG_FILE = path.join(__dirname, 'admin-config.json');
@@ -1207,6 +1208,51 @@ app.post('/lythuyet/api/queues/clear-completed', async (req, res) => {
   saveQueueState();
   io.emit('queues-cleared');
   res.json({ ok: true, count: clearedCount });
+});
+
+// =================== AUTO-SCAN COURSES API =================
+
+const autoScanSessions = new Map();
+
+app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
+  const { courses, allowedDateRanges, dailyMaxMinutes, accountIndices } = req.body;
+  if (!courses || !Array.isArray(courses) || courses.length === 0) {
+    return res.status(400).json({ error: 'Cần nhập ít nhất 1 khóa học' });
+  }
+
+  const allAccounts = loadAccounts();
+  const targetAccounts = accountIndices.map(idx => allAccounts[idx - 1]).filter(Boolean);
+  if (targetAccounts.length === 0) {
+    return res.status(400).json({ error: 'Không tìm thấy tài khoản hợp lệ' });
+  }
+
+  const started = [];
+  for (const acc of targetAccounts) {
+    const sessionId = `autoscan_${acc.name}_${Date.now()}`;
+    const autoSession = new AutoCourseSession(sessionId, acc, courses, {
+      headless: true,
+      dailyMaxMinutes: dailyMaxMinutes || 480,
+      allowedDateRanges: allowedDateRanges || [],
+    });
+
+    autoSession.on('log', (entry) => addLog(entry));
+    autoSession.on('status', (status) => io.emit('autoscan-status', status));
+    autoSession.on('progress-saved', (data) => {
+      const fbConfig = fbService.loadFirebaseConfig();
+      if (fbConfig && fbConfig.projectId) {
+        fbService.syncToFirebaseREST('system_course_progress', `${acc.name}_${Date.now()}`, data, fbConfig);
+      }
+    });
+
+    autoScanSessions.set(sessionId, autoSession);
+    autoSession.start().catch(err => {
+      addLog({ timestamp: formatVN(new Date()), account: acc.name, msg: `❌ Lỗi Auto-Scan: ${err.message}`, level: 'error' });
+    });
+
+    started.push({ sessionId, account: acc.name });
+  }
+
+  res.json({ ok: true, started });
 });
 
 // Tạm dừng hàng chờ

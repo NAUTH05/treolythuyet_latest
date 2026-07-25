@@ -46,6 +46,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
 
   const navItems = [
     { id: 'dashboard', label: 'Tổng quan', icon: '◈' },
+    { id: 'autoscan', label: 'Auto Scan Khóa Học', icon: '🤖' },
     { id: 'control', label: 'Điều khiển Box', icon: '▶' },
     { id: 'accounts', label: 'Tài khoản', icon: '○' },
     { id: 'queues', label: 'Hàng chờ & Phiên', icon: '≡', badge: activeQueuesCount + activeSessionsCount },
