@@ -147,31 +147,14 @@ async function readDomTimer(page) {
     await page.waitForTimeout(3500);
 
     const timer = await page.evaluate(() => {
-      // Ưu tiên 1: Quét trực tiếp bên trong 3 khung vòng tròn (.ect_countdown_canvas_flex)
-      const flexItems = Array.from(document.querySelectorAll('.ect_countdown_canvas_flex, .ect_countdown_flex'));
-      if (flexItems.length >= 2) {
-        const parsed = flexItems.map(item => {
-          const txt = (item.innerText || item.textContent || '').trim();
-          const match = txt.match(/(\d+)/);
-          return match ? parseInt(match[1], 10) : 0;
-        });
-
-        const h = flexItems.length === 3 ? parsed[0] : 0;
-        const m = flexItems.length === 3 ? parsed[1] : parsed[0];
-        const s = flexItems.length === 3 ? parsed[2] : parsed[1];
-
+      const makeTimer = (h, m, s, source) => {
         if (h > 0 || m > 0 || s > 0) {
-          return {
-            hours: h,
-            minutes: m,
-            seconds: s,
-            totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
-            source: 'ect_countdown_canvas_flex',
-          };
+          return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source };
         }
-      }
+        return null;
+      };
 
-      // Ưu tiên 2: Bóc tách text trong khung chứa bộ đếm .ect_countdown / [data-name="ECT Countdown"]
+      // 1. Quét trong khung chứa bộ đếm .ect_countdown / .ect_countdown_canvas_wrapper
       const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
       if (ectSection) {
         const text = ectSection.innerText || ectSection.textContent || '';
@@ -183,18 +166,26 @@ async function readDomTimer(page) {
         const m = mMatch ? parseInt(mMatch[1], 10) : 0;
         const s = sMatch ? parseInt(sMatch[1], 10) : 0;
 
-        if (h > 0 || m > 0 || s > 0) {
-          return {
-            hours: h,
-            minutes: m,
-            seconds: s,
-            totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
-            source: 'ect_section_text',
-          };
-        }
+        const res = makeTimer(h, m, s, 'ect_section_text');
+        if (res) return res;
       }
 
-      // Ưu tiên 3: Đọc thuộc tính tương lai data-end-time
+      // 2. Quét trong khu vực nội dung chính bài học (Loại trừ header & sidebar navigation)
+      const mainContent = document.querySelector('.o_wslides_lesson_main, #wrap, main, .o_wslides_slide_main') || document.body;
+      const mainText = mainContent.innerText || mainContent.textContent || '';
+
+      const hMatch = mainText.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
+      const mMatch = mainText.match(/(\d+)[\s\n\r]*(?:Phút|m)/i);
+      const sMatch = mainText.match(/(\d+)[\s\n\r]*(?:Giây|s)/i);
+
+      const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+      const m = mMatch ? parseInt(mMatch[1], 10) : 0;
+      const s = sMatch ? parseInt(sMatch[1], 10) : 0;
+
+      const resMain = makeTimer(h, m, s, 'main_content_text');
+      if (resMain) return resMain;
+
+      // 3. Đọc thuộc tính data-end-time nếu nằm ở tương lai
       const ectElem = document.querySelector('[data-end-time]');
       if (ectElem) {
         const endTimeSec = parseFloat(ectElem.getAttribute('data-end-time'));
@@ -204,17 +195,25 @@ async function readDomTimer(page) {
           const h = Math.floor(diffSec / 3600);
           const m = Math.floor((diffSec % 3600) / 60);
           const s = diffSec % 60;
-          return {
-            hours: h,
-            minutes: m,
-            seconds: s,
-            totalMinutes: h * 60 + m + (s > 0 ? 1 : 0),
-            source: 'data-end-time',
-          };
+          const resData = makeTimer(h, m, s, 'data-end-time');
+          if (resData) return resData;
         }
       }
 
-      return null;
+      // 4. Quét từng phần tử div/span riêng lẻ có chứa chữ "Giờ", "Phút", "Giây"
+      const allElems = Array.from(document.querySelectorAll('span, div, b, p'));
+      let hVal = 0, mVal = 0, sVal = 0;
+      allElems.forEach(el => {
+        const txt = (el.innerText || el.textContent || '').trim();
+        const mH = txt.match(/^(\d+)\s*Giờ$/i);
+        const mM = txt.match(/^(\d+)\s*Phút$/i);
+        const mS = txt.match(/^(\d+)\s*Giây$/i);
+        if (mH) hVal = parseInt(mH[1], 10);
+        if (mM) mVal = parseInt(mM[1], 10);
+        if (mS) sVal = parseInt(mS[1], 10);
+      });
+
+      return makeTimer(hVal, mVal, sVal, 'span_elements');
     });
 
     return timer;
