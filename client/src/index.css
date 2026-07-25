@@ -18,6 +18,24 @@
   --header-bg: rgba(255, 255, 255, 0.92);
 }
 
+[data-theme="dark"] {
+  --bg: #0f0f0f;
+  --surface: #1a1a1a;
+  --surface2: #222222;
+  --surface3: #2a2a2a;
+  --primary: #f0f0f0;
+  --primary-hover: #ffffff;
+  --primary-alpha: rgba(240, 240, 240, 0.08);
+  --success: #4caf82;
+  --warning: #d4940a;
+  --danger: #d95252;
+  --text: #f0f0f0;
+  --text2: #777777;
+  --border: rgba(255, 255, 255, 0.08);
+  --sidebar-bg: #141414;
+  --header-bg: rgba(20, 20, 20, 0.95);
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -266,6 +284,34 @@ body {
   text-transform: uppercase;
 }
 
+.top-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theme-toggle {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface2);
+  color: var(--text2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+}
+
+.theme-toggle:hover {
+  background: var(--surface3);
+  color: var(--text);
+  border-color: var(--text2);
+}
+
 .status-badge {
   font-size: 11px;
   padding: 4px 12px;
@@ -509,7 +555,7 @@ body {
   left: 0;
   width: 100vw;
   height: 100vh;
-  background: rgba(244, 243, 239, 0.95);
+  background: color-mix(in srgb, var(--bg) 95%, transparent);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   display: flex;
@@ -803,7 +849,7 @@ body {
   left: 0;
   width: 100vw;
   height: 100vh;
-  background: rgba(244, 243, 239, 0.88);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(8px);
   display: flex;
   align-items: center;

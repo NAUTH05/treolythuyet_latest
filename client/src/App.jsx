@@ -13,12 +13,23 @@ import { useSocket } from './hooks/useSocket';
 import { useToast } from './hooks/useToast';
 
 const ADMIN_TOKEN_KEY = 'treohoc_admin_token';
+const THEME_KEY = 'treohoc_theme';
 
 function App() {
   const { connected, sessions, queues, logs, setLogs } = useSocket();
   const { toasts, toast } = useToast();
   const [accounts, setAccounts] = useState([]);
   const [activeTab, setActiveTab] = useState('dashboard');
+
+  // Dark mode state
+  const [darkMode, setDarkMode] = useState(() => {
+    return localStorage.getItem(THEME_KEY) === 'dark';
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
+    localStorage.setItem(THEME_KEY, darkMode ? 'dark' : 'light');
+  }, [darkMode]);
 
   // Admin auth state
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(() => {
@@ -111,6 +122,13 @@ function App() {
             </div>
 
             <div className="top-header-actions">
+              <button
+                className="theme-toggle"
+                onClick={() => setDarkMode(d => !d)}
+                title={darkMode ? 'Chuyển sang Light mode' : 'Chuyển sang Dark mode'}
+              >
+                {darkMode ? '○' : '●'}
+              </button>
               <span className={`status-badge ${connected ? 'connected' : 'disconnected'}`}>
                 {connected ? 'Online' : 'Offline'}
               </span>
