@@ -139,11 +139,10 @@ async function scanCourseDetails(page, courseUrl) {
   }
 }
 
-// Đọc bộ đếm ngược DOM Timer (Hỗ trợ đọc 3 vòng tròn đếm ngược: 1 Giờ | 38 Phút | 5 Giây)
+// Đọc bộ đếm ngược DOM Timer (Tích hợp Odoo Widget & Multiple Fallbacks)
 async function readDomTimer(page) {
   if (!page) return null;
   try {
-    // Chờ 3.5 giây để JS render 3 vòng tròn đếm ngược
     await page.waitForTimeout(3500);
 
     const timer = await page.evaluate(() => {
@@ -154,7 +153,25 @@ async function readDomTimer(page) {
         return null;
       };
 
-      // 1. Quét trong khung chứa bộ đếm .ect_countdown / .ect_countdown_canvas_wrapper
+      // 1. Đọc thuộc tính endTime trực tiếp từ Odoo PublicWidget instance
+      try {
+        const ectEl = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"]');
+        if (ectEl && window.jQuery) {
+          const widget = window.jQuery(ectEl).data('ect_employees.ect_countdown') || window.jQuery(ectEl).data('publicWidget');
+          if (widget && widget.endTime) {
+            const nowSec = Math.floor(Date.now() / 1000);
+            const remainingSec = widget.endTime - nowSec;
+            if (remainingSec > 0) {
+              const h = Math.floor(remainingSec / 3600);
+              const m = Math.floor((remainingSec % 3600) / 60);
+              const s = remainingSec % 60;
+              return makeTimer(h, m, s, 'odoo_widget_instance');
+            }
+          }
+        }
+      } catch { /* ignore */ }
+
+      // 2. Quét trong khung chứa bộ đếm .ect_countdown_canvas_wrapper
       const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"], [data-name="ECT Countdown"]');
       if (ectSection) {
         const text = ectSection.innerText || ectSection.textContent || '';
@@ -170,7 +187,7 @@ async function readDomTimer(page) {
         if (res) return res;
       }
 
-      // 2. Quét trong khu vực nội dung chính bài học (Loại trừ header & sidebar navigation)
+      // 3. Quét trong khu vực nội dung chính bài học (Loại trừ header & sidebar navigation)
       const mainContent = document.querySelector('.o_wslides_lesson_main, #wrap, main, .o_wslides_slide_main') || document.body;
       const mainText = mainContent.innerText || mainContent.textContent || '';
 
@@ -185,35 +202,7 @@ async function readDomTimer(page) {
       const resMain = makeTimer(h, m, s, 'main_content_text');
       if (resMain) return resMain;
 
-      // 3. Đọc thuộc tính data-end-time nếu nằm ở tương lai
-      const ectElem = document.querySelector('[data-end-time]');
-      if (ectElem) {
-        const endTimeSec = parseFloat(ectElem.getAttribute('data-end-time'));
-        const nowSec = Date.now() / 1000;
-        if (endTimeSec > nowSec) {
-          const diffSec = Math.round(endTimeSec - nowSec);
-          const h = Math.floor(diffSec / 3600);
-          const m = Math.floor((diffSec % 3600) / 60);
-          const s = diffSec % 60;
-          const resData = makeTimer(h, m, s, 'data-end-time');
-          if (resData) return resData;
-        }
-      }
-
-      // 4. Quét từng phần tử div/span riêng lẻ có chứa chữ "Giờ", "Phút", "Giây"
-      const allElems = Array.from(document.querySelectorAll('span, div, b, p'));
-      let hVal = 0, mVal = 0, sVal = 0;
-      allElems.forEach(el => {
-        const txt = (el.innerText || el.textContent || '').trim();
-        const mH = txt.match(/^(\d+)\s*Giờ$/i);
-        const mM = txt.match(/^(\d+)\s*Phút$/i);
-        const mS = txt.match(/^(\d+)\s*Giây$/i);
-        if (mH) hVal = parseInt(mH[1], 10);
-        if (mM) mVal = parseInt(mM[1], 10);
-        if (mS) sVal = parseInt(mS[1], 10);
-      });
-
-      return makeTimer(hVal, mVal, sVal, 'span_elements');
+      return null;
     });
 
     return timer;

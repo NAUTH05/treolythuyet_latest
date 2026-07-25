@@ -163,17 +163,45 @@ class AutoCourseSession extends EventEmitter {
           const lesson = scanResult.uncompletedLessons[lIdx];
           this.log(`📖 Mở bài ${lIdx + 1}/${scanResult.uncompletedLessons.length}: ${lesson.title} (${lesson.url})`, 'info');
 
-          await this.page.goto(lesson.url, { waitUntil: 'load', timeout: 60000 });
-          await this.page.waitForTimeout(2000);
+          // Lắng nghe API /slide/countdown-start/ từ Playwright Network Response
+          let apiTimerSec = null;
+          const responseHandler = async (res) => {
+            if (res.url().includes('countdown-start')) {
+              try {
+                const data = await res.json();
+                if (data && data.end_time) {
+                  const endSec = parseInt(data.end_time, 10);
+                  const nowSec = Math.floor(Date.now() / 1000);
+                  if (endSec > nowSec) {
+                    apiTimerSec = endSec - nowSec;
+                  }
+                }
+              } catch { /* ignore */ }
+            }
+          };
 
-          // Đọc bộ đếm ngược DOM Timer
-          const domTimer = await readDomTimer(this.page);
-          let lessonMinutes = 240; // mặc định 4 tiếng nếu không đọc được DOM Timer
-          if (domTimer && domTimer.totalMinutes > 0) {
-            lessonMinutes = domTimer.totalMinutes;
-            this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer: ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
+          this.page.on('response', responseHandler);
+
+          await this.page.goto(lesson.url, { waitUntil: 'load', timeout: 60000 });
+          await this.page.waitForTimeout(3500);
+
+          this.page.removeListener('response', responseHandler);
+
+          let lessonMinutes = 240; // mặc định 4 tiếng nếu không bắt được
+          if (apiTimerSec && apiTimerSec > 0) {
+            const h = Math.floor(apiTimerSec / 3600);
+            const m = Math.floor((apiTimerSec % 3600) / 60);
+            const s = apiTimerSec % 60;
+            lessonMinutes = Math.ceil(apiTimerSec / 60);
+            this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/: ${h}h ${m}m ${s}s (${lessonMinutes} phút cần treo)`, 'success');
           } else {
-            this.log(`ℹ️ Không đọc được DOM Timer, sử dụng thời gian mặc định 240 phút`, 'info');
+            const domTimer = await readDomTimer(this.page);
+            if (domTimer && domTimer.totalMinutes > 0) {
+              lessonMinutes = domTimer.totalMinutes;
+              this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer: ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
+            } else {
+              this.log(`ℹ️ Không đọc được DOM Timer, sử dụng thời gian mặc định 240 phút`, 'info');
+            }
           }
 
           // Treo bài học này
@@ -186,6 +214,15 @@ class AutoCourseSession extends EventEmitter {
           // Chờ treo bài học (F5 mỗi 15 phút)
           let elapsedMs = 0;
           while (elapsedMs < durationMs && !this._stopped) {
+            // Tự động bấm nút "Tiếp tục ghi nhận giờ học" nếu xuất hiện popup tạm dừng của Odoo
+            try {
+              const popupBtn = await this.page.$('#resume-activity-button');
+              if (popupBtn) {
+                await popupBtn.click();
+                this.log('👆 Đã tự động bấm "Tiếp tục ghi nhận giờ học" (Khôi phục Inactivity)', 'info');
+              }
+            } catch { /* ignore */ }
+
             const waitStep = Math.min(15 * 60 * 1000, durationMs - elapsedMs);
             await this.page.waitForTimeout(waitStep);
             elapsedMs += waitStep;
