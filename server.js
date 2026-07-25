@@ -53,6 +53,12 @@ function addLog(entry) {
   logHistory.push(entry);
   if (logHistory.length > MAX_LOG) logHistory.shift();
   io.emit('log', entry);
+
+  // Auto sync to Firebase if configured
+  const fbConfig = fbService.loadFirebaseConfig();
+  if (fbConfig && fbConfig.projectId) {
+    fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, fbConfig);
+  }
 }
 
 // ===================== QUEUE MGMT ==========================
@@ -87,6 +93,12 @@ function saveQueueState() {
       });
     }
     fs.writeFileSync(QUEUE_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+
+    // Auto sync to Firebase if configured
+    const fbConfig = fbService.loadFirebaseConfig();
+    if (fbConfig && fbConfig.projectId) {
+      fbService.syncToFirebaseREST('system_queues', 'state', { queues: state, updatedAt: new Date().toISOString() }, fbConfig);
+    }
   } catch (e) {
     console.error('[STATE] Không thể lưu queue state:', e.message);
   }
@@ -702,6 +714,12 @@ function saveAccounts(accounts) {
     JSON.stringify({ accounts }, null, 2),
     'utf8'
   );
+
+  // Auto sync to Firebase if configured
+  const fbConfig = fbService.loadFirebaseConfig();
+  if (fbConfig && fbConfig.projectId) {
+    fbService.syncToFirebaseREST('system_accounts', 'list', { accounts, updatedAt: new Date().toISOString() }, fbConfig);
+  }
 }
 
 // ===================== ADMIN & FIREBASE API ==================
@@ -748,11 +766,15 @@ app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
   }
   const saved = fbService.saveFirebaseConfig(config);
   if (saved) {
-    // Test sync
+    // Sync current accounts, state, and logs immediately to Firebase
+    const accounts = loadAccounts();
+    await fbService.syncToFirebaseREST('system_accounts', 'list', { accounts, updatedAt: new Date().toISOString() }, config);
+    await fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, config);
     await fbService.syncToFirebaseREST('system_settings', 'config_info', {
       updatedAt: new Date().toISOString(),
       status: 'connected',
     }, config);
+
     return res.json({ ok: true, connected: true });
   }
   res.status(500).json({ error: 'Không thể lưu file cấu hình Firebase' });
