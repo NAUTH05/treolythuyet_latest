@@ -54,6 +54,31 @@ function savePresets(presets) {
   }
 }
 
+// =================== AUTO-SCAN PRESETS =====================
+
+const AUTO_PRESETS_FILE = path.join(__dirname, 'autoscan-presets.json');
+
+function loadAutoPresets() {
+  if (!fs.existsSync(AUTO_PRESETS_FILE)) return [];
+  try {
+    return JSON.parse(fs.readFileSync(AUTO_PRESETS_FILE, 'utf8')).presets || [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAutoPresets(presets) {
+  try {
+    fs.writeFileSync(AUTO_PRESETS_FILE, JSON.stringify({ presets }, null, 2), 'utf8');
+    const fbConfig = fbService.loadFirebaseConfig();
+    if (fbConfig && fbConfig.projectId) {
+      fbService.syncToFirebaseREST('system_autoscan_presets', 'list', { presets, updatedAt: new Date().toISOString() }, fbConfig);
+    }
+  } catch (e) {
+    console.error('[AUTO-PRESETS] Không thể lưu auto-scan presets:', e.message);
+  }
+}
+
 // ============================================================
 //  WEB SERVER - Dashboard quản lý bot
 // ============================================================
@@ -76,17 +101,118 @@ const sessions = new Map();   // sessionId -> BotSession
 const logHistory = [];         // Lưu 500 dòng log gần nhất
 const MAX_LOG = 500;
 
-function addLog(entry) {
-  logHistory.push(entry);
-  if (logHistory.length > MAX_LOG) logHistory.shift();
-  io.emit('log', entry);
+// =================== DAILY LOGS (ngày → user) =====================
+// Lưu TOÀN BỘ logs của từng ngày, phân theo user, đẩy lên Firebase
+// collection system_logs_daily (doc: <yyyy-mm-dd>_<user>) để xem lại
+// đầy đủ không bị ngắt đoạn. Flush theo chu kỳ để không spam Firestore.
 
-  // Auto sync to Firebase if configured
+const DAILY_LOGS_FILE = path.join(__dirname, 'daily-logs.json');
+const MAX_DAILY_LOGS_PER_USER = 5000; // Giới hạn an toàn dưới 1MB/doc Firestore
+
+function vnDateStr(d = new Date()) {
+  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
+}
+
+function slugifyAccount(name) {
+  return String(name || 'system')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .replace(/[^a-zA-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'system';
+}
+
+let dailyLogs = { date: vnDateStr(), users: {} };
+let dailyLogsDirtyUsers = new Set();
+let latestLogsDirty = false;
+
+// Khôi phục logs trong ngày từ file local (nếu server restart giữa ngày)
+try {
+  if (fs.existsSync(DAILY_LOGS_FILE)) {
+    const saved = JSON.parse(fs.readFileSync(DAILY_LOGS_FILE, 'utf8'));
+    if (saved && saved.date === dailyLogs.date && saved.users) {
+      dailyLogs = saved;
+    }
+  }
+} catch { /* ignore */ }
+
+function flushDailyLogsFor(store, users) {
+  try {
+    fs.writeFileSync(DAILY_LOGS_FILE, JSON.stringify(store), 'utf8');
+  } catch (e) {
+    console.error('[LOGS] Không thể lưu daily-logs local:', e.message);
+  }
+  const fbConfig = fbService.loadFirebaseConfig();
+  if (!fbConfig || !fbConfig.projectId) return;
+  for (const account of users) {
+    const entries = store.users[account];
+    if (!entries || entries.length === 0) continue;
+    const docId = `${store.date}_${slugifyAccount(account)}`;
+    fbService.syncToFirebaseREST('system_logs_daily', docId, {
+      date: store.date,
+      account,
+      count: entries.length,
+      logs: entries,
+      updatedAt: new Date().toISOString(),
+    }, fbConfig);
+  }
+}
+
+function recordDailyLog(entry) {
+  const today = vnDateStr();
+  if (dailyLogs.date !== today) {
+    // Sang ngày mới (giờ VN): flush nốt ngày cũ rồi mở store mới
+    const oldStore = dailyLogs;
+    const oldUsers = Object.keys(oldStore.users);
+    dailyLogs = { date: today, users: {} };
+    dailyLogsDirtyUsers.clear();
+    try { flushDailyLogsFor(oldStore, oldUsers); } catch { /* ignore */ }
+  }
+  const key = entry.account || 'system';
+  if (!dailyLogs.users[key]) dailyLogs.users[key] = [];
+  dailyLogs.users[key].push(entry);
+  if (dailyLogs.users[key].length > MAX_DAILY_LOGS_PER_USER) dailyLogs.users[key].shift();
+  dailyLogsDirtyUsers.add(key);
+}
+
+// Flush daily logs lên Firebase mỗi 60 giây (chỉ user có log mới)
+setInterval(() => {
+  if (dailyLogsDirtyUsers.size === 0) return;
+  const users = [...dailyLogsDirtyUsers];
+  dailyLogsDirtyUsers.clear();
+  try { flushDailyLogsFor(dailyLogs, users); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
+}, 60 * 1000);
+
+// Sync system_logs/latest (100 dòng gần nhất) debounce 15 giây —
+// trước đây sync từng dòng gây 1 Firestore write/log, rất nặng server
+setInterval(() => {
+  if (!latestLogsDirty) return;
+  latestLogsDirty = false;
   const fbConfig = fbService.loadFirebaseConfig();
   if (fbConfig && fbConfig.projectId) {
     fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, fbConfig);
   }
+}, 15 * 1000);
+
+function addLog(entry) {
+  logHistory.push(entry);
+  if (logHistory.length > MAX_LOG) logHistory.shift();
+  io.emit('log', entry);
+  recordDailyLog(entry);
+  latestLogsDirty = true;
 }
+
+// Safety-net: định kỳ 5 phút lưu toàn bộ trạng thái (file + Firebase) để không
+// mất dữ liệu nếu server bị kill đột ngột giữa các lần lưu theo sự kiện
+setInterval(() => {
+  try {
+    saveQueueState();
+    saveAutoScanState();
+  } catch (e) {
+    console.error('[STATE] Lỗi safety-net sync:', e.message);
+  }
+}, 5 * 60 * 1000);
 
 // ===================== QUEUE MGMT ==========================
 
@@ -1177,6 +1303,45 @@ app.delete('/lythuyet/api/presets/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// =================== AUTO-SCAN PRESETS API =================
+
+app.get('/lythuyet/api/auto-presets', (req, res) => {
+  res.json(loadAutoPresets());
+});
+
+// Tạo Mẫu Preset Auto-Scan (lưu toàn bộ cấu hình form)
+app.post('/lythuyet/api/auto-presets', (req, res) => {
+  const { name, config } = req.body;
+  if (!name || !config || !Array.isArray(config.courses) || config.courses.length === 0) {
+    return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách khóa học hợp lệ' });
+  }
+
+  const presets = loadAutoPresets();
+  const newPreset = {
+    id: `autopreset_${Date.now()}`,
+    name,
+    config,
+    createdAt: new Date().toISOString(),
+  };
+
+  presets.unshift(newPreset);
+  saveAutoPresets(presets);
+  res.json({ ok: true, preset: newPreset });
+});
+
+// Xóa Mẫu Preset Auto-Scan
+app.delete('/lythuyet/api/auto-presets/:id', (req, res) => {
+  const { id } = req.params;
+  let presets = loadAutoPresets();
+  const initialLen = presets.length;
+  presets = presets.filter(p => p.id !== id);
+  if (presets.length === initialLen) {
+    return res.status(404).json({ error: 'Không tìm thấy Preset' });
+  }
+  saveAutoPresets(presets);
+  res.json({ ok: true });
+});
+
 // =================== DELETE QUEUES API =====================
 
 // Xóa 1 hàng chờ
@@ -1248,6 +1413,7 @@ function saveAutoScanState() {
         courseProgress: s.courseProgress,
         nextRunTime: s.nextRunTime || null,
         createdAt: s.createdAt || new Date().toISOString(),
+        completedAt: s.completedAt || null,
       });
     }
     fs.writeFileSync(AUTOSCAN_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
@@ -1287,6 +1453,7 @@ function scheduleAutoScanTimer(sessionId, fireAt, fn) {
 function createAutoScanSession(sessionId, account, courses, options, restoreState = null) {
   const autoSession = new AutoCourseSession(sessionId, account, courses, options);
   autoSession.createdAt = (restoreState && restoreState.createdAt) || new Date().toISOString();
+  autoSession.completedAt = null;
   autoSession.nextRunTime = null;
   if (restoreState) {
     if (restoreState.dailyStudiedMinutes != null) autoSession.dailyStudiedMinutes = restoreState.dailyStudiedMinutes;
@@ -1298,7 +1465,11 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
   autoSession.on('status', (status) => {
     // Bỏ qua emit muộn của phiên đã bị xóa khỏi Dashboard để không hồi sinh thẻ
     if (!autoScanSessions.has(status.id)) return;
-    io.emit('autoscan-status', { ...status, nextRunTime: autoSession.nextRunTime || null });
+    // Ghi nhận thời điểm kết thúc phiên (hoàn thành / dừng / lỗi)
+    if ((status.status === 'completed' || status.status === 'stopped' || status.status === 'error') && !autoSession.completedAt) {
+      autoSession.completedAt = new Date().toISOString();
+    }
+    io.emit('autoscan-status', { ...status, nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
     saveAutoScanState();
     // Chạm giới hạn ngày / ngày nghỉ / hết khung giờ học → tự hẹn giờ chạy lại (giống Queue thủ công)
     if (status.status === 'date-limit' || status.status === 'daily-limit' || status.status === 'time-window') {
@@ -1425,6 +1596,7 @@ async function loadAndRestoreAutoScans() {
     s.pausedFromStatus = saved.pausedFromStatus || null;
     s.currentCourseIndex = saved.currentCourseIndex || 0;
     s.nextRunTime = saved.nextRunTime || null;
+    s.completedAt = saved.completedAt || null;
 
     if (saved.status === 'paused') {
       logHistory.push({
@@ -1623,7 +1795,8 @@ app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
   await autoSession.stop();
   autoSession.status = 'stopped';
   autoSession.nextRunTime = null;
-  io.emit('autoscan-status', autoSession.getStatus());
+  if (!autoSession.completedAt) autoSession.completedAt = new Date().toISOString();
+  io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: null, completedAt: autoSession.completedAt });
   addLog({
     timestamp: formatVN(new Date()),
     account: autoSession.account.name,
@@ -1632,6 +1805,23 @@ app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
   });
   saveAutoScanState();
   res.json({ ok: true });
+});
+
+// Xóa tất cả phiên Auto-Scan đã kết thúc (hoàn thành / dừng / lỗi) khỏi Dashboard
+app.post('/lythuyet/api/auto-scan/clear-completed', async (req, res) => {
+  let clearedCount = 0;
+  for (const [id, autoSession] of autoScanSessions) {
+    if (autoSession.status === 'completed' || autoSession.status === 'stopped' || autoSession.status === 'error') {
+      clearAutoScanTimer(id);
+      await autoSession.stop();
+      autoSession.removeAllListeners('status');
+      autoScanSessions.delete(id);
+      io.emit('autoscan-removed', id);
+      clearedCount++;
+    }
+  }
+  saveAutoScanState();
+  res.json({ ok: true, count: clearedCount });
 });
 
 // Xóa thẻ phiên Auto-Scan khỏi Dashboard (hủy cả lịch hẹn nếu có)
@@ -1938,7 +2128,7 @@ io.on('connection', (socket) => {
   }
   const autoScanList = [];
   for (const [id, autoSession] of autoScanSessions) {
-    autoScanList.push({ ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime || null });
+    autoScanList.push({ ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
   }
   socket.emit('init', { sessions: sessionList, queues: queueList, autoScans: autoScanList, logs: logHistory.slice(-100) });
 

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import * as api from '../api';
 
 const AUTO_STATUS = {
@@ -17,6 +17,7 @@ const AUTO_STATUS = {
 
 const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying']);
 const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window']);
+const DONE_STATUSES = new Set(['completed', 'stopped', 'error']);
 
 function formatVNDateTime(iso) {
   try {
@@ -90,7 +91,7 @@ function AutoScanCard({ scan, toast }) {
         <span className="autoscan-card-name">{scan.account}</span>
         <div className="session-actions">
           <span className={`session-badge ${info.badge}`}>{info.text}</span>
-          {(scan.status === 'scanning' || scan.status === 'studying') && (
+          {(scan.status === 'logging-in' || scan.status === 'scanning' || scan.status === 'studying') && (
             <button className="btn btn-sm btn-outline" onClick={handlePause}>Tạm dừng</button>
           )}
           {isPaused && (
@@ -110,6 +111,9 @@ function AutoScanCard({ scan, toast }) {
         <span>Hôm nay: <strong>{formatMinutes(scan.dailyStudiedMinutes)} / {formatMinutes(dailyMax)}</strong></span>
         {isScheduled && scan.nextRunTime && (
           <span>Tự chạy lại: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
+        )}
+        {DONE_STATUSES.has(scan.status) && scan.completedAt && (
+          <span>Kết thúc: <strong>{formatVNDateTime(scan.completedAt)}</strong></span>
         )}
       </div>
 
@@ -149,16 +153,12 @@ function AutoScanCard({ scan, toast }) {
   );
 }
 
-export default function AutoScanPanel({ accounts, autoScans, toast }) {
-  const [courses, setCourses] = useState([
-    {
-      courseUrl: 'https://hoclythuyetlaixe.eco-tek.com.vn/slides/cau-tao-va-sua-chua-thong-thuong-xe-cat-tuong-minh-213',
-      targetHours: '12',
-      targetMinutes: '36',
-    },
-  ]);
+const EMPTY_COURSE = { courseUrl: '', targetHours: '', targetMinutes: '' };
 
-  const [allowedDateRanges, setAllowedDateRanges] = useState('25/07-28/07, 30/07, 01/08-02/08, 04/08, 06/08-14/08');
+export default function AutoScanPanel({ accounts, autoScans, toast }) {
+  const [courses, setCourses] = useState([{ ...EMPTY_COURSE }]);
+
+  const [allowedDateRanges, setAllowedDateRanges] = useState('');
   const [dailyMaxHours, setDailyMaxHours] = useState('8');
   const [newDayStartTime, setNewDayStartTime] = useState('06:00');
   const [refreshInterval, setRefreshInterval] = useState('15');
@@ -167,11 +167,108 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
   const [selectedAccounts, setSelectedAccounts] = useState(new Set());
   const [loading, setLoading] = useState(false);
 
+  // Auto-Scan Presets
+  const [presets, setPresets] = useState([]);
+  const [selectedPresetId, setSelectedPresetId] = useState('');
+  const [showSavePresetModal, setShowSavePresetModal] = useState(false);
+  const [newPresetName, setNewPresetName] = useState('');
+  const [presetSaving, setPresetSaving] = useState(false);
+
+  useEffect(() => {
+    api.fetchAutoPresets()
+      .then(data => { if (Array.isArray(data)) setPresets(data); })
+      .catch(() => {});
+  }, []);
+
   const scanList = Object.values(autoScans || {});
+  const activeScans = scanList.filter(s => !DONE_STATUSES.has(s.status));
+  const doneScans = scanList.filter(s => DONE_STATUSES.has(s.status));
   const activeCount = scanList.filter(s => ACTIVE_STATUSES.has(s.status) || s.status === 'paused').length;
 
+  const handleSelectPreset = (presetId) => {
+    setSelectedPresetId(presetId);
+    if (!presetId) return;
+    const preset = presets.find(p => p.id === presetId);
+    if (!preset || !preset.config) return;
+
+    const cfg = preset.config;
+    if (Array.isArray(cfg.courses) && cfg.courses.length > 0) {
+      setCourses(cfg.courses.map(c => ({
+        courseUrl: c.courseUrl || '',
+        targetHours: c.targetHours != null ? String(c.targetHours) : '',
+        targetMinutes: c.targetMinutes != null ? String(c.targetMinutes) : '',
+      })));
+    }
+    if (cfg.allowedDateRanges != null) setAllowedDateRanges(cfg.allowedDateRanges);
+    if (cfg.dailyMaxHours != null) setDailyMaxHours(String(cfg.dailyMaxHours));
+    if (cfg.newDayStartTime != null) setNewDayStartTime(cfg.newDayStartTime);
+    if (cfg.refreshInterval != null) setRefreshInterval(String(cfg.refreshInterval));
+    if (cfg.timeWindowsText != null) setTimeWindowsText(cfg.timeWindowsText);
+    if (cfg.stealth != null) setStealth(!!cfg.stealth);
+  };
+
+  const handleSavePresetSubmit = async (e) => {
+    e.preventDefault();
+    if (!newPresetName.trim()) return;
+
+    setPresetSaving(true);
+    try {
+      const res = await api.saveAutoPreset({
+        name: newPresetName.trim(),
+        config: {
+          courses: courses.filter(c => c.courseUrl.trim()),
+          allowedDateRanges,
+          dailyMaxHours,
+          newDayStartTime,
+          refreshInterval,
+          timeWindowsText,
+          stealth,
+        },
+      });
+
+      if (res.ok && res.preset) {
+        setPresets(prev => [res.preset, ...prev]);
+        setSelectedPresetId(res.preset.id);
+        setShowSavePresetModal(false);
+        setNewPresetName('');
+        toast('Đã lưu Preset Auto-Scan', 'success');
+      } else {
+        toast(res.error || 'Lỗi lưu Preset', 'error');
+      }
+    } catch {
+      toast('Lỗi kết nối lưu Preset', 'error');
+    } finally {
+      setPresetSaving(false);
+    }
+  };
+
+  const handleDeletePreset = async () => {
+    if (!selectedPresetId) return;
+    const preset = presets.find(p => p.id === selectedPresetId);
+    if (!preset) return;
+    if (!window.confirm(`Xóa mẫu Preset "${preset.name}"?`)) return;
+
+    try {
+      const res = await api.deleteAutoPreset(selectedPresetId);
+      if (res.ok) {
+        setPresets(prev => prev.filter(p => p.id !== selectedPresetId));
+        setSelectedPresetId('');
+        toast('Đã xóa Preset', 'info');
+      }
+    } catch {
+      toast('Lỗi xóa Preset', 'error');
+    }
+  };
+
+  const handleClearCompleted = async () => {
+    if (!window.confirm('Xóa tất cả phiên Auto-Scan đã kết thúc?')) return;
+    const res = await api.clearCompletedAutoScans();
+    if (res.ok) toast(`Đã xóa ${res.count} phiên đã kết thúc`, 'success');
+    else toast(res.error || 'Lỗi xóa phiên đã kết thúc', 'error');
+  };
+
   const addCourse = () => {
-    setCourses(prev => [...prev, { courseUrl: '', targetHours: '12', targetMinutes: '0' }]);
+    setCourses(prev => [...prev, { ...EMPTY_COURSE }]);
   };
 
   const removeCourse = idx => {
@@ -249,6 +346,81 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             của từng bài rồi treo đủ giờ. Tự kiểm soát định mức tổng giờ của từng khóa
             và giới hạn số giờ học mỗi ngày.
           </div>
+
+          {/* Preset Toolbar */}
+          <div className="preset-bar">
+            <span className="filter-label">Mẫu Preset Auto-Scan</span>
+
+            <select
+              value={selectedPresetId}
+              onChange={e => handleSelectPreset(e.target.value)}
+              style={{ minWidth: 200 }}
+            >
+              <option value="">-- Chọn mẫu đã lưu --</option>
+              {presets.map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.name} ({p.config && p.config.courses ? p.config.courses.length : 0} khóa)
+                </option>
+              ))}
+            </select>
+
+            {selectedPresetId && (
+              <button
+                type="button"
+                className="btn btn-sm btn-danger"
+                onClick={handleDeletePreset}
+                title="Xóa mẫu Preset này"
+              >
+                Xóa mẫu
+              </button>
+            )}
+
+            <button
+              type="button"
+              className="btn btn-sm btn-outline"
+              onClick={() => setShowSavePresetModal(true)}
+              style={{ marginLeft: 'auto' }}
+              disabled={!courses.some(c => c.courseUrl.trim())}
+            >
+              Lưu Preset mới
+            </button>
+          </div>
+
+          {/* Save Preset Modal */}
+          {showSavePresetModal && (
+            <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowSavePresetModal(false)}>
+              <div className="modal">
+                <div className="modal-title">Lưu mẫu Preset Auto-Scan</div>
+                <p className="modal-desc">
+                  Lưu lại toàn bộ cấu hình hiện tại ({courses.filter(c => c.courseUrl.trim()).length} khóa học,
+                  lịch ngày học, giới hạn giờ, khung giờ) để nạp lại nhanh cho lần sau.
+                </p>
+
+                <form onSubmit={handleSavePresetSubmit}>
+                  <div className="form-group">
+                    <label>Tên mẫu Preset</label>
+                    <input
+                      type="text"
+                      placeholder="VD: Bộ khóa học Hạng B - Tháng 8..."
+                      value={newPresetName}
+                      onChange={e => setNewPresetName(e.target.value)}
+                      autoFocus
+                      required
+                    />
+                  </div>
+
+                  <div className="btn-group" style={{ justifyContent: 'flex-end', marginTop: 20 }}>
+                    <button type="button" className="btn btn-outline" onClick={() => setShowSavePresetModal(false)}>
+                      Hủy
+                    </button>
+                    <button type="submit" className="btn btn-primary" disabled={presetSaving || !newPresetName.trim()}>
+                      {presetSaving ? 'Đang lưu...' : 'Lưu Preset'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
 
           {/* Courses List Form */}
           <div className="form-group">
@@ -443,8 +615,15 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       {/* Progress & Live Monitor */}
       <div className="card">
         <div className="card-header" style={{ justifyContent: 'space-between' }}>
-          <span>Tiến độ Auto-Scan</span>
-          {activeCount > 0 && <span className="count-pill">{activeCount} hoạt động</span>}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            Tiến độ Auto-Scan
+            {activeCount > 0 && <span className="count-pill">{activeCount} hoạt động</span>}
+          </span>
+          {doneScans.length > 0 && (
+            <button className="btn btn-xs btn-danger" onClick={handleClearCompleted}>
+              Xóa tất cả đã xong ({doneScans.length})
+            </button>
+          )}
         </div>
         <div className="card-body">
           {scanList.length === 0 ? (
@@ -457,9 +636,32 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
               </p>
             </div>
           ) : (
-            scanList.map(scan => (
-              <AutoScanCard key={scan.id} scan={scan} toast={toast} />
-            ))
+            <>
+              {activeScans.length > 0 && (
+                <div>
+                  <div className="section-label">
+                    <span>Đang hoạt động / Đã hẹn lịch ({activeScans.length})</span>
+                  </div>
+                  {activeScans.map(scan => (
+                    <AutoScanCard key={scan.id} scan={scan} toast={toast} />
+                  ))}
+                </div>
+              )}
+
+              {doneScans.length > 0 && (
+                <div style={{ marginTop: activeScans.length > 0 ? 16 : 0 }}>
+                  <div className="section-label">
+                    <span>Đã hoàn thành / Kết thúc ({doneScans.length})</span>
+                    <button className="btn btn-xs btn-danger" onClick={handleClearCompleted}>
+                      Xóa tất cả
+                    </button>
+                  </div>
+                  {doneScans.map(scan => (
+                    <AutoScanCard key={scan.id} scan={scan} toast={toast} />
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>

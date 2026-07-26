@@ -45,7 +45,7 @@ export default function LogPanel({ logs, onClear }) {
   return (
     <div className="card log-container">
       <div className="card-header" style={{ flexWrap: 'wrap' }}>
-        <span>Nhật ký hệ thống</span>
+        <span>Logs</span>
 
         {/* Filter Controls Bar */}
         <div className="filter-bar" style={{ marginLeft: 'auto' }}>

@@ -107,6 +107,30 @@ export async function removeAutoScan(id) {
   return res.json();
 }
 
+export async function clearCompletedAutoScans() {
+  const res = await fetch(`${API}/api/auto-scan/clear-completed`, { method: 'POST' });
+  return res.json();
+}
+
+export async function fetchAutoPresets() {
+  const res = await fetch(`${API}/api/auto-presets`);
+  return res.json();
+}
+
+export async function saveAutoPreset(payload) {
+  const res = await fetch(`${API}/api/auto-presets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return res.json();
+}
+
+export async function deleteAutoPreset(id) {
+  const res = await fetch(`${API}/api/auto-presets/${id}`, { method: 'DELETE' });
+  return res.json();
+}
+
 export async function fetchPresets() {
   const res = await fetch(`${API}/api/presets`);
   return res.json();

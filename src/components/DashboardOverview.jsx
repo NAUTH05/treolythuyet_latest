@@ -96,7 +96,7 @@ export default function DashboardOverview({ accounts, sessions, queues, autoScan
             Xem tiến độ hàng chờ
           </button>
           <button className="btn btn-outline" onClick={() => onNavigate('logs')}>
-            Xem Nhật ký (Logs)
+            Xem Logs
           </button>
           <button className="btn btn-outline" onClick={() => onNavigate('settings')}>
             Cấu hình Firebase & Mật khẩu

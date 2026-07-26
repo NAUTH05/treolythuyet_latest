@@ -21,7 +21,7 @@ const TAB_TITLES = {
   control: 'Bảng điều khiển Box bài học',
   accounts: 'Quản lý danh sách tài khoản',
   queues: 'Hàng chờ & Các phiên đang chạy',
-  logs: 'Nhật ký hoạt động hệ thống',
+  logs: 'Logs',
   settings: 'Cấu hình hệ thống & Firebase',
 };
 

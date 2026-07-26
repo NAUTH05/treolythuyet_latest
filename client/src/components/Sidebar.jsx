@@ -50,7 +50,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
     { id: 'control', label: 'Điều khiển Box', icon: '▶' },
     { id: 'accounts', label: 'Tài khoản', icon: '○' },
     { id: 'queues', label: 'Hàng chờ & Phiên', icon: '≡', badge: activeQueuesCount + activeSessionsCount },
-    { id: 'logs', label: 'Nhật ký hệ thống', icon: '∷' },
+    { id: 'logs', label: 'Logs', icon: '∷' },
     { id: 'settings', label: 'Cài đặt & Firebase', icon: '◎' },
   ];
 
