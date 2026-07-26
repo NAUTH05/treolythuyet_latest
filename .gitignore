@@ -4,6 +4,7 @@ client/dist/
 logs/
 accounts.json
 queue-state.json
+autoscan-state.json
 presets.json
 admin-config.json
 firebase-config.json

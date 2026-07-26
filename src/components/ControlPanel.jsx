@@ -25,6 +25,7 @@ function createDefaultBox() {
     startHour: 7,
     refreshInterval: 15,
     stealthInterval: 30,
+    stealth: true,
     useTimeWindows: false,
     timeWindows: [{ start: '07:00', end: '23:00' }],
     useSchedule: false,
@@ -59,6 +60,7 @@ function convertSavedToBox(savedBox, globalSettings = {}) {
     startHour: savedBox.pairOptions?.startHour ?? savedBox.startHour ?? globalSettings.startHour ?? 7,
     refreshInterval: savedBox.pairOptions?.refreshInterval ?? savedBox.refreshInterval ?? globalSettings.refreshInterval ?? 15,
     stealthInterval: savedBox.pairOptions?.stealthInterval ?? savedBox.stealthInterval ?? globalSettings.stealthInterval ?? 30,
+    stealth: (savedBox.pairOptions?.stealth ?? savedBox.stealth) !== false,
     useTimeWindows: !!(savedBox.useTimeWindows || savedBox.pairOptions?.timeWindows?.length),
     timeWindows: savedBox.timeWindows || savedBox.pairOptions?.timeWindows || [{ start: '07:00', end: '23:00' }],
   };
@@ -232,6 +234,7 @@ export default function ControlPanel({ accounts, onStart }) {
             startHour: parseInt(box.startHour, 10) || 7,
             refreshInterval: parseInt(box.refreshInterval, 10) || 15,
             stealthInterval: parseInt(box.stealthInterval, 10) || 30,
+            stealth: box.stealth !== false,
             ...(box.useTimeWindows && {
               timeWindows: box.timeWindows.filter(w => w.start && w.end),
             }),
@@ -511,6 +514,17 @@ export default function ControlPanel({ accounts, onStart }) {
                           ))}
                         </div>
                       )}
+                    </div>
+
+                    <div style={{ marginBottom: 8 }}>
+                      <label className="check-row">
+                        <input
+                          type="checkbox"
+                          checked={box.stealth !== false}
+                          onChange={e => updateBox(boxIdx, 'stealth', e.target.checked)}
+                        />
+                        <span>Stealth / Anti-detection (giả lập thao tác người dùng, chống phát hiện bot)</span>
+                      </label>
                     </div>
 
                     <div>

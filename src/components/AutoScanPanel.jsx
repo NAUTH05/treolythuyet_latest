@@ -6,14 +6,31 @@ const AUTO_STATUS = {
   'logging-in': { text: 'Đang đăng nhập', badge: 'badge-logging-in' },
   scanning:     { text: 'Đang quét khóa học', badge: 'badge-running' },
   studying:     { text: 'Đang treo học', badge: 'badge-running' },
-  'date-limit': { text: 'Ngày nghỉ — chờ lịch', badge: 'badge-logging-in' },
-  'daily-limit':{ text: 'Đạt giới hạn ngày', badge: 'badge-logging-in' },
+  paused:       { text: 'Tạm dừng', badge: 'badge-idle' },
+  'date-limit': { text: 'Ngày nghỉ — đã hẹn lịch', badge: 'badge-logging-in' },
+  'daily-limit':{ text: 'Đủ giờ hôm nay — đã hẹn lịch', badge: 'badge-logging-in' },
+  'time-window':{ text: 'Ngoài khung giờ — đã hẹn lịch', badge: 'badge-logging-in' },
   completed:    { text: 'Hoàn thành', badge: 'badge-completed' },
   stopped:      { text: 'Đã dừng', badge: 'badge-idle' },
   error:        { text: 'Lỗi', badge: 'badge-error' },
 };
 
 const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying']);
+const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window']);
+
+function formatVNDateTime(iso) {
+  try {
+    return new Date(iso).toLocaleString('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      hour: '2-digit',
+      minute: '2-digit',
+      day: '2-digit',
+      month: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
 
 function formatMinutes(mins) {
   const m = Math.max(0, Math.round(mins || 0));
@@ -32,10 +49,27 @@ function courseNameFromUrl(url) {
 function AutoScanCard({ scan, toast }) {
   const info = AUTO_STATUS[scan.status] || { text: scan.status, badge: 'badge-idle' };
   const isActive = ACTIVE_STATUSES.has(scan.status);
+  const isScheduled = SCHEDULED_STATUSES.has(scan.status);
+  const isPaused = scan.status === 'paused';
   const courses = Object.entries(scan.courseProgress || {});
 
+  const handlePause = async () => {
+    const res = await api.pauseAutoScan(scan.id);
+    if (res.ok) toast('Đã tạm dừng phiên Auto-Scan', 'info');
+    else toast(res.error || 'Lỗi tạm dừng phiên Auto-Scan', 'error');
+  };
+
+  const handleResume = async () => {
+    const res = await api.resumeAutoScan(scan.id);
+    if (res.ok) toast('Đã tiếp tục phiên Auto-Scan', 'success');
+    else toast(res.error || 'Lỗi tiếp tục phiên Auto-Scan', 'error');
+  };
+
   const handleStop = async () => {
-    if (!window.confirm(`Dừng phiên Auto-Scan của ${scan.account}?`)) return;
+    const msg = isScheduled
+      ? `Hủy lịch hẹn và dừng phiên Auto-Scan của ${scan.account}?`
+      : `Dừng phiên Auto-Scan của ${scan.account}?`;
+    if (!window.confirm(msg)) return;
     const res = await api.stopAutoScan(scan.id);
     if (res.ok) toast('Đã dừng phiên Auto-Scan', 'info');
     else toast(res.error || 'Lỗi dừng phiên Auto-Scan', 'error');
@@ -56,9 +90,16 @@ function AutoScanCard({ scan, toast }) {
         <span className="autoscan-card-name">{scan.account}</span>
         <div className="session-actions">
           <span className={`session-badge ${info.badge}`}>{info.text}</span>
-          {isActive ? (
+          {(scan.status === 'scanning' || scan.status === 'studying') && (
+            <button className="btn btn-sm btn-outline" onClick={handlePause}>Tạm dừng</button>
+          )}
+          {isPaused && (
+            <button className="btn btn-sm btn-primary" onClick={handleResume}>Tiếp tục</button>
+          )}
+          {(isActive || isScheduled || isPaused) && (
             <button className="btn btn-sm btn-danger" onClick={handleStop}>Dừng</button>
-          ) : (
+          )}
+          {!isActive && !isPaused && (
             <button className="btn btn-sm btn-ghost" onClick={handleRemove} title="Xóa thẻ này khỏi danh sách">Xóa</button>
           )}
         </div>
@@ -67,6 +108,9 @@ function AutoScanCard({ scan, toast }) {
       <div className="autoscan-meta">
         <span>Khóa học: <strong>{Math.min((scan.currentCourseIndex || 0) + 1, scan.totalCourses || 1)}/{scan.totalCourses || 1}</strong></span>
         <span>Hôm nay: <strong>{formatMinutes(scan.dailyStudiedMinutes)} / {formatMinutes(dailyMax)}</strong></span>
+        {isScheduled && scan.nextRunTime && (
+          <span>Tự chạy lại: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
+        )}
       </div>
 
       <div className="progress-track">
@@ -116,11 +160,15 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
 
   const [allowedDateRanges, setAllowedDateRanges] = useState('25/07-28/07, 30/07, 01/08-02/08, 04/08, 06/08-14/08');
   const [dailyMaxHours, setDailyMaxHours] = useState('8');
+  const [newDayStartTime, setNewDayStartTime] = useState('06:00');
+  const [refreshInterval, setRefreshInterval] = useState('15');
+  const [timeWindowsText, setTimeWindowsText] = useState('');
+  const [stealth, setStealth] = useState(false);
   const [selectedAccounts, setSelectedAccounts] = useState(new Set());
   const [loading, setLoading] = useState(false);
 
   const scanList = Object.values(autoScans || {});
-  const activeCount = scanList.filter(s => ACTIVE_STATUSES.has(s.status)).length;
+  const activeCount = scanList.filter(s => ACTIVE_STATUSES.has(s.status) || s.status === 'paused').length;
 
   const addCourse = () => {
     setCourses(prev => [...prev, { courseUrl: '', targetHours: '12', targetMinutes: '0' }]);
@@ -146,6 +194,17 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       return;
     }
 
+    // Parse khung giờ học "07:00-11:30, 13:00-22:00" → [{start, end}]
+    const timeWindows = timeWindowsText
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(part => {
+        const m = part.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$/);
+        return m ? { start: m[1], end: m[2] } : null;
+      })
+      .filter(Boolean);
+
     setLoading(true);
     try {
       const data = await api.startAutoScan({
@@ -156,6 +215,10 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         })),
         allowedDateRanges: allowedDateRanges.split(',').map(s => s.trim()).filter(Boolean),
         dailyMaxMinutes: (parseInt(dailyMaxHours, 10) || 8) * 60,
+        newDayStartTime: newDayStartTime.trim() || '06:00',
+        refreshInterval: parseInt(refreshInterval, 10) || 15,
+        stealth,
+        ...(timeWindows.length > 0 && { timeWindows }),
         accountIndices: [...selectedAccounts],
       });
 
@@ -177,7 +240,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       <div className="card">
         <div className="card-header" style={{ justifyContent: 'space-between' }}>
           <span>Cấu hình Auto-Scan & Treo học</span>
-          <span className="session-badge badge-running">Thử nghiệm</span>
+          <span className="session-badge badge-running">Chính thức</span>
         </div>
 
         <div className="card-body">
@@ -241,7 +304,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             </button>
           </div>
 
-          {/* Date Ranges & Daily Cap */}
+          {/* Date Ranges & Daily Cap & New Day Start Time */}
           <div className="form-group">
             <label>Lịch ngày học được phép (phân cách bằng dấu phẩy)</label>
             <input
@@ -251,7 +314,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
               onChange={e => setAllowedDateRanges(e.target.value)}
             />
             <div className="hint">
-              Nếu ngày hiện tại là ngày nghỉ, bot sẽ tự chờ đến 06:00 ngày học hợp lệ tiếp theo.
+              Nếu ngày hiện tại là ngày nghỉ, bot sẽ tự chờ đến giờ bắt đầu ngày học hợp lệ tiếp theo.
             </div>
           </div>
 
@@ -268,6 +331,70 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
                 style={{ width: 100 }}
               />
               <span className="unit">tiếng/ngày (mặc định: 8)</span>
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label>Giờ bắt đầu ngày mới (Hẹn tự động chạy lại)</label>
+            <div className="input-row">
+              <input
+                type="text"
+                placeholder="06:00"
+                value={newDayStartTime}
+                onChange={e => setNewDayStartTime(e.target.value)}
+                style={{ width: 100 }}
+              />
+              <span className="unit">ví dụ: 06:00, 07:00 (mặc định: 06:00)</span>
+            </div>
+            <div className="hint">
+              Nếu chạm giới hạn ngày hoặc gặp ngày nghỉ, bot sẽ tự động hẹn giờ chạy lại vào giờ này.
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label>Thời gian F5 reload trang (lưu checkpoint & giữ phiên)</label>
+            <div className="input-row">
+              <input
+                type="number"
+                placeholder="15"
+                min="1"
+                max="60"
+                value={refreshInterval}
+                onChange={e => setRefreshInterval(e.target.value)}
+                style={{ width: 100 }}
+              />
+              <span className="unit">phút/lần (mặc định: 15)</span>
+            </div>
+            <div className="hint">
+              Sau mỗi chu kỳ này, bot sẽ tự động reload trang để lưu checkpoint lên web và thực hiện Heartbeat Check.
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label>Khung giờ học trong ngày (tùy chọn)</label>
+            <input
+              type="text"
+              placeholder="VD: 07:00-11:30, 13:00-22:00"
+              value={timeWindowsText}
+              onChange={e => setTimeWindowsText(e.target.value)}
+            />
+            <div className="hint">
+              Để trống = không giới hạn. Khi hết khung giờ, bot sẽ F5 lưu checkpoint, tạm nghỉ
+              và tự hẹn giờ chạy lại vào đầu khung giờ tiếp theo (giống Queue thủ công).
+            </div>
+          </div>
+
+          <div className="form-group">
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={stealth}
+                onChange={e => setStealth(e.target.checked)}
+              />
+              <span>Stealth / Anti-detection (mặc định TẮT cho Auto-Scan)</span>
+            </label>
+            <div className="hint">
+              Khi bật: giả lập di chuột/cuộn trang, che dấu hiệu tự động hóa. Mặc định tắt để chạy nhẹ và ổn định.
             </div>
           </div>
 
@@ -317,7 +444,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       <div className="card">
         <div className="card-header" style={{ justifyContent: 'space-between' }}>
           <span>Tiến độ Auto-Scan</span>
-          {activeCount > 0 && <span className="count-pill">{activeCount} đang chạy</span>}
+          {activeCount > 0 && <span className="count-pill">{activeCount} hoạt động</span>}
         </div>
         <div className="card-body">
           {scanList.length === 0 ? (

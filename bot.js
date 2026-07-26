@@ -19,6 +19,7 @@ class BotSession extends EventEmitter {
     this.options = {
       headless: true,
       durationMinutes: 240,
+      stealth: true, // Bật/tắt anti-detection + giả lập thao tác (mặc định BẬT cho Queue thủ công)
       stealthInterval: 30,
       refreshInterval: 30, // F5 mỗi 30 phút
       perUrlTimes: null,  // Mảng thời gian (phút) riêng cho từng URL, null = dùng durationMinutes
@@ -140,6 +141,7 @@ class BotSession extends EventEmitter {
   }
 
   async fakeVisibilityAPI() {
+    if (!this.options.stealth) return;
     await this.page.evaluate(() => {
       Object.defineProperty(document, 'hidden', { value: false, writable: false });
       Object.defineProperty(document, 'visibilityState', { value: 'visible', writable: false });
@@ -234,15 +236,17 @@ class BotSession extends EventEmitter {
     }, 5 * 60 * 1000);
     this.intervals.push(progressTimer);
 
-    // Stealth loop
-    const stealthTimer = setInterval(async () => {
-      if (this.status !== 'running') return;
-      try {
-        await this.fakeActivity();
-        await this.fakeVisibilityAPI();
-      } catch { /* ignore */ }
-    }, this.options.stealthInterval * 1000);
-    this.intervals.push(stealthTimer);
+    // Stealth loop (chỉ khi bật Stealth)
+    if (this.options.stealth) {
+      const stealthTimer = setInterval(async () => {
+        if (this.status !== 'running') return;
+        try {
+          await this.fakeActivity();
+          await this.fakeVisibilityAPI();
+        } catch { /* ignore */ }
+      }, this.options.stealthInterval * 1000);
+      this.intervals.push(stealthTimer);
+    }
 
     // Auto F5 refresh với random jitter ±30%
     this._scheduleRefresh();
@@ -352,7 +356,9 @@ class BotSession extends EventEmitter {
     await this.page.fill('input[name="login"]', this.account.email);
     await this.page.fill('input[name="password"]', this.account.password);
 
-    await this.page.waitForTimeout(this.randomBetween(500, 1500));
+    if (this.options.stealth) {
+      await this.page.waitForTimeout(this.randomBetween(500, 1500));
+    }
 
     await Promise.all([
       this.page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }),
@@ -489,11 +495,14 @@ class BotSession extends EventEmitter {
         timezoneId: 'Asia/Ho_Chi_Minh',
       });
 
-      await this.context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
-      });
+      // Anti-detection init script (chỉ khi bật Stealth)
+      if (this.options.stealth) {
+        await this.context.addInitScript(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+          Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+        });
+      }
 
       this.page = await this.context.newPage();
 

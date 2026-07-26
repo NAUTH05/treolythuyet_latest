@@ -92,6 +92,16 @@ export async function stopAutoScan(id) {
   return res.json();
 }
 
+export async function pauseAutoScan(id) {
+  const res = await fetch(`${API}/api/auto-scan/pause/${id}`, { method: 'POST' });
+  return res.json();
+}
+
+export async function resumeAutoScan(id) {
+  const res = await fetch(`${API}/api/auto-scan/resume/${id}`, { method: 'POST' });
+  return res.json();
+}
+
 export async function removeAutoScan(id) {
   const res = await fetch(`${API}/api/auto-scan/sessions/${id}`, { method: 'DELETE' });
   return res.json();

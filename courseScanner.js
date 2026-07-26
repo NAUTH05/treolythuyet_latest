@@ -47,11 +47,19 @@ function isAllowedStudyDate(date = new Date(), allowedRanges = []) {
   return false;
 }
 
-// Tìm ngày học hợp lệ tiếp theo (trả về Date object lúc 06:00 AM)
-function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = []) {
+// Tìm ngày học hợp lệ tiếp theo (trả về Date object theo newDayStartTime, ví dụ 06:00 AM)
+function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = [], newDayStartTime = '06:00') {
   const current = new Date(fromDate);
   current.setDate(current.getDate() + 1);
-  current.setHours(6, 0, 0, 0);
+
+  let startH = 6;
+  let startM = 0;
+  if (newDayStartTime && typeof newDayStartTime === 'string') {
+    const parts = newDayStartTime.split(':').map(Number);
+    if (!isNaN(parts[0])) startH = parts[0];
+    if (!isNaN(parts[1])) startM = parts[1];
+  }
+  current.setHours(startH, startM, 0, 0);
 
   // Tìm trong 60 ngày tiếp theo
   for (let i = 0; i < 60; i++) {
@@ -61,10 +69,10 @@ function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = []) {
     current.setDate(current.getDate() + 1);
   }
 
-  // Fallback ngày mai lúc 06:00 AM nếu không khớp
+  // Fallback ngày mai theo newDayStartTime nếu không khớp
   const fallback = new Date(fromDate);
   fallback.setDate(fallback.getDate() + 1);
-  fallback.setHours(6, 0, 0, 0);
+  fallback.setHours(startH, startM, 0, 0);
   return fallback;
 }
 
@@ -161,8 +169,11 @@ async function readDomTimer(page) {
 
     const timer = await page.evaluate(async () => {
       const makeTimer = (h, m, s, source) => {
-        if (h > 0 || m > 0 || s > 0) {
-          return { hours: h, minutes: m, seconds: s, totalMinutes: h * 60 + m + (s > 0 ? 1 : 0), source };
+        const safeH = isNaN(h) ? 0 : Math.max(0, parseInt(h, 10) || 0);
+        const safeM = isNaN(m) ? 0 : Math.max(0, parseInt(m, 10) || 0);
+        const safeS = isNaN(s) ? 0 : Math.max(0, parseInt(s, 10) || 0);
+        if (safeH > 0 || safeM > 0 || safeS > 0) {
+          return { hours: safeH, minutes: safeM, seconds: safeS, totalMinutes: safeH * 60 + safeM + (safeS > 0 ? 1 : 0), source };
         }
         return null;
       };
