@@ -325,7 +325,7 @@ class AutoCourseSession extends EventEmitter {
     if (!isAllowedStudyDate(now, this.options.allowedDateRanges)) {
       const nextDate = getNextAllowedStudyDate(now, this.options.allowedDateRanges, this.options.newDayStartTime);
       this.status = 'date-limit';
-      this.log(`⏰ Hôm nay (${now.toLocaleDateString('vi-VN')}) là ngày nghỉ — Hẹn lịch tiếp tục lúc ${this.options.newDayStartTime || '06:00'} ngày ${nextDate.toLocaleDateString('vi-VN')}`, 'warn');
+      this.log(`⏰ Hôm nay (${now.toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}) là ngày nghỉ — Hẹn lịch tiếp tục lúc ${this.options.newDayStartTime || '06:00'} ngày ${nextDate.toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}`, 'warn');
       this.emit('status', this.getStatus());
       return;
     }

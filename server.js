@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { BotSession } = require('./bot');
 const { AutoCourseSession } = require('./autoCourseEngine');
-const { getNextAllowedStudyDate } = require('./courseScanner');
+const { isAllowedStudyDate, getNextAllowedStudyDate } = require('./courseScanner');
 const fbService = require('./firebase-service');
 
 const ADMIN_CONFIG_FILE = path.join(__dirname, 'admin-config.json');
@@ -1442,6 +1442,18 @@ async function loadAndRestoreAutoScans() {
         level: 'warn',
       });
       s.status = 'idle';
+      setTimeout(() => startAutoScanWhenFree(s), 5000);
+      active++;
+    } else if (saved.status === 'date-limit' && isAllowedStudyDate(new Date(), options.allowedDateRanges)) {
+      // Hôm nay (giờ VN) đã là ngày học hợp lệ — bỏ qua lịch hẹn cũ (có thể sai do lệch múi giờ) → chạy lại ngay
+      logHistory.push({
+        timestamp: formatVN(new Date()),
+        account: saved.account.name,
+        msg: `▶️ Hôm nay là ngày học hợp lệ — khởi động lại Auto-Scan ngay (bỏ lịch hẹn cũ)`,
+        level: 'info',
+      });
+      s.status = 'idle';
+      s.nextRunTime = null;
       setTimeout(() => startAutoScanWhenFree(s), 5000);
       active++;
     } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window') {

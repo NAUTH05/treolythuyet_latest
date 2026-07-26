@@ -3,22 +3,43 @@
 //  Tự động quét khóa học, đọc DOM Timer, kiểm tra Lịch Ngày Học
 // ============================================================
 
+// ── Chuẩn hóa múi giờ Việt Nam (Asia/Ho_Chi_Minh, UTC+7 cố định, không DST) ──
+const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+// Lấy {year, month(0-11), day} theo lịch Việt Nam của một thời điểm bất kỳ
+// (không phụ thuộc múi giờ server — VPS chạy UTC vẫn ra đúng ngày VN)
+function vnDateParts(date = new Date()) {
+  const shifted = new Date(date.getTime() + VN_OFFSET_MS);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth(),
+    day: shifted.getUTCDate(),
+  };
+}
+
+// Khóa so sánh dạng số yyyymmdd cho một ngày lịch
+function dateKey(year, month, day) {
+  return year * 10000 + (month + 1) * 100 + day;
+}
+
+// Parse "25/07" hoặc "25/07/2026" → {year, month(0-11), day} (năm mặc định = năm hiện tại theo giờ VN)
 function parseVNShortDate(dateStr) {
   if (!dateStr) return null;
   const parts = dateStr.trim().split('/');
   if (parts.length < 2) return null;
   const day = parseInt(parts[0], 10);
   const month = parseInt(parts[1], 10) - 1;
-  const year = parts.length >= 3 ? parseInt(parts[2], 10) : new Date().getFullYear();
-  return new Date(year, month, day, 0, 0, 0, 0);
+  const year = parts.length >= 3 ? parseInt(parts[2], 10) : vnDateParts().year;
+  if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+  return { year, month, day };
 }
 
-// Kiểm tra xem ngày (Date object) có thuộc Lịch Ngày Học Được Phép hay không
+// Kiểm tra xem thời điểm `date` (theo lịch VN) có thuộc Lịch Ngày Học Được Phép hay không
 function isAllowedStudyDate(date = new Date(), allowedRanges = []) {
   if (!allowedRanges || allowedRanges.length === 0) return true; // Trống = cho phép tất cả các ngày
 
-  const checkDate = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
-  const checkTime = checkDate.getTime();
+  const p = vnDateParts(date);
+  const checkKey = dateKey(p.year, p.month, p.day);
 
   for (const item of allowedRanges) {
     if (!item) continue;
@@ -27,18 +48,19 @@ function isAllowedStudyDate(date = new Date(), allowedRanges = []) {
     if (str.includes('-')) {
       // Dải ngày: "25/07-28/07" hoặc "25/07/2026-28/07/2026"
       const [startStr, endStr] = str.split('-').map(s => s.trim());
-      const startDate = parseVNShortDate(startStr);
-      const endDate = parseVNShortDate(endStr);
-      if (startDate && endDate) {
-        endDate.setHours(23, 59, 59, 999);
-        if (checkTime >= startDate.getTime() && checkTime <= endDate.getTime()) {
+      const start = parseVNShortDate(startStr);
+      const end = parseVNShortDate(endStr);
+      if (start && end) {
+        const startKey = dateKey(start.year, start.month, start.day);
+        const endKey = dateKey(end.year, end.month, end.day);
+        if (checkKey >= startKey && checkKey <= endKey) {
           return true;
         }
       }
     } else {
       // Ngày đơn: "30/07" hoặc "30/07/2026"
-      const singleDate = parseVNShortDate(str);
-      if (singleDate && singleDate.getTime() === checkTime) {
+      const single = parseVNShortDate(str);
+      if (single && dateKey(single.year, single.month, single.day) === checkKey) {
         return true;
       }
     }
@@ -47,11 +69,9 @@ function isAllowedStudyDate(date = new Date(), allowedRanges = []) {
   return false;
 }
 
-// Tìm ngày học hợp lệ tiếp theo (trả về Date object theo newDayStartTime, ví dụ 06:00 AM)
+// Tìm ngày học hợp lệ tiếp theo — trả về Date (thời điểm UTC thực) ứng với
+// newDayStartTime GIỜ VIỆT NAM của ngày đó (VD 07:00 VN, không phải 07:00 giờ server)
 function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = [], newDayStartTime = '06:00') {
-  const current = new Date(fromDate);
-  current.setDate(current.getDate() + 1);
-
   let startH = 6;
   let startM = 0;
   if (newDayStartTime && typeof newDayStartTime === 'string') {
@@ -59,21 +79,21 @@ function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = [], newD
     if (!isNaN(parts[0])) startH = parts[0];
     if (!isNaN(parts[1])) startM = parts[1];
   }
-  current.setHours(startH, startM, 0, 0);
 
-  // Tìm trong 60 ngày tiếp theo
-  for (let i = 0; i < 60; i++) {
-    if (isAllowedStudyDate(current, allowedRanges)) {
-      return current;
+  // Thời điểm UTC thực của startH:startM giờ VN vào ngày (y, m, d)
+  const vnMoment = (y, m, d) => new Date(Date.UTC(y, m, d, startH, startM, 0, 0) - VN_OFFSET_MS);
+
+  // Bắt đầu từ ngày mai theo lịch VN, tìm trong 60 ngày tiếp theo
+  const from = vnDateParts(fromDate);
+  for (let i = 1; i <= 60; i++) {
+    const candidate = vnMoment(from.year, from.month, from.day + i); // Date.UTC tự xử lý tràn ngày/tháng
+    if (isAllowedStudyDate(candidate, allowedRanges)) {
+      return candidate;
     }
-    current.setDate(current.getDate() + 1);
   }
 
-  // Fallback ngày mai theo newDayStartTime nếu không khớp
-  const fallback = new Date(fromDate);
-  fallback.setDate(fallback.getDate() + 1);
-  fallback.setHours(startH, startM, 0, 0);
-  return fallback;
+  // Fallback: ngày mai (giờ VN) theo newDayStartTime nếu không khớp lịch nào
+  return vnMoment(from.year, from.month, from.day + 1);
 }
 
 // Quét trang thông tin khóa học (slides/[course-slug]) bằng Playwright
