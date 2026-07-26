@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import * as api from '../api';
 
 export default function AccountPanel({ accounts, onRefresh, toast }) {
   const [showModal, setShowModal] = useState(false);
@@ -11,27 +12,20 @@ export default function AccountPanel({ accounts, onRefresh, toast }) {
       toast('Cần nhập email và mật khẩu', 'error');
       return;
     }
-    const base = import.meta.env.BASE_URL.replace(/\/$/, '');
-    const res = await fetch(`${base}/api/accounts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name || email, email, password }),
-    });
-    if (res.ok) {
+    const res = await api.addAccount({ name: name || email, email, password });
+    if (res && res.error) {
+      toast(res.error, 'error');
+    } else {
       toast('Đã thêm tài khoản', 'success');
       setShowModal(false);
       setName(''); setEmail(''); setPassword('');
       onRefresh();
-    } else {
-      const err = await res.json();
-      toast(err.error, 'error');
     }
   };
 
   const handleDelete = async (index) => {
     if (!window.confirm('Xóa tài khoản này?')) return;
-    const base = import.meta.env.BASE_URL.replace(/\/$/, '');
-    await fetch(`${base}/api/accounts/${index}`, { method: 'DELETE' });
+    await api.deleteAccount(index);
     toast('Đã xóa tài khoản', 'info');
     onRefresh();
   };

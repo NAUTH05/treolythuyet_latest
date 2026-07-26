@@ -38,14 +38,14 @@ function App() {
 
   const handleAdminVerify = (token) => {
     sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
-    setIsAdminAuthenticated(true);
-    toast('Đăng nhập Admin thành công', 'success');
+    // Reload để socket.io kết nối lại kèm token và mọi API có token ngay từ đầu
+    window.location.reload();
   };
 
-  const handleLogout = () => {
-    sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  const handleLogout = async () => {
+    await api.logout();
     setIsAdminAuthenticated(false);
-    toast('Đã đăng xuất Admin', 'info');
+    window.location.reload();
   };
 
   const loadAccounts = useCallback(async () => {

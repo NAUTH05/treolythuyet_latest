@@ -10,7 +10,10 @@ export function useSocket() {
   const [logs, setLogs] = useState([]);
 
   useEffect(() => {
-    const socket = io({ path: '/lythuyet/socket.io' });
+    const socket = io({
+      path: '/lythuyet/socket.io',
+      auth: { token: sessionStorage.getItem('treohoc_admin_token') || '' },
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => setConnected(true));

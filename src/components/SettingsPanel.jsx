@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import * as api from '../api';
 import { initFirebaseClient, syncDocClient } from '../firebaseClient';
 
 export default function SettingsPanel({ toast }) {
@@ -23,10 +24,9 @@ export default function SettingsPanel({ toast }) {
 
   // Load existing Firebase config
   useEffect(() => {
-    fetch('/lythuyet/api/admin/firebase-config')
-      .then(res => res.json())
+    api.fetchFirebaseConfig()
       .then(data => {
-        if (data.config) {
+        if (data && data.config) {
           setFirebaseConfig(data.config);
           setFbConnected(!!data.connected);
           if (data.config.projectId && data.config.apiKey) {
@@ -45,17 +45,12 @@ export default function SettingsPanel({ toast }) {
     }
     setPassLoading(true);
     try {
-      const res = await fetch('/lythuyet/api/admin/change-password', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ oldPassword, newPassword }),
-      });
-      const data = await res.json();
+      const data = await api.changePassword(oldPassword, newPassword);
       if (data.ok) {
-        toast('Đã đổi mật khẩu Admin thành công', 'success');
-        setOldPassword('');
-        setNewPassword('');
-        setConfirmPassword('');
+        // Server đã thu hồi mọi token → buộc đăng nhập lại bằng mật khẩu mới
+        toast('Đã đổi mật khẩu — vui lòng đăng nhập lại', 'success');
+        sessionStorage.removeItem('treohoc_admin_token');
+        setTimeout(() => window.location.reload(), 800);
       } else {
         toast(data.error || 'Lỗi đổi mật khẩu', 'error');
       }
@@ -78,12 +73,7 @@ export default function SettingsPanel({ toast }) {
       });
 
       // 2. Save on server & trigger server-side sync
-      const res = await fetch('/lythuyet/api/admin/firebase-config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: firebaseConfig }),
-      });
-      const data = await res.json();
+      const data = await api.saveFirebaseConfig(firebaseConfig);
       if (data.ok) {
         setFbConnected(!!data.connected);
         toast('Đã lưu cấu hình và đồng bộ Firebase thành công', 'success');

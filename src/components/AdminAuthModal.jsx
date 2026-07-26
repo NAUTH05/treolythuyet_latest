@@ -17,8 +17,8 @@ export default function AdminAuthModal({ onVerify }) {
         body: JSON.stringify({ password }),
       });
       const data = await res.json();
-      if (data.ok) {
-        onVerify(data.token || password);
+      if (data.ok && data.token) {
+        onVerify(data.token);
       } else {
         setError(data.error || 'Mật khẩu Admin không chính xác');
       }

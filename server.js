@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { BotSession } = require('./bot');
 const { AutoCourseSession } = require('./autoCourseEngine');
 const { isAllowedStudyDate, getNextAllowedStudyDate } = require('./courseScanner');
@@ -27,6 +28,30 @@ function saveAdminConfig(cfg) {
   } catch (e) {
     console.error('[ADMIN] Không thể lưu admin config:', e.message);
   }
+}
+
+// =================== ADMIN AUTH (Bearer token) ===================
+// Token ngẫu nhiên phát khi verify đúng mật khẩu, lưu trong RAM server.
+// Client giữ token ở sessionStorage (tự mất khi đóng tab). Mọi API nhạy cảm
+// và luồng socket.io init đều bắt buộc token hợp lệ → không thể bypass bằng
+// việc ẩn overlay đăng nhập trong DevTools.
+
+const activeTokens = new Set();
+
+function generateToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function extractToken(headers) {
+  const auth = headers['authorization'] || '';
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  return headers['x-admin-token'] || null;
+}
+
+function requireAdmin(req, res, next) {
+  const token = extractToken(req.headers);
+  if (token && activeTokens.has(token)) return next();
+  return res.status(401).json({ error: 'Chưa xác thực hoặc phiên đã hết hạn' });
 }
 
 // =================== PRESETS PERSISTENCE ===================
@@ -94,6 +119,21 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(express.json());
 app.use('/lythuyet', express.static(path.join(__dirname, 'public')));
+
+// Bảo vệ toàn bộ /lythuyet/api trừ route đăng nhập — bao trùm mọi route hiện có
+// và tương lai, không cần gắn guard từng route riêng lẻ.
+app.use('/lythuyet/api', (req, res, next) => {
+  if (req.method === 'POST' && req.path === '/admin/verify') return next();
+  return requireAdmin(req, res, next);
+});
+
+// Socket.io: chỉ client có token hợp lệ mới được kết nối & nhận 'init'
+io.use((socket, next) => {
+  const token = (socket.handshake.auth && socket.handshake.auth.token)
+    || extractToken(socket.handshake.headers || {});
+  if (token && activeTokens.has(token)) return next();
+  return next(new Error('unauthorized'));
+});
 
 // ======================== STATE =============================
 
@@ -895,9 +935,18 @@ app.post('/lythuyet/api/admin/verify', (req, res) => {
   const { password } = req.body;
   const cfg = getAdminConfig();
   if (password === cfg.adminPassword) {
-    return res.json({ ok: true, token: 'admin_verified_' + Date.now() });
+    const token = generateToken();
+    activeTokens.add(token);
+    return res.json({ ok: true, token });
   }
   res.status(401).json({ ok: false, error: 'Mật khẩu Admin không chính xác' });
+});
+
+// Đăng xuất — thu hồi token hiện tại (route này nằm sau middleware nên đã yêu cầu token)
+app.post('/lythuyet/api/admin/logout', (req, res) => {
+  const token = extractToken(req.headers);
+  if (token) activeTokens.delete(token);
+  res.json({ ok: true });
 });
 
 // Đổi mật khẩu Admin
@@ -912,6 +961,8 @@ app.post('/lythuyet/api/admin/change-password', (req, res) => {
   }
   cfg.adminPassword = newPassword;
   saveAdminConfig(cfg);
+  // Thu hồi toàn bộ token đang hoạt động → buộc đăng nhập lại bằng mật khẩu mới
+  activeTokens.clear();
   res.json({ ok: true });
 });
 
@@ -1872,7 +1923,7 @@ app.post('/lythuyet/api/pause-queue/:id', async (req, res) => {
 });
 
 // Tiếp tục hàng chờ
-app.post('/treohoc/api/resume-queue/:id', (req, res) => {
+app.post('/treohoc/api/resume-queue/:id', requireAdmin, (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (queue.status !== 'paused') {
