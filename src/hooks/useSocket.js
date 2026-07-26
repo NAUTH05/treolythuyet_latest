@@ -6,6 +6,7 @@ export function useSocket() {
   const [connected, setConnected] = useState(false);
   const [sessions, setSessions] = useState({});
   const [queues, setQueues] = useState({});
+  const [autoScans, setAutoScans] = useState({});
   const [logs, setLogs] = useState([]);
 
   useEffect(() => {
@@ -23,6 +24,10 @@ export function useSocket() {
       const queueMap = {};
       (data.queues || []).forEach(q => { queueMap[q.id] = q; });
       setQueues(queueMap);
+
+      const autoScanMap = {};
+      (data.autoScans || []).forEach(s => { autoScanMap[s.id] = s; });
+      setAutoScans(autoScanMap);
 
       setLogs(data.logs || []);
     });
@@ -46,8 +51,20 @@ export function useSocket() {
       setQueues(prev => ({ ...prev, [queue.id]: queue }));
     });
 
+    socket.on('autoscan-status', (status) => {
+      setAutoScans(prev => ({ ...prev, [status.id]: status }));
+    });
+
+    socket.on('autoscan-removed', (id) => {
+      setAutoScans(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    });
+
     return () => { socket.disconnect(); };
   }, []);
 
-  return { connected, sessions, queues, logs, setLogs };
+  return { connected, sessions, queues, autoScans, logs, setLogs };
 }

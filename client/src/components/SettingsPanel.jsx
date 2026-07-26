@@ -40,7 +40,7 @@ export default function SettingsPanel({ toast }) {
   const handleChangePassword = async (e) => {
     e.preventDefault();
     if (newPassword !== confirmPassword) {
-      toast('❌ Mật khẩu mới xác nhận không khớp', 'error');
+      toast('Mật khẩu mới xác nhận không khớp', 'error');
       return;
     }
     setPassLoading(true);
@@ -52,15 +52,15 @@ export default function SettingsPanel({ toast }) {
       });
       const data = await res.json();
       if (data.ok) {
-        toast('✅ Đã đổi mật khẩu Admin thành công', 'success');
+        toast('Đã đổi mật khẩu Admin thành công', 'success');
         setOldPassword('');
         setNewPassword('');
         setConfirmPassword('');
       } else {
-        toast(`❌ ${data.error || 'Lỗi đổi mật khẩu'}`, 'error');
+        toast(data.error || 'Lỗi đổi mật khẩu', 'error');
       }
     } catch {
-      toast('❌ Lỗi kết nối máy chủ', 'error');
+      toast('Lỗi kết nối máy chủ', 'error');
     } finally {
       setPassLoading(false);
     }
@@ -86,22 +86,22 @@ export default function SettingsPanel({ toast }) {
       const data = await res.json();
       if (data.ok) {
         setFbConnected(!!data.connected);
-        toast('🔥 Đã lưu cấu hình và đồng bộ Firebase thành công!', 'success');
+        toast('Đã lưu cấu hình và đồng bộ Firebase thành công', 'success');
       } else {
-        toast(`❌ ${data.error || 'Lỗi kết nối Firebase'}`, 'error');
+        toast(data.error || 'Lỗi kết nối Firebase', 'error');
       }
     } catch {
-      toast('❌ Lỗi lưu Firebase', 'error');
+      toast('Lỗi lưu Firebase', 'error');
     } finally {
       setFbLoading(false);
     }
   };
 
   return (
-    <div className="settings-container" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+    <div className="two-col-grid">
       {/* Admin Password Management */}
       <div className="card">
-        <div className="card-header">Bảo Mật Mật Khẩu Admin</div>
+        <div className="card-header">Bảo mật mật khẩu Admin</div>
         <div className="card-body">
           <form onSubmit={handleChangePassword}>
             <div className="form-group">
@@ -135,7 +135,7 @@ export default function SettingsPanel({ toast }) {
               />
             </div>
             <button type="submit" className="btn btn-primary" disabled={passLoading}>
-              {passLoading ? '⏳ Đang lưu...' : '💾 Đổi Mật Khẩu Admin'}
+              {passLoading ? 'Đang lưu...' : 'Đổi mật khẩu Admin'}
             </button>
           </form>
         </div>
@@ -143,10 +143,10 @@ export default function SettingsPanel({ toast }) {
 
       {/* Firebase Configuration & Tutorial */}
       <div className="card">
-        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span>🔥 Cấu Hình Firebase Database</span>
+        <div className="card-header" style={{ justifyContent: 'space-between' }}>
+          <span>Cấu hình Firebase Database</span>
           <span className={`session-badge ${fbConnected ? 'badge-completed' : 'badge-idle'}`}>
-            {fbConnected ? '✅ Đã kết nối Firebase' : '⚪ Chưa kết nối'}
+            {fbConnected ? 'Đã kết nối' : 'Chưa kết nối'}
           </span>
         </div>
         <div className="card-body">
@@ -228,17 +228,17 @@ export default function SettingsPanel({ toast }) {
             </div>
 
             <button type="submit" className="btn btn-primary" disabled={fbLoading}>
-              {fbLoading ? '⏳ Đang lưu & test...' : '🔥 Lưu Cấu Hình Firebase'}
+              {fbLoading ? 'Đang lưu & test...' : 'Lưu cấu hình Firebase'}
             </button>
           </form>
 
           {/* Tutorial step by step */}
-          <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border)', fontSize: 12, color: 'var(--text2)' }}>
-            <h4 style={{ color: 'var(--primary)', marginBottom: 8, fontSize: 13 }}>📖 Hướng dẫn lấy tham số & Mở quyền Firestore Database:</h4>
-            <ol style={{ paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 12 }}>
-              <li>Truy cập <b>console.firebase.google.com</b> $\rightarrow$ Bấm <b>Add Project</b> tạo project mới.</li>
+          <div className="tutorial">
+            <h4>Hướng dẫn lấy tham số & mở quyền Firestore Database</h4>
+            <ol>
+              <li>Truy cập <b>console.firebase.google.com</b> → bấm <b>Add Project</b> tạo project mới.</li>
               <li>Tại trang chủ dự án, bấm biểu tượng Web <b>&lt;/&gt;</b> (Add app) để lấy mã Config.</li>
-              <li>Vào menu <b>Build</b> $\rightarrow$ <b>Firestore Database</b> $\rightarrow$ Bấm <b>Create Database</b>.</li>
+              <li>Vào menu <b>Build</b> → <b>Firestore Database</b> → bấm <b>Create Database</b>.</li>
               <li><b>Rất quan trọng</b>: Vào tab <b>Rules</b> của Firestore Database, sửa <code>allow read, write: if false;</code> thành <code>allow read, write: if true;</code> rồi bấm <b>Publish</b> thì mới cho phép tạo Data Collections!</li>
             </ol>
           </div>

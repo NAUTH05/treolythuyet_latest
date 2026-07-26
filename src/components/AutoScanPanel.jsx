@@ -1,6 +1,111 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
+import * as api from '../api';
 
-export default function AutoScanPanel({ accounts, toast }) {
+const AUTO_STATUS = {
+  idle:         { text: 'Chờ khởi động', badge: 'badge-idle' },
+  'logging-in': { text: 'Đang đăng nhập', badge: 'badge-logging-in' },
+  scanning:     { text: 'Đang quét khóa học', badge: 'badge-running' },
+  studying:     { text: 'Đang treo học', badge: 'badge-running' },
+  'date-limit': { text: 'Ngày nghỉ — chờ lịch', badge: 'badge-logging-in' },
+  'daily-limit':{ text: 'Đạt giới hạn ngày', badge: 'badge-logging-in' },
+  completed:    { text: 'Hoàn thành', badge: 'badge-completed' },
+  stopped:      { text: 'Đã dừng', badge: 'badge-idle' },
+  error:        { text: 'Lỗi', badge: 'badge-error' },
+};
+
+const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying']);
+
+function formatMinutes(mins) {
+  const m = Math.max(0, Math.round(mins || 0));
+  const h = Math.floor(m / 60);
+  return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
+}
+
+function courseNameFromUrl(url) {
+  try {
+    return decodeURIComponent(url.split('/').filter(Boolean).pop() || url);
+  } catch {
+    return url;
+  }
+}
+
+function AutoScanCard({ scan, toast }) {
+  const info = AUTO_STATUS[scan.status] || { text: scan.status, badge: 'badge-idle' };
+  const isActive = ACTIVE_STATUSES.has(scan.status);
+  const courses = Object.entries(scan.courseProgress || {});
+
+  const handleStop = async () => {
+    if (!window.confirm(`Dừng phiên Auto-Scan của ${scan.account}?`)) return;
+    const res = await api.stopAutoScan(scan.id);
+    if (res.ok) toast('Đã dừng phiên Auto-Scan', 'info');
+    else toast(res.error || 'Lỗi dừng phiên Auto-Scan', 'error');
+  };
+
+  const handleRemove = async () => {
+    const res = await api.removeAutoScan(scan.id);
+    if (res.ok) toast('Đã xóa thẻ phiên Auto-Scan', 'info');
+    else toast(res.error || 'Lỗi xóa phiên Auto-Scan', 'error');
+  };
+
+  const dailyMax = scan.dailyMaxMinutes || 480;
+  const dailyPct = Math.min(100, ((scan.dailyStudiedMinutes || 0) / dailyMax) * 100);
+
+  return (
+    <div className="autoscan-card">
+      <div className="autoscan-card-header">
+        <span className="autoscan-card-name">{scan.account}</span>
+        <div className="session-actions">
+          <span className={`session-badge ${info.badge}`}>{info.text}</span>
+          {isActive ? (
+            <button className="btn btn-sm btn-danger" onClick={handleStop}>Dừng</button>
+          ) : (
+            <button className="btn btn-sm btn-ghost" onClick={handleRemove} title="Xóa thẻ này khỏi danh sách">Xóa</button>
+          )}
+        </div>
+      </div>
+
+      <div className="autoscan-meta">
+        <span>Khóa học: <strong>{Math.min((scan.currentCourseIndex || 0) + 1, scan.totalCourses || 1)}/{scan.totalCourses || 1}</strong></span>
+        <span>Hôm nay: <strong>{formatMinutes(scan.dailyStudiedMinutes)} / {formatMinutes(dailyMax)}</strong></span>
+      </div>
+
+      <div className="progress-track">
+        <div
+          className={`progress-fill ${dailyPct >= 100 ? 'warning' : ''}`}
+          style={{ width: `${dailyPct}%` }}
+        />
+      </div>
+
+      {courses.length > 0 && (
+        <div className="course-progress">
+          {courses.map(([url, cp]) => {
+            const target = cp.targetMinutes || 0;
+            const studied = cp.studiedMinutes || 0;
+            const pct = cp.completed ? 100 : target > 0 ? Math.min(100, (studied / target) * 100) : 0;
+            return (
+              <div className="course-progress-row" key={url}>
+                <div className="course-progress-title">
+                  <span className="name" title={url}>{cp.title || courseNameFromUrl(url)}</span>
+                  <span className={`value ${cp.completed ? 'done' : ''}`}>
+                    {cp.completed ? 'Đã đạt mục tiêu' : `${formatMinutes(studied)} / ${formatMinutes(target)}`}
+                  </span>
+                </div>
+                <div className="progress-track">
+                  <div
+                    className={`progress-fill ${cp.completed ? 'success' : ''}`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function AutoScanPanel({ accounts, autoScans, toast }) {
   const [courses, setCourses] = useState([
     {
       courseUrl: 'https://hoclythuyetlaixe.eco-tek.com.vn/slides/cau-tao-va-sua-chua-thong-thuong-xe-cat-tuong-minh-213',
@@ -13,7 +118,9 @@ export default function AutoScanPanel({ accounts, toast }) {
   const [dailyMaxHours, setDailyMaxHours] = useState('8');
   const [selectedAccounts, setSelectedAccounts] = useState(new Set());
   const [loading, setLoading] = useState(false);
-  const [autoSessions, setAutoSessions] = useState([]);
+
+  const scanList = Object.values(autoScans || {});
+  const activeCount = scanList.filter(s => ACTIVE_STATUSES.has(s.status)).length;
 
   const addCourse = () => {
     setCourses(prev => [...prev, { courseUrl: '', targetHours: '12', targetMinutes: '0' }]);
@@ -35,139 +142,146 @@ export default function AutoScanPanel({ accounts, toast }) {
   const handleStartAutoScan = async () => {
     const validCourses = courses.filter(c => c.courseUrl.trim());
     if (validCourses.length === 0 || selectedAccounts.size === 0) {
-      toast('❌ Vui lòng nhập ít nhất 1 URL khóa học và chọn tài khoản', 'error');
+      toast('Vui lòng nhập ít nhất 1 URL khóa học và chọn tài khoản', 'error');
       return;
     }
 
     setLoading(true);
     try {
-      const res = await fetch('/lythuyet/api/auto-scan/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          courses: validCourses.map(c => ({
-            courseUrl: c.courseUrl.trim(),
-            targetHours: parseInt(c.targetHours, 10) || 0,
-            targetMinutes: parseInt(c.targetMinutes, 10) || 0,
-          })),
-          allowedDateRanges: allowedDateRanges.split(',').map(s => s.trim()).filter(Boolean),
-          dailyMaxMinutes: (parseInt(dailyMaxHours, 10) || 8) * 60,
-          accountIndices: [...selectedAccounts],
-        }),
+      const data = await api.startAutoScan({
+        courses: validCourses.map(c => ({
+          courseUrl: c.courseUrl.trim(),
+          targetHours: parseInt(c.targetHours, 10) || 0,
+          targetMinutes: parseInt(c.targetMinutes, 10) || 0,
+        })),
+        allowedDateRanges: allowedDateRanges.split(',').map(s => s.trim()).filter(Boolean),
+        dailyMaxMinutes: (parseInt(dailyMaxHours, 10) || 8) * 60,
+        accountIndices: [...selectedAccounts],
       });
 
-      const data = await res.json();
       if (data.ok) {
-        toast(`🤖 Đã khởi động Auto-Scan cho ${data.started.length} tài khoản`, 'success');
+        toast(`Đã khởi động Auto-Scan cho ${data.started.length} tài khoản`, 'success');
       } else {
-        toast(`❌ ${data.error || 'Lỗi khởi động Auto-Scan'}`, 'error');
+        toast(data.error || 'Lỗi khởi động Auto-Scan', 'error');
       }
     } catch (err) {
-      toast(`❌ Lỗi kết nối: ${err.message}`, 'error');
+      toast(`Lỗi kết nối: ${err.message}`, 'error');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="auto-scan-container" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
+    <div className="autoscan-grid">
       {/* Auto Scan Setup Form */}
       <div className="card">
-        <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span>🤖 Thử Nghiệm: Auto-Scan & Auto-Study Khóa Học</span>
-          <span className="session-badge badge-running">Bản thử nghiệm (test_dev)</span>
+        <div className="card-header" style={{ justifyContent: 'space-between' }}>
+          <span>Cấu hình Auto-Scan & Treo học</span>
+          <span className="session-badge badge-running">Thử nghiệm</span>
         </div>
 
         <div className="card-body">
-          <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 16 }}>
-            Bot sẽ tự động vào link Khóa học $\rightarrow$ Lọc bài chưa xong (&lt;100%) $\rightarrow$ Tự động đọc vòng tròn đếm ngược DOM Timer $\rightarrow$ Kiểm soát định mức tổng giờ học của từng Khóa & Giới hạn tối đa 8h/ngày!
+          <div className="hint" style={{ marginTop: 0, marginBottom: 16 }}>
+            Bot tự động vào link khóa học, lọc bài chưa xong (&lt;100%), đọc bộ đếm ngược
+            của từng bài rồi treo đủ giờ. Tự kiểm soát định mức tổng giờ của từng khóa
+            và giới hạn số giờ học mỗi ngày.
           </div>
 
           {/* Courses List Form */}
           <div className="form-group">
-            <label>📚 Danh Sách Khóa Học Cần Quét & Treo</label>
+            <label>Danh sách khóa học cần quét & treo</label>
             {courses.map((c, idx) => (
-              <div key={idx} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 12, marginBottom: 8, background: 'var(--surface2)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--primary)' }}>Khóa học #{idx + 1}</span>
+              <div key={idx} className="box-card">
+                <div className="box-card-header">
+                  <span className="box-card-title">
+                    <span className="box-card-index">{idx + 1}</span>
+                    Khóa học {idx + 1}
+                  </span>
                   {courses.length > 1 && (
-                    <button type="button" className="btn btn-sm btn-danger" onClick={() => removeCourse(idx)} style={{ padding: '2px 6px', fontSize: 10 }}>✕ Xóa</button>
+                    <button type="button" className="icon-btn" onClick={() => removeCourse(idx)} title="Xóa khóa học này">✕</button>
                   )}
                 </div>
 
                 <input
                   type="url"
-                  placeholder="URL Khóa học (VD: https://hoclythuyetlaixe.eco-tek.com.vn/slides/...)"
+                  placeholder="URL khóa học (VD: https://hoclythuyetlaixe.eco-tek.com.vn/slides/...)"
                   value={c.courseUrl}
                   onChange={e => updateCourse(idx, 'courseUrl', e.target.value)}
-                  style={{ width: '100%', marginBottom: 6 }}
+                  style={{ width: '100%', marginBottom: 8 }}
                   required
                 />
 
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-                  <span style={{ color: 'var(--text2)' }}>Định mức yêu cầu:</span>
+                <div className="input-row">
+                  <span className="unit">Định mức yêu cầu:</span>
                   <input
                     type="number"
+                    className="input-num"
                     placeholder="12"
+                    min="0"
                     value={c.targetHours}
                     onChange={e => updateCourse(idx, 'targetHours', e.target.value)}
-                    style={{ width: 60, textAlign: 'center' }}
                   />
-                  <span>giờ</span>
+                  <span className="unit">giờ</span>
                   <input
                     type="number"
+                    className="input-num"
                     placeholder="36"
+                    min="0"
+                    max="59"
                     value={c.targetMinutes}
                     onChange={e => updateCourse(idx, 'targetMinutes', e.target.value)}
-                    style={{ width: 60, textAlign: 'center' }}
                   />
-                  <span>phút</span>
+                  <span className="unit">phút</span>
                 </div>
               </div>
             ))}
 
-            <button type="button" className="btn btn-sm btn-outline" onClick={addCourse} style={{ width: '100%' }}>
-              + Thêm Khóa Học Nữa
+            <button type="button" className="btn btn-sm btn-outline btn-block" onClick={addCourse}>
+              + Thêm khóa học
             </button>
           </div>
 
           {/* Date Ranges & Daily Cap */}
           <div className="form-group">
-            <label>📅 Lịch Ngày Học Được Phép (Phân cách bằng dấu phẩy)</label>
+            <label>Lịch ngày học được phép (phân cách bằng dấu phẩy)</label>
             <input
               type="text"
               placeholder="VD: 25/07-28/07, 30/07, 01/08-02/08..."
               value={allowedDateRanges}
               onChange={e => setAllowedDateRanges(e.target.value)}
             />
-            <div style={{ fontSize: 11, color: 'var(--text2)', marginTop: 4 }}>
-              Nếu ngày hiện tại là ngày nghỉ, Bot sẽ tự chờ đến 06:00 ngày học hợp lệ tiếp theo.
+            <div className="hint">
+              Nếu ngày hiện tại là ngày nghỉ, bot sẽ tự chờ đến 06:00 ngày học hợp lệ tiếp theo.
             </div>
           </div>
 
           <div className="form-group">
-            <label>⏱️ Giới Hạn Tối Đa Mỗi Ngày (Tiếng/Ngày)</label>
-            <input
-              type="number"
-              placeholder="8"
-              value={dailyMaxHours}
-              onChange={e => setDailyMaxHours(e.target.value)}
-              style={{ width: 120 }}
-            />
-            <span style={{ fontSize: 12, color: 'var(--text2)', marginLeft: 8 }}>(Mặc định: 8 tiếng/ngày)</span>
+            <label>Giới hạn tối đa mỗi ngày</label>
+            <div className="input-row">
+              <input
+                type="number"
+                placeholder="8"
+                min="1"
+                max="24"
+                value={dailyMaxHours}
+                onChange={e => setDailyMaxHours(e.target.value)}
+                style={{ width: 100 }}
+              />
+              <span className="unit">tiếng/ngày (mặc định: 8)</span>
+            </div>
           </div>
 
           {/* Accounts Selector */}
           <div className="form-group">
-            <label>👤 Chọn Tài Khoản Áp Dụng</label>
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            <label>Chọn tài khoản áp dụng</label>
+            <div className="chip-group">
               {accounts.map(acc => {
                 const isSelected = selectedAccounts.has(acc.index);
                 return (
                   <button
                     key={acc.index}
                     type="button"
-                    className={`btn btn-sm ${isSelected ? 'btn-primary' : 'btn-outline'}`}
+                    className={`chip ${isSelected ? 'selected' : ''}`}
                     onClick={() => {
                       setSelectedAccounts(prev => {
                         const next = new Set(prev);
@@ -181,6 +295,9 @@ export default function AutoScanPanel({ accounts, toast }) {
                   </button>
                 );
               })}
+              {accounts.length === 0 && (
+                <span className="hint" style={{ marginTop: 0 }}>Chưa có tài khoản nào — thêm ở mục Tài khoản.</span>
+              )}
             </div>
           </div>
 
@@ -191,22 +308,32 @@ export default function AutoScanPanel({ accounts, toast }) {
             disabled={loading || selectedAccounts.size === 0}
             style={{ marginTop: 16 }}
           >
-            {loading ? '⏳ Đang khởi động...' : '🤖 Bắt Đầu Auto-Scan & Treo Học'}
+            {loading ? 'Đang khởi động...' : 'Bắt đầu Auto-Scan & Treo học'}
           </button>
         </div>
       </div>
 
-      {/* Progress & Live Logs Monitor */}
+      {/* Progress & Live Monitor */}
       <div className="card">
-        <div className="card-header">📊 Tiến Độ Auto-Scan Khóa Học</div>
+        <div className="card-header" style={{ justifyContent: 'space-between' }}>
+          <span>Tiến độ Auto-Scan</span>
+          {activeCount > 0 && <span className="count-pill">{activeCount} đang chạy</span>}
+        </div>
         <div className="card-body">
-          <div className="empty">
-            <div className="empty-icon">🤖</div>
-            <span>Auto-Scan Engine đang chờ khởi động</span>
-            <p style={{ fontSize: 12, color: 'var(--text2)', marginTop: 8 }}>
-              Tiến độ từng bài học, thời gian DOM Timer đã đọc và số giờ còn lại của Khóa học sẽ tự động cập nhật ở đây.
-            </p>
-          </div>
+          {scanList.length === 0 ? (
+            <div className="empty">
+              <div className="empty-icon">⟳</div>
+              <span>Auto-Scan Engine đang chờ khởi động</span>
+              <p>
+                Trạng thái từng tài khoản, tiến độ từng khóa học và số giờ đã treo
+                trong ngày sẽ tự động cập nhật ở đây.
+              </p>
+            </div>
+          ) : (
+            scanList.map(scan => (
+              <AutoScanCard key={scan.id} scan={scan} toast={toast} />
+            ))
+          )}
         </div>
       </div>
     </div>

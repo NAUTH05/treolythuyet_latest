@@ -1236,7 +1236,10 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
     });
 
     autoSession.on('log', (entry) => addLog(entry));
-    autoSession.on('status', (status) => io.emit('autoscan-status', status));
+    autoSession.on('status', (status) => {
+      // Bỏ qua emit muộn của phiên đã bị xóa khỏi Dashboard để không hồi sinh thẻ
+      if (autoScanSessions.has(status.id)) io.emit('autoscan-status', status);
+    });
     autoSession.on('progress-saved', (data) => {
       const fbConfig = fbService.loadFirebaseConfig();
       if (fbConfig && fbConfig.projectId) {
@@ -1253,6 +1256,35 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
   }
 
   res.json({ ok: true, started });
+});
+
+// Dừng 1 phiên Auto-Scan theo yêu cầu từ Dashboard
+app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
+  const autoSession = autoScanSessions.get(req.params.id);
+  if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
+
+  await autoSession.stop();
+  autoSession.status = 'stopped';
+  io.emit('autoscan-status', autoSession.getStatus());
+  addLog({
+    timestamp: formatVN(new Date()),
+    account: autoSession.account.name,
+    msg: '⏹ Đã dừng phiên Auto-Scan theo yêu cầu',
+    level: 'warn',
+  });
+  res.json({ ok: true });
+});
+
+// Xóa thẻ phiên Auto-Scan đã kết thúc khỏi Dashboard
+app.delete('/lythuyet/api/auto-scan/sessions/:id', async (req, res) => {
+  const autoSession = autoScanSessions.get(req.params.id);
+  if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
+
+  await autoSession.stop();
+  autoSession.removeAllListeners('status');
+  autoScanSessions.delete(req.params.id);
+  io.emit('autoscan-removed', req.params.id);
+  res.json({ ok: true });
 });
 
 // Tạm dừng hàng chờ
@@ -1543,7 +1575,11 @@ io.on('connection', (socket) => {
   for (const [id, queue] of queues) {
     queueList.push(getQueueStatus(queue));
   }
-  socket.emit('init', { sessions: sessionList, queues: queueList, logs: logHistory.slice(-100) });
+  const autoScanList = [];
+  for (const [id, autoSession] of autoScanSessions) {
+    autoScanList.push(autoSession.getStatus());
+  }
+  socket.emit('init', { sessions: sessionList, queues: queueList, autoScans: autoScanList, logs: logHistory.slice(-100) });
 
   socket.on('disconnect', () => {
     console.log(`[WEB] Client disconnected: ${socket.id}`);

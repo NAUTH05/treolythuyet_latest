@@ -14,23 +14,22 @@ import { useSocket } from './hooks/useSocket';
 import { useToast } from './hooks/useToast';
 
 const ADMIN_TOKEN_KEY = 'treohoc_admin_token';
-const THEME_KEY = 'treohoc_theme';
+
+const TAB_TITLES = {
+  dashboard: 'Tổng quan hệ thống',
+  autoscan: 'Auto Scan & Treo học khóa học',
+  control: 'Bảng điều khiển Box bài học',
+  accounts: 'Quản lý danh sách tài khoản',
+  queues: 'Hàng chờ & Các phiên đang chạy',
+  logs: 'Nhật ký hoạt động hệ thống',
+  settings: 'Cấu hình hệ thống & Firebase',
+};
 
 function App() {
-  const { connected, sessions, queues, logs, setLogs } = useSocket();
+  const { connected, sessions, queues, autoScans, logs, setLogs } = useSocket();
   const { toasts, toast } = useToast();
   const [accounts, setAccounts] = useState([]);
   const [activeTab, setActiveTab] = useState('dashboard');
-
-  // Dark mode state
-  const [darkMode, setDarkMode] = useState(() => {
-    return localStorage.getItem(THEME_KEY) === 'dark';
-  });
-
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
-    localStorage.setItem(THEME_KEY, darkMode ? 'dark' : 'light');
-  }, [darkMode]);
 
   // Admin auth state
   const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(() => {
@@ -91,6 +90,10 @@ function App() {
     q => q.status === 'running' || q.status === 'waiting'
   ).length;
 
+  const activeAutoScansCount = Object.values(autoScans || {}).filter(
+    s => s.status === 'logging-in' || s.status === 'studying' || s.status === 'scanning'
+  ).length;
+
   return (
     <>
       {/* Admin Lock Overlay */}
@@ -108,29 +111,17 @@ function App() {
           onLogout={handleLogout}
           activeSessionsCount={activeSessionsCount}
           activeQueuesCount={activeQueuesCount}
+          activeAutoScansCount={activeAutoScansCount}
         />
 
         {/* Main Content View Container */}
         <main className="main-content">
           <header className="top-header">
             <div className="top-header-title">
-              {activeTab === 'dashboard' && 'Tổng quan hệ thống'}
-              {activeTab === 'autoscan' && '🤖 Auto Scan & Treo Học Khóa Học'}
-              {activeTab === 'control' && 'Bảng điều khiển Box bài học'}
-              {activeTab === 'accounts' && 'Quản lý danh sách tài khoản'}
-              {activeTab === 'queues' && 'Tiến độ Hàng chờ & Các phiên đang chạy'}
-              {activeTab === 'logs' && 'Nhật ký hoạt động hệ thống'}
-              {activeTab === 'settings' && 'Cấu hình hệ thống & Firebase'}
+              {TAB_TITLES[activeTab] || ''}
             </div>
 
             <div className="top-header-actions">
-              <button
-                className="theme-toggle"
-                onClick={() => setDarkMode(d => !d)}
-                title={darkMode ? 'Chuyển sang Light mode' : 'Chuyển sang Dark mode'}
-              >
-                {darkMode ? '○' : '●'}
-              </button>
               <span className={`status-badge ${connected ? 'connected' : 'disconnected'}`}>
                 {connected ? 'Online' : 'Offline'}
               </span>
@@ -143,12 +134,13 @@ function App() {
                 accounts={accounts}
                 sessions={sessions}
                 queues={queues}
+                autoScans={autoScans}
                 onNavigate={setActiveTab}
               />
             )}
 
             {activeTab === 'autoscan' && (
-              <AutoScanPanel accounts={accounts} toast={toast} />
+              <AutoScanPanel accounts={accounts} autoScans={autoScans} toast={toast} />
             )}
 
             {activeTab === 'control' && (

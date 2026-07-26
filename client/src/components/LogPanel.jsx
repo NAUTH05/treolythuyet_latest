@@ -44,67 +44,33 @@ export default function LogPanel({ logs, onClear }) {
 
   return (
     <div className="card log-container">
-      <div className="card-header" style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <span>📜 Nhật ký hệ thống</span>
+      <div className="card-header" style={{ flexWrap: 'wrap' }}>
+        <span>Nhật ký hệ thống</span>
 
         {/* Filter Controls Bar */}
-        <div style={{ display: 'flex', gap: 8, marginLeft: 'auto', alignItems: 'center', flexWrap: 'wrap' }}>
-          {/* Search Input */}
+        <div className="filter-bar" style={{ marginLeft: 'auto' }}>
           <input
             type="text"
-            placeholder="🔍 Tìm từ khóa..."
+            placeholder="Tìm từ khóa..."
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
-            style={{
-              padding: '4px 10px',
-              background: 'var(--surface2)',
-              border: '1px solid var(--border)',
-              borderRadius: '6px',
-              color: 'var(--text)',
-              fontSize: '11px',
-              outline: 'none',
-              width: '130px',
-            }}
+            style={{ width: 140 }}
           />
 
-          {/* Level / Status Filter */}
           <select
             value={filterLevel}
             onChange={e => setFilterLevel(e.target.value)}
-            style={{
-              padding: '4px 10px',
-              background: 'var(--surface2)',
-              border: '1px solid var(--border)',
-              borderRadius: '6px',
-              color: 'var(--text)',
-              fontSize: '11px',
-              cursor: 'pointer',
-              outline: 'none',
-              fontFamily: 'inherit',
-            }}
           >
             <option value="">Tất cả trạng thái</option>
-            <option value="error">❌ Lỗi (Error)</option>
-            <option value="warn">⚠️ Cảnh báo (Warn)</option>
-            <option value="success">✅ Thành công (Success)</option>
-            <option value="info">ℹ️ Thông tin (Info)</option>
+            <option value="error">Lỗi (Error)</option>
+            <option value="warn">Cảnh báo (Warn)</option>
+            <option value="success">Thành công (Success)</option>
+            <option value="info">Thông tin (Info)</option>
           </select>
 
-          {/* Account Filter */}
           <select
             value={filterAccount}
             onChange={e => setFilterAccount(e.target.value)}
-            style={{
-              padding: '4px 10px',
-              background: 'var(--surface2)',
-              border: '1px solid var(--border)',
-              borderRadius: '6px',
-              color: 'var(--text)',
-              fontSize: '11px',
-              cursor: 'pointer',
-              outline: 'none',
-              fontFamily: 'inherit',
-            }}
           >
             <option value="">Tất cả tài khoản</option>
             {accountList.map(a => (
@@ -114,16 +80,15 @@ export default function LogPanel({ logs, onClear }) {
 
           {(filterAccount || filterLevel || searchQuery) && (
             <button
-              className="btn btn-sm btn-outline"
+              className="btn btn-sm btn-ghost"
               onClick={() => {
                 setFilterAccount('');
                 setFilterLevel('');
                 setSearchQuery('');
               }}
-              style={{ fontSize: 10, padding: '3px 8px' }}
               title="Reset bộ lọc"
             >
-              🔄 Reset
+              Reset
             </button>
           )}
 
@@ -134,7 +99,7 @@ export default function LogPanel({ logs, onClear }) {
       <div className="card-body" style={{ padding: 12 }}>
         <div className="log-box" ref={boxRef}>
           {filteredLogs.length === 0 ? (
-            <div style={{ color: 'var(--text2)', textAlign: 'center', padding: '20px 0', fontSize: 12 }}>
+            <div className="empty" style={{ padding: '20px 0' }}>
               Chưa có log phù hợp bộ lọc
             </div>
           ) : (

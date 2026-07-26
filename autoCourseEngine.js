@@ -45,6 +45,7 @@ class AutoCourseSession extends EventEmitter {
       currentCourseIndex: this.currentCourseIndex,
       totalCourses: this.coursesConfig.length,
       dailyStudiedMinutes: this.dailyStudiedMinutes,
+      dailyMaxMinutes: this.options.dailyMaxMinutes,
       courseProgress: this.courseProgress,
     };
   }
@@ -108,6 +109,8 @@ class AutoCourseSession extends EventEmitter {
         this.currentCourseIndex = cIdx;
 
         const targetMinutes = (cConfig.targetHours || 0) * 60 + (cConfig.targetMinutes || 0);
+        this.status = 'scanning';
+        this.emit('status', this.getStatus());
         this.log(`🔍 Bắt đầu quét Khóa học ${cIdx + 1}/${this.coursesConfig.length}: ${cConfig.courseUrl} (Mục tiêu: ${cConfig.targetHours || 0}h ${cConfig.targetMinutes || 0}m)`, 'info');
 
         // Quét thông tin khóa học & các bài chưa hoàn thành (<100%)
@@ -159,7 +162,7 @@ class AutoCourseSession extends EventEmitter {
           // Kiểm tra giới hạn 8 tiếng/ngày (480m)
           if (this.dailyStudiedMinutes >= this.options.dailyMaxMinutes) {
             this.status = 'daily-limit';
-            this.log(`🛑 Đã đạt giới hạn tối đa 8 tiếng học trong ngày (480 phút) $\\rightarrow$ Hẹn 06:00 sáng ngày mai tiếp tục!`, 'warn');
+            this.log(`🛑 Đã đạt giới hạn học tối đa trong ngày (${this.options.dailyMaxMinutes} phút) → Hẹn 06:00 sáng ngày mai tiếp tục!`, 'warn');
             this.emit('status', this.getStatus());
             return;
           }
@@ -216,6 +219,8 @@ class AutoCourseSession extends EventEmitter {
             }
           }
 
+          if (this._stopped) break;
+
           // Treo bài học này
           this.status = 'studying';
           this.emit('status', this.getStatus());
@@ -245,7 +250,7 @@ class AutoCourseSession extends EventEmitter {
             courseStudiedMins += addMins;
             this.courseProgress[cConfig.courseUrl].studiedMinutes = courseStudiedMins;
 
-            this.log(`📊 Đang treo bài [${lesson.title}]: Đã treo ${Math.round(elapsedMs / 60000)}/${lessonMinutes} phút | Tổng hôm nay: ${this.dailyStudiedMinutes}/480 phút`, 'info');
+            this.log(`📊 Đang treo bài [${lesson.title}]: Đã treo ${Math.round(elapsedMs / 60000)}/${lessonMinutes} phút | Tổng hôm nay: ${this.dailyStudiedMinutes}/${this.options.dailyMaxMinutes} phút`, 'info');
             this.emit('status', this.getStatus());
 
             if (elapsedMs < durationMs && !this._stopped) {
@@ -253,23 +258,36 @@ class AutoCourseSession extends EventEmitter {
             }
           }
 
-          this.log(`✅ Hoàn thành treo bài [${lesson.title}] (${lessonMinutes} phút)!`, 'success');
-          this.emit('progress-saved', {
-            account: this.account.name,
-            courseTitle: scanResult.courseTitle,
-            lessonTitle: lesson.title,
-            studiedMinutes: lessonMinutes,
-            courseRemainingMinutes: Math.max(0, targetMinutes - courseStudiedMins),
-          });
+          if (!this._stopped) {
+            this.log(`✅ Hoàn thành treo bài [${lesson.title}] (${lessonMinutes} phút)!`, 'success');
+            this.emit('progress-saved', {
+              account: this.account.name,
+              courseTitle: scanResult.courseTitle,
+              lessonTitle: lesson.title,
+              studiedMinutes: lessonMinutes,
+              courseRemainingMinutes: Math.max(0, targetMinutes - courseStudiedMins),
+            });
+          }
         }
       }
 
-      this.status = 'completed';
-      this.log(`🎉 Tất cả các khóa học đã được quét và treo xong!`, 'success');
-      this.emit('status', this.getStatus());
+      if (this._stopped) {
+        this.status = 'stopped';
+        this.emit('status', this.getStatus());
+      } else {
+        this.status = 'completed';
+        this.log(`🎉 Tất cả các khóa học đã được quét và treo xong!`, 'success');
+        this.emit('status', this.getStatus());
+      }
     } catch (err) {
-      this.status = 'error';
-      this.log(`❌ Lỗi Auto-Scan: ${err.message}`, 'error');
+      if (this._stopped) {
+        this.status = 'stopped';
+        this.emit('status', this.getStatus());
+      } else {
+        this.status = 'error';
+        this.log(`❌ Lỗi Auto-Scan: ${err.message}`, 'error');
+        this.emit('status', this.getStatus());
+      }
     } finally {
       await this.stop();
     }

@@ -78,6 +78,25 @@ export async function addPairsToQueue(queueId, pairs) {
   return res.json();
 }
 
+export async function startAutoScan(payload) {
+  const res = await fetch(`${API}/api/auto-scan/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return res.json();
+}
+
+export async function stopAutoScan(id) {
+  const res = await fetch(`${API}/api/auto-scan/stop/${id}`, { method: 'POST' });
+  return res.json();
+}
+
+export async function removeAutoScan(id) {
+  const res = await fetch(`${API}/api/auto-scan/sessions/${id}`, { method: 'DELETE' });
+  return res.json();
+}
+
 export async function fetchPresets() {
   const res = await fetch(`${API}/api/presets`);
   return res.json();

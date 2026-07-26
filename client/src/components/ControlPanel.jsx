@@ -17,13 +17,6 @@ function parseTimeMinutes(h, m) {
   return hours * 60 + mins;
 }
 
-function formatTimeStr(h, m) {
-  const total = parseTimeMinutes(h, m) || 240;
-  const hours = Math.floor(total / 60);
-  const mins = total % 60;
-  return `${hours}h${mins > 0 ? ` ${mins}m` : ''}`;
-}
-
 function createDefaultBox() {
   return {
     urls: [{ url: '', timeH: '', timeM: '' }],
@@ -258,52 +251,29 @@ export default function ControlPanel({ accounts, onStart }) {
   };
 
   const hasValidLink = boxes.some(b => b.urls.some(u => u.url.trim()));
-  const numStyle = { width: 48, textAlign: 'center', padding: '6px 4px' };
 
   const totalLinksCount = boxes.reduce((acc, b) => acc + b.urls.filter(u => u.url.trim()).length, 0);
 
   return (
     <div className="card">
-      <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <span>🎮 Bảng Điều Khiển Box Bài Học</span>
+      <div className="card-header">
+        <span>Bảng điều khiển Box bài học</span>
       </div>
 
       <div className="card-body">
         {/* Preset Management Toolbar */}
-        <div style={{
-          background: 'rgba(124, 111, 255, 0.06)',
-          border: '1px solid rgba(124, 111, 255, 0.2)',
-          borderRadius: 10,
-          padding: '12px 16px',
-          marginBottom: 20,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 12,
-          flexWrap: 'wrap',
-        }}>
-          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
-            📂 Mẫu Preset Bài Học:
-          </span>
+        <div className="preset-bar">
+          <span className="filter-label">Mẫu Preset bài học</span>
 
           <select
             value={selectedPresetId}
             onChange={e => handleSelectPreset(e.target.value)}
-            style={{
-              padding: '6px 12px',
-              background: 'var(--surface2)',
-              border: '1px solid var(--border)',
-              borderRadius: 6,
-              color: 'var(--text)',
-              fontSize: 13,
-              cursor: 'pointer',
-              outline: 'none',
-              minWidth: 220,
-            }}
+            style={{ minWidth: 220 }}
           >
             <option value="">-- Chọn mẫu đã lưu --</option>
             {presets.map(p => (
               <option key={p.id} value={p.id}>
-                📦 {p.name} ({p.boxes ? p.boxes.length : 0} box)
+                {p.name} ({p.boxes ? p.boxes.length : 0} box)
               </option>
             ))}
           </select>
@@ -315,44 +285,33 @@ export default function ControlPanel({ accounts, onStart }) {
               onClick={handleDeletePreset}
               title="Xóa mẫu Preset này"
             >
-              🗑 Xóa Mẫu
+              Xóa mẫu
             </button>
           )}
 
           <button
             type="button"
-            className="btn btn-sm btn-primary"
+            className="btn btn-sm btn-outline"
             onClick={() => setShowSavePresetModal(true)}
             style={{ marginLeft: 'auto' }}
             disabled={!hasValidLink}
           >
-            💾 Lưu làm Preset Mới
+            Lưu làm Preset mới
           </button>
         </div>
 
         {/* Save Preset Modal */}
         {showSavePresetModal && (
-          <div style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.7)',
-            backdropFilter: 'blur(8px)',
-            zIndex: 1000,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-          }}>
-            <div className="card" style={{ width: '90%', maxWidth: 440, padding: 24 }}>
-              <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 8, color: 'var(--primary)' }}>
-                💾 Lưu Mẫu Preset Mới
-              </div>
-              <p style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 16 }}>
+          <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowSavePresetModal(false)}>
+            <div className="modal">
+              <div className="modal-title">Lưu mẫu Preset mới</div>
+              <p className="modal-desc">
                 Lưu lại toàn bộ cấu hình {boxes.length} Box ({totalLinksCount} link bài học kèm thời gian) để nạp lại nhanh cho các học viên khác.
               </p>
 
               <form onSubmit={handleSavePresetSubmit}>
                 <div className="form-group">
-                  <label>Tên Mẫu Preset</label>
+                  <label>Tên mẫu Preset</label>
                   <input
                     type="text"
                     placeholder="VD: Bộ Lý Thuyết Hạng B2 - 32 bài..."
@@ -368,7 +327,7 @@ export default function ControlPanel({ accounts, onStart }) {
                     Hủy
                   </button>
                   <button type="submit" className="btn btn-primary" disabled={presetSaving || !newPresetName.trim()}>
-                    {presetSaving ? '⏳ Đang lưu...' : '💾 Lưu Preset'}
+                    {presetSaving ? 'Đang lưu...' : 'Lưu Preset'}
                   </button>
                 </div>
               </form>
@@ -377,8 +336,8 @@ export default function ControlPanel({ accounts, onStart }) {
         )}
 
         <div className="form-group">
-          <label>📋 Danh sách Box bài học</label>
-          <div style={{ fontSize: 12, color: 'var(--text2)', marginBottom: 8 }}>
+          <label>Danh sách Box bài học</label>
+          <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
             Mỗi box có nhiều link, mỗi link có thể tuỳ chỉnh thời gian riêng. Mỗi box có cài đặt riêng biệt.
           </div>
 
@@ -390,93 +349,65 @@ export default function ControlPanel({ accounts, onStart }) {
             }, 0);
 
             return (
-              <div
-                key={boxIdx}
-                style={{
-                  border: '1px solid var(--border)',
-                  borderRadius: 8,
-                  padding: 12,
-                  marginBottom: 8,
-                  background: 'rgba(255, 255, 255, 0.02)',
-                }}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--primary)' }}>
+              <div key={boxIdx} className="box-card">
+                <div className="box-card-header">
+                  <span className="box-card-title">
+                    <span className="box-card-index">{boxIdx + 1}</span>
                     Box {boxIdx + 1} ({box.urls.length} link)
                   </span>
                   <div style={{ display: 'flex', gap: 4 }}>
                     <button
-                      className="btn btn-sm btn-outline"
+                      className="btn btn-xs btn-outline"
                       onClick={() => addUrlToBox(boxIdx)}
-                      style={{ padding: '2px 8px', fontSize: 11 }}
                     >
                       + Link
                     </button>
                     {boxes.length > 1 && (
                       <button
-                        className="btn btn-sm btn-danger"
+                        className="btn btn-xs btn-danger"
                         onClick={() => removeBox(boxIdx)}
-                        style={{ padding: '2px 8px', fontSize: 11 }}
                       >
-                        ✕ Xoá
+                        Xoá Box
                       </button>
                     )}
                   </div>
                 </div>
 
                 {box.urls.map((urlObj, urlIdx) => (
-                  <div
-                    key={urlIdx}
-                    style={{
-                      display: 'flex',
-                      gap: 6,
-                      alignItems: 'center',
-                      marginBottom: 6,
-                    }}
-                  >
-                    <span style={{ fontSize: 12, color: 'var(--text2)', minWidth: 20 }}>
-                      {urlIdx + 1}.
-                    </span>
+                  <div key={urlIdx} className="url-row">
+                    <span className="url-row-index">{urlIdx + 1}.</span>
                     <input
                       type="url"
                       placeholder={`URL bài học ${urlIdx + 1} *`}
                       value={urlObj.url}
                       onChange={e => updateBoxUrl(boxIdx, urlIdx, 'url', e.target.value)}
-                      style={{ flex: 1 }}
                     />
                     <input
                       type="number"
+                      className="input-num"
                       placeholder="h"
                       min="0"
                       max="24"
                       value={urlObj.timeH}
                       onChange={e => updateBoxUrl(boxIdx, urlIdx, 'timeH', e.target.value)}
-                      style={numStyle}
                       title="Số giờ riêng cho bài này (để trống = dùng tổng Box)"
                     />
-                    <span style={{ fontSize: 12, color: 'var(--text2)' }}>:</span>
+                    <span className="unit">:</span>
                     <input
                       type="number"
+                      className="input-num"
                       placeholder="m"
                       min="0"
                       max="59"
                       value={urlObj.timeM}
                       onChange={e => updateBoxUrl(boxIdx, urlIdx, 'timeM', e.target.value)}
-                      style={numStyle}
                       title="Số phút riêng cho bài này (để trống = dùng tổng Box)"
                     />
                     {box.urls.length > 1 && (
                       <button
                         type="button"
+                        className="icon-btn"
                         onClick={() => removeUrlFromBox(boxIdx, urlIdx)}
-                        style={{
-                          background: 'none',
-                          border: 'none',
-                          color: 'var(--danger)',
-                          cursor: 'pointer',
-                          padding: '0 4px',
-                          fontSize: 14,
-                        }}
                         title="Xoá link này"
                       >
                         ✕
@@ -485,86 +416,78 @@ export default function ControlPanel({ accounts, onStart }) {
                   </div>
                 ))}
 
-                <div style={{ fontSize: 11, color: 'var(--text2)', marginTop: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div className="box-card-footer">
                   <span>
-                    ⏱️ Tổng: <strong>{(totalBoxMinutes / 60).toFixed(1)}h</strong> ({totalBoxMinutes} phút)
+                    Tổng: <strong style={{ color: 'var(--text)' }}>{(totalBoxMinutes / 60).toFixed(1)}h</strong> ({totalBoxMinutes} phút)
                   </span>
 
                   <button
                     type="button"
-                    className="btn btn-sm btn-outline"
+                    className="btn btn-xs btn-ghost"
                     onClick={() => updateBox(boxIdx, 'showOptions', !box.showOptions)}
-                    style={{ fontSize: 11, padding: '2px 8px' }}
                   >
-                    ⚙️ Cài đặt Box {box.showOptions ? '▲' : '▼'}
+                    Cài đặt Box {box.showOptions ? '▴' : '▾'}
                   </button>
                 </div>
 
                 {box.showOptions && (
-                  <div style={{
-                    marginTop: 10,
-                    paddingTop: 10,
-                    borderTop: '1px dashed var(--border)',
-                    fontSize: 12,
-                  }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 8 }}>
-                      <div>
-                        <label style={{ fontSize: 11 }}>Thời gian mặc định Box</label>
-                        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                  <div className="box-card-options">
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 10 }}>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>Thời gian mặc định Box</label>
+                        <div className="input-row">
                           <input
                             type="number"
+                            className="input-num"
                             placeholder="4"
                             value={box.timeH}
                             onChange={e => updateBox(boxIdx, 'timeH', e.target.value)}
-                            style={numStyle}
                           />
-                          <span>h</span>
+                          <span className="unit">h</span>
                           <input
                             type="number"
+                            className="input-num"
                             placeholder="0"
                             value={box.timeM}
                             onChange={e => updateBox(boxIdx, 'timeM', e.target.value)}
-                            style={numStyle}
                           />
-                          <span>m</span>
+                          <span className="unit">m</span>
                         </div>
                       </div>
 
-                      <div>
-                        <label style={{ fontSize: 11 }}>F5 Refresh (phút)</label>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>F5 Refresh (phút)</label>
                         <input
                           type="number"
                           value={box.refreshInterval}
                           onChange={e => updateBox(boxIdx, 'refreshInterval', e.target.value)}
-                          style={{ width: '100%' }}
                         />
                       </div>
 
-                      <div>
-                        <label style={{ fontSize: 11 }}>Stealth (giây)</label>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label>Stealth (giây)</label>
                         <input
                           type="number"
                           value={box.stealthInterval}
                           onChange={e => updateBox(boxIdx, 'stealthInterval', e.target.value)}
-                          style={{ width: '100%' }}
                         />
                       </div>
                     </div>
 
                     <div style={{ marginBottom: 8 }}>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12 }}>
+                      <label className="check-row">
                         <input
                           type="checkbox"
                           checked={box.useTimeWindows}
                           onChange={e => updateBox(boxIdx, 'useTimeWindows', e.target.checked)}
                         />
-                        <span>⏰ Giới hạn khung giờ học cho Box này</span>
+                        <span>Giới hạn khung giờ học cho Box này</span>
                       </label>
 
                       {box.useTimeWindows && (
-                        <div style={{ marginTop: 6, paddingLeft: 20 }}>
+                        <div style={{ marginTop: 6, paddingLeft: 22 }}>
                           {box.timeWindows.map((tw, twIdx) => (
-                            <div key={twIdx} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4 }}>
+                            <div key={twIdx} className="input-row" style={{ marginBottom: 4 }}>
                               <input
                                 type="time"
                                 value={tw.start}
@@ -574,7 +497,7 @@ export default function ControlPanel({ accounts, onStart }) {
                                   updateBox(boxIdx, 'timeWindows', next);
                                 }}
                               />
-                              <span>-</span>
+                              <span className="unit">-</span>
                               <input
                                 type="time"
                                 value={tw.end}
@@ -591,17 +514,17 @@ export default function ControlPanel({ accounts, onStart }) {
                     </div>
 
                     <div>
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12 }}>
+                      <label className="check-row">
                         <input
                           type="checkbox"
                           checked={box.useSchedule}
                           onChange={e => updateBox(boxIdx, 'useSchedule', e.target.checked)}
                         />
-                        <span>📅 Hẹn ngày giờ bắt đầu cho Box này</span>
+                        <span>Hẹn ngày giờ bắt đầu cho Box này</span>
                       </label>
 
                       {box.useSchedule && (
-                        <div style={{ display: 'flex', gap: 8, marginTop: 6, paddingLeft: 20 }}>
+                        <div className="input-row" style={{ marginTop: 6, paddingLeft: 22 }}>
                           <input
                             type="date"
                             value={box.scheduleDate}
@@ -623,56 +546,56 @@ export default function ControlPanel({ accounts, onStart }) {
 
           <button
             type="button"
-            className="btn btn-outline btn-sm"
+            className="btn btn-outline btn-sm btn-block"
             onClick={addBox}
-            style={{ width: '100%', marginTop: 4 }}
+            style={{ marginTop: 4 }}
           >
-            + Thêm Box Bài Học Mới
+            + Thêm Box bài học mới
           </button>
         </div>
 
         {/* Random delay start */}
         <div style={{ marginBottom: 16 }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
+          <label className="check-row">
             <input
               type="checkbox"
               checked={randomStart}
               onChange={e => setRandomStart(e.target.checked)}
             />
-            <span>🎲 Random delay giờ khởi động (mỗi account trễ ngẫu nhiên)</span>
+            <span>Random delay giờ khởi động (mỗi account trễ ngẫu nhiên)</span>
           </label>
 
           {randomStart && (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6, paddingLeft: 22 }}>
+            <div className="input-row" style={{ marginTop: 6, paddingLeft: 22 }}>
               <input
                 type="number"
+                className="input-num"
                 value={randomStartMin}
                 onChange={e => setRandomStartMin(Number(e.target.value))}
-                style={{ width: 60 }}
               />
-              <span>-</span>
+              <span className="unit">-</span>
               <input
                 type="number"
+                className="input-num"
                 value={randomStartMax}
                 onChange={e => setRandomStartMax(Number(e.target.value))}
-                style={{ width: 60 }}
               />
-              <span style={{ fontSize: 12, color: 'var(--text2)' }}>phút</span>
+              <span className="unit">phút</span>
             </div>
           )}
         </div>
 
         {/* Account Selector */}
         <div className="form-group">
-          <label>👤 Chọn tài khoản áp dụng</label>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
+          <label>Chọn tài khoản áp dụng</label>
+          <div className="chip-group">
             {accounts.map(acc => {
               const isSelected = selectedAccounts.has(acc.index);
               return (
                 <button
                   key={acc.index}
                   type="button"
-                  className={`btn btn-sm ${isSelected ? 'btn-primary' : 'btn-outline'}`}
+                  className={`chip ${isSelected ? 'selected' : ''}`}
                   onClick={() => {
                     setSelectedAccounts(prev => {
                       const next = new Set(prev);
@@ -686,6 +609,9 @@ export default function ControlPanel({ accounts, onStart }) {
                 </button>
               );
             })}
+            {accounts.length === 0 && (
+              <span className="hint" style={{ marginTop: 0 }}>Chưa có tài khoản nào — thêm ở mục Tài khoản.</span>
+            )}
           </div>
         </div>
 
@@ -696,7 +622,7 @@ export default function ControlPanel({ accounts, onStart }) {
           onClick={handleStart}
           disabled={loading || !hasValidLink || selectedAccounts.size === 0}
         >
-          {loading ? '⏳ Đang khởi động...' : '🚀 Bắt Đầu Treo Bài Học'}
+          {loading ? 'Đang khởi động...' : 'Bắt đầu treo bài học'}
         </button>
       </div>
     </div>

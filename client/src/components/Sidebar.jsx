@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 const SIDEBAR_WIDTH_KEY = 'treohoc_sidebar_width';
 const SIDEBAR_COLLAPSED_KEY = 'treohoc_sidebar_collapsed';
 
-export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, onLogout, activeSessionsCount, activeQueuesCount }) {
+export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, onLogout, activeSessionsCount, activeQueuesCount, activeAutoScansCount }) {
   const [collapsed, setCollapsed] = useState(() => {
     return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
   });
@@ -46,7 +46,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
 
   const navItems = [
     { id: 'dashboard', label: 'Tổng quan', icon: '◈' },
-    { id: 'autoscan', label: 'Auto Scan Khóa Học', icon: '🤖' },
+    { id: 'autoscan', label: 'Auto Scan Khóa Học', icon: '⟳', badge: activeAutoScansCount },
     { id: 'control', label: 'Điều khiển Box', icon: '▶' },
     { id: 'accounts', label: 'Tài khoản', icon: '○' },
     { id: 'queues', label: 'Hàng chờ & Phiên', icon: '≡', badge: activeQueuesCount + activeSessionsCount },
@@ -60,7 +60,7 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`} style={{ width: sidebarWidth }}>
       {/* Brand Header */}
       <div className="sidebar-brand">
-        <div className="brand-logo" style={{ fontSize: 16, fontWeight: 800, letterSpacing: '-0.5px', fontFamily: 'serif' }}>TLT</div>
+        <div className="brand-logo">TLT</div>
         {!collapsed && (
           <div className="brand-info">
             <span className="brand-title">Treo Lý Thuyết</span>

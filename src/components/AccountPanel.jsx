@@ -39,9 +39,9 @@ export default function AccountPanel({ accounts, onRefresh, toast }) {
   return (
     <>
       <div className="card">
-        <div className="card-header" style={{ display: 'flex', alignItems: 'center' }}>
+        <div className="card-header">
           Tài khoản
-          <span style={{ marginLeft: 6, color: 'var(--text2)', fontWeight: 400 }}>({accounts.length})</span>
+          <span className="count-pill">{accounts.length}</span>
           <button className="btn btn-sm btn-outline" style={{ marginLeft: 'auto' }} onClick={() => setShowModal(true)}>
             + Thêm
           </button>
@@ -72,7 +72,7 @@ export default function AccountPanel({ accounts, onRefresh, toast }) {
       {showModal && (
         <div className="modal-overlay" onClick={e => e.target === e.currentTarget && setShowModal(false)}>
           <div className="modal">
-            <h3 style={{ fontSize: 16, fontWeight: 700, letterSpacing: '-0.3px', marginBottom: 20 }}>Thêm tài khoản</h3>
+            <h3 className="modal-title" style={{ marginBottom: 20 }}>Thêm tài khoản</h3>
             <div className="form-group">
               <label>Tên hiển thị</label>
               <input value={name} onChange={e => setName(e.target.value)} placeholder="VD: Nguyễn Văn A" />
