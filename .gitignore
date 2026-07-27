@@ -12,4 +12,5 @@ admin-config.json
 firebase-config.json
 .env
 .DS_Store
+.claude/
 treohoclythuyet_correctUI/
