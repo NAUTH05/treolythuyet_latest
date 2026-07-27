@@ -1455,6 +1455,7 @@ function saveAutoScanState() {
           stealthInterval: s.options.stealthInterval || 30,
           stealth: s.options.stealth === true,
           timeWindows: s.options.timeWindows || [],
+          customTimeRules: s.options.customTimeRules || [],
         },
         status: s.status,
         pausedFromStatus: s.pausedFromStatus || null,
@@ -1578,6 +1579,7 @@ function restartAutoScanSession(sessionId) {
     stealth: old.options.stealth === true,
     stealthInterval: old.options.stealthInterval || 30,
     timeWindows: old.options.timeWindows || [],
+    customTimeRules: old.options.customTimeRules || [],
   }, {
     createdAt: old.createdAt,
     dailyStudiedMinutes: old.dailyStudiedMinutes,
@@ -1636,6 +1638,7 @@ async function loadAndRestoreAutoScans() {
       stealth: !!(saved.options && saved.options.stealth),
       stealthInterval: (saved.options && saved.options.stealthInterval) || 30,
       timeWindows: (saved.options && saved.options.timeWindows) || [],
+      customTimeRules: (saved.options && saved.options.customTimeRules) || [],
     };
     const s = createAutoScanSession(saved.id, saved.account, saved.coursesConfig || [], options, {
       createdAt: saved.createdAt,
@@ -1744,7 +1747,7 @@ function startAutoScanWhenFree(autoSession) {
 }
 
 app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
-  const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, refreshInterval, stealth, stealthInterval, timeWindows, accountIndices } = req.body;
+  const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices } = req.body;
   if (!courses || !Array.isArray(courses) || courses.length === 0) {
     return res.status(400).json({ error: 'Cần nhập ít nhất 1 khóa học' });
   }
@@ -1759,6 +1762,13 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
     ? timeWindows.filter(w => w && /^\d{1,2}:\d{2}$/.test(w.start || '') && /^\d{1,2}:\d{2}$/.test(w.end || ''))
     : [];
 
+  const validCustomRules = Array.isArray(customTimeRules)
+    ? customTimeRules.map(r => ({
+        dates: String(r.dates || '').trim(),
+        shifts: String(r.shifts || '').trim(),
+      })).filter(r => r.shifts.length > 0)
+    : [];
+
   const started = [];
   for (const acc of targetAccounts) {
     const sessionId = `autoscan_${acc.name}_${Date.now()}`;
@@ -1771,6 +1781,7 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
       stealth: stealth === true,
       stealthInterval: parseInt(stealthInterval, 10) || 30,
       timeWindows: validTimeWindows,
+      customTimeRules: validCustomRules,
     });
 
     startAutoScanWhenFree(autoSession);

@@ -96,6 +96,119 @@ function getNextAllowedStudyDate(fromDate = new Date(), allowedRanges = [], newD
   return vnMoment(from.year, from.month, from.day + 1);
 }
 
+// ── XỬ LÝ KHUNG GIỜ HỌC THEO CA (TIME SHIFTS) ──
+
+// Parse chuỗi ca học dạng "07:00-11:30, 14:00-23:00" → mảng các shift
+function parseShifts(shiftsStr) {
+  if (!shiftsStr) return [];
+  const res = [];
+  const parts = String(shiftsStr).split(',').map(s => s.trim()).filter(Boolean);
+  for (const p of parts) {
+    const range = p.split('-').map(s => s.trim());
+    if (range.length === 2) {
+      const [sh, sm] = range[0].split(':').map(Number);
+      const [eh, em] = range[1].split(':').map(Number);
+      if (!isNaN(sh) && !isNaN(eh)) {
+        const startMins = sh * 60 + (isNaN(sm) ? 0 : sm);
+        const endMins = eh * 60 + (isNaN(em) ? 0 : em);
+        res.push({
+          start: range[0],
+          end: range[1],
+          startMins,
+          endMins,
+        });
+      }
+    }
+  }
+  return res;
+}
+
+// Tìm danh sách Ca học áp dụng cho ngày `date` dựa trên `customTimeRules`
+function getShiftsForDate(date = new Date(), customTimeRules = []) {
+  if (!customTimeRules || customTimeRules.length === 0) return [];
+
+  // Tìm quy tắc có `dates` khớp với ngày `date`
+  for (const rule of customTimeRules) {
+    if (!rule || !rule.shifts) continue;
+    const ruleDates = rule.dates ? [rule.dates] : [];
+    // Nếu rule.dates rỗng → quy tắc mặc định cho tất cả các ngày
+    if (ruleDates.length === 0 || isAllowedStudyDate(date, ruleDates)) {
+      const parsed = Array.isArray(rule.shifts) ? rule.shifts : parseShifts(rule.shifts);
+      if (parsed.length > 0) return parsed;
+    }
+  }
+
+  return [];
+}
+
+// Kiểm tra thời điểm `date` (VN time) có nằm trong Ca học nào không & tính ms còn lại của ca hiện tại
+function calcMsRemainingInShift(date = new Date(), shifts = []) {
+  if (!shifts || shifts.length === 0) {
+    return { inShift: true, remainingMs: Infinity, currentShift: null, nextShiftToday: null };
+  }
+
+  const p = vnDateParts(date);
+  // Lấy giờ, phút, giây VN của `date`
+  const vnDateObj = new Date(date.getTime() + VN_OFFSET_MS);
+  const nowMins = vnDateObj.getUTCHours() * 60 + vnDateObj.getUTCMinutes();
+  const nowSecs = vnDateObj.getUTCSeconds();
+
+  // Kiểm tra ca hiện tại
+  for (const s of shifts) {
+    if (nowMins >= s.startMins && nowMins < s.endMins) {
+      const remMins = s.endMins - nowMins;
+      const ms = remMins * 60000 - nowSecs * 1000;
+      return { inShift: true, remainingMs: Math.max(0, ms), currentShift: s, nextShiftToday: null };
+    }
+  }
+
+  // Nếu không nằm trong ca nào, tìm ca tiếp theo TRONG NGÀY HÔM NAY (nếu có)
+  const futureShiftsToday = shifts.filter(s => s.startMins > nowMins).sort((a, b) => a.startMins - b.startMins);
+  const nextShiftToday = futureShiftsToday.length > 0 ? futureShiftsToday[0] : null;
+
+  return { inShift: false, remainingMs: 0, currentShift: null, nextShiftToday };
+}
+
+// Tìm thời điểm bắt đầu Ca học tiếp theo (hôm nay hoặc ngày học tiếp theo)
+function getNextShiftStart(fromDate = new Date(), customTimeRules = [], allowedRanges = [], defaultNewDayStart = '06:00') {
+  const shiftsToday = getShiftsForDate(fromDate, customTimeRules);
+  const statusToday = calcMsRemainingInShift(fromDate, shiftsToday);
+
+  // 1. Nếu hôm nay còn Ca học phía sau (chưa đến giờ):
+  if (statusToday.nextShiftToday) {
+    const s = statusToday.nextShiftToday;
+    const startH = Math.floor(s.startMins / 60);
+    const startM = s.startMins % 60;
+    const p = vnDateParts(fromDate);
+    // Trả về thời điểm UTC tương ứng với startH:startM giờ VN hôm nay
+    return new Date(Date.UTC(p.year, p.month, p.day, startH, startM, 0, 0) - VN_OFFSET_MS);
+  }
+
+  // 2. Nếu hôm nay đã hết tất cả các Ca học: tìm trong các ngày tiếp theo
+  const pFrom = vnDateParts(fromDate);
+  for (let i = 1; i <= 60; i++) {
+    const candidateDate = new Date(Date.UTC(pFrom.year, pFrom.month, pFrom.day + i, 0, 0, 0, 0) - VN_OFFSET_MS);
+    if (isAllowedStudyDate(candidateDate, allowedRanges)) {
+      const candidateShifts = getShiftsForDate(candidateDate, customTimeRules);
+      const candP = vnDateParts(candidateDate);
+
+      if (candidateShifts.length > 0) {
+        // Lấy ca đầu tiên của ngày đó
+        const firstShift = candidateShifts.sort((a, b) => a.startMins - b.startMins)[0];
+        const startH = Math.floor(firstShift.startMins / 60);
+        const startM = firstShift.startMins % 60;
+        return new Date(Date.UTC(candP.year, candP.month, candP.day, startH, startM, 0, 0) - VN_OFFSET_MS);
+      } else {
+        // Ngày đó không có quy tắc ca riêng → dùng defaultNewDayStart
+        return getNextAllowedStudyDate(fromDate, allowedRanges, defaultNewDayStart);
+      }
+    }
+  }
+
+  // Fallback
+  return getNextAllowedStudyDate(fromDate, allowedRanges, defaultNewDayStart);
+}
+
 // Quét trang thông tin khóa học (slides/[course-slug]) bằng Playwright
 async function scanCourseDetails(page, courseUrl) {
   if (!page) return null;
@@ -286,4 +399,8 @@ module.exports = {
   scanCourseDetails,
   readDomTimer,
   parseVNShortDate,
+  parseShifts,
+  getShiftsForDate,
+  calcMsRemainingInShift,
+  getNextShiftStart,
 };

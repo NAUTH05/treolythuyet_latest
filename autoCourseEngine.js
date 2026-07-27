@@ -1,6 +1,6 @@
 const { chromium } = require('playwright');
 const EventEmitter = require('events');
-const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, readDomTimer } = require('./courseScanner');
+const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, readDomTimer, getShiftsForDate, calcMsRemainingInShift, getNextShiftStart } = require('./courseScanner');
 
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
@@ -17,6 +17,7 @@ class AutoCourseSession extends EventEmitter {
       allowedDateRanges: [], // ["25/07-28/07", "30/07", ...]
       newDayStartTime: '06:00', // Giờ bắt đầu ngày mới (VD: "06:00", "07:30")
       refreshInterval: 15, // Thời gian F5 reload trang (phút)
+      customTimeRules: [], // [{ dates: "25/07", shifts: "07:00-11:30, 14:00-23:00" }, ...]
       stealth: false, // Bật/tắt anti-detection + giả lập thao tác người dùng (mặc định TẮT cho AutoCourse)
       stealthInterval: 30, // Giây giữa các hành động stealth giả lập (giống Queue thủ công)
       timeWindows: [], // [{start:'HH:MM', end:'HH:MM'}] — giới hạn khung giờ học (rỗng = không giới hạn)
@@ -317,6 +318,51 @@ class AutoCourseSession extends EventEmitter {
     this.log('✅ Login thành công!', 'success');
   }
 
+  // Kiểm tra Ca học theo quy tắc Ngày cụ thể (customTimeRules)
+  _checkCustomShifts() {
+    const customRules = this.options.customTimeRules || [];
+    if (!customRules || customRules.length === 0) {
+      return { inShift: true, remainingMs: Infinity, currentShift: null, nextShiftToday: null };
+    }
+    const now = new Date();
+    const shiftsToday = getShiftsForDate(now, customRules);
+    if (!shiftsToday || shiftsToday.length === 0) {
+      return { inShift: true, remainingMs: Infinity, currentShift: null, nextShiftToday: null };
+    }
+    return calcMsRemainingInShift(now, shiftsToday);
+  }
+
+  _hitTimeShiftLimit() {
+    const customRules = this.options.customTimeRules || [];
+    if (!customRules || customRules.length === 0) return false;
+
+    const now = new Date();
+    const shiftsToday = getShiftsForDate(now, customRules);
+    if (!shiftsToday || shiftsToday.length === 0) return false;
+
+    const shiftStatus = calcMsRemainingInShift(now, shiftsToday);
+
+    if (!shiftStatus.inShift) {
+      const nextRun = getNextShiftStart(now, customRules, this.options.allowedDateRanges || [], this.options.newDayStartTime || '06:00');
+      this.status = 'date-limit';
+      const vnTimeStr = now.toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const vnNextStr = nextRun.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+
+      let msg = `⏰ Hiện tại (${vnTimeStr}) nằm ngoài Ca học cho phép`;
+      if (shiftStatus.nextShiftToday) {
+        msg += ` (Ca kế tiếp hôm nay: ${shiftStatus.nextShiftToday.start}-${shiftStatus.nextShiftToday.end}) → Hẹn tự động chạy lại lúc ${vnNextStr}`;
+      } else {
+        msg += ` → Hẹn tự động chạy lại Ca học tiếp theo lúc ${vnNextStr}`;
+      }
+
+      this.log(msg, 'warn');
+      this.emit('status', this.getStatus());
+      return true;
+    }
+
+    return false;
+  }
+
   async start() {
     this.log(`🤖 Khởi động Auto-Scan khóa học cho ${this.account.name}`, 'info');
 
@@ -330,7 +376,10 @@ class AutoCourseSession extends EventEmitter {
       return;
     }
 
-    // 2. Kiểm tra Khung Giờ Học (nếu được cấu hình) trước khi mở browser
+    // 2. Kiểm tra Khung Giờ Ca Học (nếu có quy tắc riêng)
+    if (this._hitTimeShiftLimit()) return;
+
+    // 3. Kiểm tra Khung Giờ Học Tổng Quát (nếu được cấu hình) trước khi mở browser
     if (this._hitTimeWindowLimit()) return;
 
     try {
@@ -561,6 +610,12 @@ class AutoCourseSession extends EventEmitter {
             const jitteredMs = Math.round(refreshIntervalMs + (Math.random() * 2 - 1) * jitter);
             let waitStep = Math.min(Math.max(60000, jitteredMs), durationMs - elapsedMs);
 
+            // Không chờ vượt quá thời điểm kết thúc Ca học hiện tại
+            const shiftCheck = this._checkCustomShifts();
+            if (shiftCheck.currentShift && shiftCheck.remainingMs < waitStep) {
+              waitStep = Math.max(5000, shiftCheck.remainingMs);
+            }
+
             // Không chờ vượt quá thời điểm kết thúc khung giờ hiện tại
             const windowRemainingMs = this._msRemainingInWindow();
             if (windowRemainingMs >= 0) {
@@ -569,9 +624,10 @@ class AutoCourseSession extends EventEmitter {
 
             await this.page.waitForTimeout(waitStep);
 
-            // Re-check pause after waitStep
+            // Re-check pause & shift limit after waitStep
             await this._checkPaused();
             if (this._stopped) break;
+            if (this._hitTimeShiftLimit()) return;
 
             elapsedMs += waitStep;
 

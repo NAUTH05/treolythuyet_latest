@@ -163,9 +163,28 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
   const [newDayStartTime, setNewDayStartTime] = useState('06:00');
   const [refreshInterval, setRefreshInterval] = useState('15');
   const [timeWindowsText, setTimeWindowsText] = useState('');
+  const [customTimeRules, setCustomTimeRules] = useState([
+    { id: 1, dates: '', shifts: '07:00-11:30, 14:00-23:00' }
+  ]);
   const [stealth, setStealth] = useState(false);
   const [selectedAccounts, setSelectedAccounts] = useState(new Set());
   const [loading, setLoading] = useState(false);
+
+  const addCustomRule = () => {
+    setCustomTimeRules(prev => [...prev, { id: Date.now(), dates: '', shifts: '07:00-11:30, 14:00-23:00' }]);
+  };
+
+  const removeCustomRule = (id) => {
+    if (customTimeRules.length <= 1) {
+      setCustomTimeRules([{ id: Date.now(), dates: '', shifts: '' }]);
+      return;
+    }
+    setCustomTimeRules(prev => prev.filter(r => r.id !== id));
+  };
+
+  const updateCustomRule = (id, field, value) => {
+    setCustomTimeRules(prev => prev.map(r => r.id === id ? { ...r, [field]: value } : r));
+  };
 
   // Auto-Scan Presets
   const [presets, setPresets] = useState([]);
@@ -204,6 +223,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
     if (cfg.newDayStartTime != null) setNewDayStartTime(cfg.newDayStartTime);
     if (cfg.refreshInterval != null) setRefreshInterval(String(cfg.refreshInterval));
     if (cfg.timeWindowsText != null) setTimeWindowsText(cfg.timeWindowsText);
+    if (Array.isArray(cfg.customTimeRules)) setCustomTimeRules(cfg.customTimeRules);
     if (cfg.stealth != null) setStealth(!!cfg.stealth);
   };
 
@@ -222,6 +242,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           newDayStartTime,
           refreshInterval,
           timeWindowsText,
+          customTimeRules,
           stealth,
         },
       });
@@ -235,8 +256,8 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       } else {
         toast(res.error || 'Lỗi lưu Preset', 'error');
       }
-    } catch {
-      toast('Lỗi kết nối lưu Preset', 'error');
+    } catch (err) {
+      toast(`Lỗi lưu Preset: ${err.message}`, 'error');
     } finally {
       setPresetSaving(false);
     }
@@ -302,6 +323,10 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       })
       .filter(Boolean);
 
+    const validCustomRules = customTimeRules
+      .map(r => ({ dates: (r.dates || '').trim(), shifts: (r.shifts || '').trim() }))
+      .filter(r => r.shifts.length > 0);
+
     setLoading(true);
     try {
       const data = await api.startAutoScan({
@@ -316,6 +341,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         refreshInterval: parseInt(refreshInterval, 10) || 15,
         stealth,
         ...(timeWindows.length > 0 && { timeWindows }),
+        customTimeRules: validCustomRules,
         accountIndices: [...selectedAccounts],
       });
 
@@ -543,7 +569,53 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           </div>
 
           <div className="form-group">
-            <label>Khung giờ học trong ngày (tùy chọn)</label>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+              <label style={{ margin: 0, fontWeight: 600 }}>Cấu hình Ca học / Khung giờ theo Ngày (Tùy chọn)</label>
+              <button type="button" className="btn btn-sm btn-outline" onClick={addCustomRule}>
+                + Thêm Ca học
+              </button>
+            </div>
+            <div className="hint" style={{ marginBottom: 12 }}>
+              Cài đặt khung giờ theo ca cho ngày cụ thể (ví dụ: ngày 25/07 chia làm 2 ca: ca 1 từ <code>07:00-11:30</code>, ca 2 từ <code>14:00-23:00</code>). Để trống <strong>Ngày áp dụng</strong> nếu muốn làm ca học mặc định hàng ngày.
+            </div>
+
+            {customTimeRules.map((rule, idx) => (
+              <div key={rule.id || idx} className="box-card" style={{ marginBottom: 10, padding: '12px 14px' }}>
+                <div className="box-card-header" style={{ marginBottom: 8 }}>
+                  <span className="box-card-title" style={{ fontSize: '0.88rem' }}>
+                    Quy tắc Ca học #{idx + 1}
+                  </span>
+                  <button type="button" className="icon-btn" onClick={() => removeCustomRule(rule.id || idx)} title="Xóa quy tắc này">✕</button>
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '10px' }}>
+                  <div>
+                    <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Ngày áp dụng (dd/mm)</label>
+                    <input
+                      type="text"
+                      placeholder="VD: 25/07 hoặc 25/07-28/07 (trống = Hàng ngày)"
+                      value={rule.dates}
+                      onChange={e => updateCustomRule(rule.id || idx, 'dates', e.target.value)}
+                      style={{ fontSize: '0.85rem' }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Các Ca học trong ngày</label>
+                    <input
+                      type="text"
+                      placeholder="VD: 07:00-11:30, 14:00-23:00"
+                      value={rule.shifts}
+                      onChange={e => updateCustomRule(rule.id || idx, 'shifts', e.target.value)}
+                      style={{ fontSize: '0.85rem' }}
+                    />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="form-group">
+            <label>Khung giờ học chung trong ngày (tùy chọn đơn giản)</label>
             <input
               type="text"
               placeholder="VD: 07:00-11:30, 13:00-22:00"
