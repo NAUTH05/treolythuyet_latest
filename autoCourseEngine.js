@@ -609,9 +609,21 @@ class AutoCourseSession extends EventEmitter {
                   this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer (lần thử ${retry}/${maxDomRetries}): ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
                   break;
                 } else if (domTimer.hours === 0 && domTimer.minutes === 0 && domTimer.seconds === 0) {
-                  lessonMinutes = 0;
-                  this.log(`🎉 Bộ đếm DOM Timer trả về 0h 0m 0s (lần thử ${retry}/${maxDomRetries}) — Bài học đã hoàn thành trước đó ➔ Bỏ qua / Hoàn thành ngay!`, 'success');
-                  break;
+                  const isTrulyCompleted = await this.page.evaluate(() => {
+                    const badge = document.querySelector('.badge, [class*="badge"]');
+                    if (badge && badge.textContent.includes('100')) return true;
+                    const checkIcon = document.querySelector('.fa-check-circle, .fa-check, [class*="completed"]');
+                    if (checkIcon) return true;
+                    return false;
+                  });
+
+                  if (isTrulyCompleted) {
+                    lessonMinutes = 0;
+                    this.log(`🎉 Giao diện web xác nhận bài học đã hoàn thành 100% ➔ Bỏ qua bài này!`, 'success');
+                    break;
+                  } else {
+                    this.log(`⚠️ DOM Timer tạm trả về 0h 0m 0s nhưng bài chưa đạt 100% trên web (lần thử ${retry}/${maxDomRetries}) ➔ Tiếp tục tải lại...`, 'warn');
+                  }
                 }
               }
 
@@ -722,18 +734,15 @@ class AutoCourseSession extends EventEmitter {
                 if (reentered) this.log(`✅ Đã vào lại bài học sau khi F5 bị redirect`, 'success');
               }
 
-              // Heartbeat Check: Đọc lại bộ đếm web sau F5 xem bài học có hoàn thành sớm hoặc hết giờ không
+              // Heartbeat Check: Đọc lại bộ đếm web sau F5 nếu tìm thấy thời gian đếm ngược hợp lệ (>0 phút)
               if (!this._stopped && this._isOnUrl(lesson.url)) {
                 const checkTimer = await readDomTimer(this.page);
-                if (checkTimer && checkTimer.hours === 0 && checkTimer.minutes === 0 && checkTimer.seconds === 0) {
-                  this.log('🎉 Bộ đếm DOM Timer trên web đã về 0h 0m 0s (Đã đạt 100% / Hoàn thành bài trên web) ➔ Hoàn thành bài học sớm!', 'success');
-                  break;
-                } else if (checkTimer && checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
+                if (checkTimer && checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
                   const remainingWebMs = checkTimer.totalMinutes * 60 * 1000;
                   if (lessonMinutes === 240 || remainingWebMs < (durationMs - elapsedMs)) {
-                    lessonMinutes = checkTimer.totalMinutes;
+                    lessonMinutes = Math.round((elapsedMs + remainingWebMs) / 60000);
                     durationMs = elapsedMs + remainingWebMs;
-                    this.log(`⏱️ Thời gian đếm ngược trên web đã cập nhật còn ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút) ➔ Tự động cập nhật rút ngắn thời gian treo!`, 'info');
+                    this.log(`⏱️ Thời gian đếm ngược trên web cập nhật còn lại: ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút)`, 'info');
                   }
                 }
               }
