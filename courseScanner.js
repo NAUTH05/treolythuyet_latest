@@ -305,10 +305,7 @@ async function readDomTimer(page) {
         const safeH = isNaN(h) ? 0 : Math.max(0, parseInt(h, 10) || 0);
         const safeM = isNaN(m) ? 0 : Math.max(0, parseInt(m, 10) || 0);
         const safeS = isNaN(s) ? 0 : Math.max(0, parseInt(s, 10) || 0);
-        if (safeH > 0 || safeM > 0 || safeS > 0) {
-          return { hours: safeH, minutes: safeM, seconds: safeS, totalMinutes: safeH * 60 + safeM + (safeS > 0 ? 1 : 0), source };
-        }
-        return null;
+        return { hours: safeH, minutes: safeM, seconds: safeS, totalMinutes: safeH * 60 + safeM + (safeS > 0 ? 1 : 0), source };
       };
 
       // 1. Gọi trực tiếp Odoo RPC Route /slide/countdown-start/ từ trong trang
@@ -323,15 +320,19 @@ async function readDomTimer(page) {
           });
           const json = await response.json();
           const payload = json.result || json;
-          if (payload && payload.end_time) {
+          if (payload && payload.end_time !== undefined && payload.end_time !== null) {
             const endTimeSec = parseInt(payload.end_time, 10);
-            const nowSec = Math.floor(Date.now() / 1000);
-            const remainingSec = endTimeSec - nowSec;
-            if (remainingSec > 0) {
-              const h = Math.floor(remainingSec / 3600);
-              const m = Math.floor((remainingSec % 3600) / 60);
-              const s = remainingSec % 60;
-              return makeTimer(h, m, s, 'odoo_rpc_fetch');
+            if (!isNaN(endTimeSec)) {
+              const nowSec = Math.floor(Date.now() / 1000);
+              const remainingSec = endTimeSec - nowSec;
+              if (remainingSec > 0) {
+                const h = Math.floor(remainingSec / 3600);
+                const m = Math.floor((remainingSec % 3600) / 60);
+                const s = remainingSec % 60;
+                return makeTimer(h, m, s, 'odoo_rpc_fetch');
+              } else {
+                return makeTimer(0, 0, 0, 'odoo_rpc_fetch');
+              }
             }
           }
         }
@@ -339,7 +340,7 @@ async function readDomTimer(page) {
 
       // 2. Đọc thuộc tính endTime trực tiếp từ Odoo PublicWidget instance trên DOM
       try {
-        const ectEl = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"]');
+        const ectEl = document.querySelector('.ect_countdown, section[data-snippet="ect_countdown"], [class*="countdown"]');
         if (ectEl && window.jQuery) {
           const widget = window.jQuery(ectEl).data('publicWidget') || window.jQuery(ectEl).data('ect_employees.ect_countdown');
           if (widget) {
@@ -362,26 +363,38 @@ async function readDomTimer(page) {
                 const m = Math.floor((remainingSec % 3600) / 60);
                 const s = remainingSec % 60;
                 return makeTimer(h, m, s, 'odoo_widget_endtime');
+              } else {
+                return makeTimer(0, 0, 0, 'odoo_widget_endtime');
               }
             }
           }
         }
       } catch { /* ignore */ }
 
-      // 3. Quét duy nhất trong khung chứa bộ đếm .ect_countdown_canvas_wrapper
-      const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"]');
+      // 3. Quét duy nhất trong khung chứa bộ đếm .ect_countdown_canvas_wrapper hoặc các thẻ chứa timer
+      const ectSection = document.querySelector('.ect_countdown_canvas_wrapper, .ect_countdown, section[data-snippet="ect_countdown"], [class*="countdown"], .o_wslides_lesson_content');
       if (ectSection) {
         const text = ectSection.innerText || ectSection.textContent || '';
+
+        // Match HH:MM:SS or MM:SS
+        const timeMatch = text.match(/\b(?:(\d{1,2}):)?(\d{1,2}):(\d{2})\b/);
+        if (timeMatch) {
+          const h = timeMatch[1] ? parseInt(timeMatch[1], 10) : 0;
+          const m = parseInt(timeMatch[2], 10);
+          const s = parseInt(timeMatch[3], 10);
+          return makeTimer(h, m, s, 'ect_section_hhmmss');
+        }
+
         const hMatch = text.match(/(\d+)[\s\n\r]*(?:Giờ|h)/i);
         const mMatch = text.match(/(\d+)[\s\n\r]*(?:Phút|m)/i);
         const sMatch = text.match(/(\d+)[\s\n\r]*(?:Giây|s)/i);
 
-        const h = hMatch ? parseInt(hMatch[1], 10) : 0;
-        const m = mMatch ? parseInt(mMatch[1], 10) : 0;
-        const s = sMatch ? parseInt(sMatch[1], 10) : 0;
-
-        const res = makeTimer(h, m, s, 'ect_section_text');
-        if (res) return res;
+        if (hMatch || mMatch || sMatch) {
+          const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+          const m = mMatch ? parseInt(mMatch[1], 10) : 0;
+          const s = sMatch ? parseInt(sMatch[1], 10) : 0;
+          return makeTimer(h, m, s, 'ect_section_text');
+        }
       }
 
       return null;

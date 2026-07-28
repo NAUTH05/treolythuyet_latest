@@ -564,14 +564,59 @@ class AutoCourseSession extends EventEmitter {
             lessonMinutes = Math.ceil(apiTimerSec / 60);
             this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/: ${h}h ${m}m ${s}s (${lessonMinutes} phút cần treo)`, 'success');
           } else {
-            const domTimer = await readDomTimer(this.page);
-            if (domTimer && domTimer.totalMinutes > 0 && !isNaN(domTimer.totalMinutes)) {
-              lessonMinutes = domTimer.totalMinutes;
-              this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer: ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
-            } else if (domTimer && (domTimer.hours === 0 && domTimer.minutes === 0 && domTimer.seconds === 0)) {
-              this.log(`⚠️ Bộ đếm DOM Timer trả về 0h 0m 0s — Bài có thể đã hoàn thành hoặc hết thời gian cho phép trong ngày`, 'warn');
-            } else {
-              this.log(`ℹ️ Không đọc được DOM Timer hợp lệ, sử dụng thời gian mặc định 240 phút`, 'info');
+            // Thử đọc DOM Timer với cơ chế RETRY (tối đa 5 lần)
+            let domTimer = null;
+            const maxDomRetries = 5;
+            for (let retry = 1; retry <= maxDomRetries; retry++) {
+              if (this._stopped) break;
+
+              // Kiểm tra nếu apiTimerSec được ghi nhận bất đồng bộ từ network response handler
+              if (apiTimerSec && !isNaN(apiTimerSec) && apiTimerSec > 0) {
+                const h = Math.floor(apiTimerSec / 3600);
+                const m = Math.floor((apiTimerSec % 3600) / 60);
+                const s = apiTimerSec % 60;
+                lessonMinutes = Math.ceil(apiTimerSec / 60);
+                this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/ (lần thử ${retry}): ${h}h ${m}m ${s}s (${lessonMinutes} phút cần treo)`, 'success');
+                domTimer = { hours: h, minutes: m, seconds: s, totalMinutes: lessonMinutes, source: 'api' };
+                break;
+              }
+
+              domTimer = await readDomTimer(this.page);
+              if (domTimer) {
+                if (domTimer.totalMinutes > 0 && !isNaN(domTimer.totalMinutes)) {
+                  lessonMinutes = domTimer.totalMinutes;
+                  this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer (lần thử ${retry}/${maxDomRetries}): ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
+                  break;
+                } else if (domTimer.hours === 0 && domTimer.minutes === 0 && domTimer.seconds === 0) {
+                  lessonMinutes = 0;
+                  this.log(`🎉 Bộ đếm DOM Timer trả về 0h 0m 0s (lần thử ${retry}/${maxDomRetries}) — Bài học đã hoàn thành trước đó ➔ Bỏ qua / Hoàn thành ngay!`, 'success');
+                  break;
+                }
+              }
+
+              if (retry < maxDomRetries) {
+                this.log(`🔄 Chưa đọc được DOM Timer (Lần ${retry}/${maxDomRetries}) — Đang thử lại...`, 'warn');
+                this.emit('status', this.getStatus());
+
+                // Nếu thử 2 lần chưa được, F5 lại trang để khôi phục JS script/widget của Odoo
+                if (retry === 2) {
+                  this.log(`🔄 Thử F5 làm mới trang để nạp lại bộ đếm DOM Timer...`, 'info');
+                  try {
+                    await this.page.reload({ waitUntil: 'load', timeout: 60000 });
+                    await this._fakeVisibilityAPI();
+                    await this.page.waitForTimeout(3000);
+                  } catch (rErr) {
+                    this.log(`⚠️ F5 khi retry DOM timer bị lỗi: ${String(rErr.message).split('\n')[0]}`, 'warn');
+                  }
+                } else {
+                  await this.page.waitForTimeout(4000);
+                }
+              }
+            }
+
+            if (!domTimer || (domTimer.totalMinutes === undefined && lessonMinutes === 240)) {
+              this.log(`ℹ️ Không đọc được DOM Timer sau ${maxDomRetries} lần thử, sử dụng thời gian mặc định ${this.options.time || 240} phút (sẽ tự động đọc lại ở các chu kỳ F5)`, 'info');
+              lessonMinutes = parseInt(this.options.time, 10) || 240;
             }
           }
 
@@ -580,7 +625,7 @@ class AutoCourseSession extends EventEmitter {
           this.status = 'studying';
           this.emit('status', this.getStatus());
 
-          const durationMs = lessonMinutes * 60 * 1000;
+          let durationMs = lessonMinutes * 60 * 1000;
           let elapsedMs = 0;
 
           while (elapsedMs < durationMs && !this._stopped) {
@@ -664,9 +709,10 @@ class AutoCourseSession extends EventEmitter {
                   break;
                 } else if (checkTimer && checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
                   const remainingWebMs = checkTimer.totalMinutes * 60 * 1000;
-                  if (remainingWebMs < (durationMs - elapsedMs)) {
-                    this.log(`⏱️ Thời gian đếm ngược trên web đã giảm còn ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút) ➔ Tự động cập nhật rút ngắn thời gian treo!`, 'info');
+                  if (lessonMinutes === 240 || remainingWebMs < (durationMs - elapsedMs)) {
+                    lessonMinutes = checkTimer.totalMinutes;
                     durationMs = elapsedMs + remainingWebMs;
+                    this.log(`⏱️ Thời gian đếm ngược trên web đã cập nhật còn ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút) ➔ Tự động cập nhật rút ngắn thời gian treo!`, 'info');
                   }
                 }
               }
