@@ -298,7 +298,7 @@ async function scanCourseDetails(page, courseUrl) {
 async function readDomTimer(page) {
   if (!page) return null;
   try {
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(7000); // Chờ 7 giây cho Odoo JS & API /slide/countdown-start/ render xong hoàn toàn
 
     const timer = await page.evaluate(async () => {
       const makeTimer = (h, m, s, source) => {

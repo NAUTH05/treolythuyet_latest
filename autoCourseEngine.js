@@ -723,7 +723,7 @@ class AutoCourseSession extends EventEmitter {
               try {
                 await this.page.reload({ waitUntil: 'load', timeout: 60000 });
                 await this._fakeVisibilityAPI();
-                await this.page.waitForTimeout(2000);
+                await this.page.waitForTimeout(7000); // Chờ 7s cho Odoo JS render & chốt checkpoint lên server
               } catch (err) {
                 if (!this._isNetworkError(err)) throw err;
                 this.log(`⚠️ F5 lỗi mạng: ${String(err.message).split('\n')[0]} → sẽ thử lại ở chu kỳ sau`, 'warn');
