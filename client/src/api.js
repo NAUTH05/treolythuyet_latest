@@ -56,6 +56,7 @@ export const startAutoScan = (payload) => apiSend('/api/auto-scan/start', 'POST'
 export const stopAutoScan = (id) => apiSend(`/api/auto-scan/stop/${id}`, 'POST');
 export const pauseAutoScan = (id) => apiSend(`/api/auto-scan/pause/${id}`, 'POST');
 export const resumeAutoScan = (id) => apiSend(`/api/auto-scan/resume/${id}`, 'POST');
+export const setAutoScanDailyMinutes = (id, minutes) => apiSend(`/api/auto-scan/set-daily-minutes/${id}`, 'POST', { minutes });
 export const removeAutoScan = (id) => apiSend(`/api/auto-scan/sessions/${id}`, 'DELETE');
 export const clearCompletedAutoScans = () => apiSend('/api/auto-scan/clear-completed', 'POST');
 export const fetchAutoPresets = () => apiGet('/api/auto-presets');

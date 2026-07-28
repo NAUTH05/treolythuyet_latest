@@ -1580,6 +1580,9 @@ function restartAutoScanSession(sessionId) {
     stealthInterval: old.options.stealthInterval || 30,
     timeWindows: old.options.timeWindows || [],
     customTimeRules: old.options.customTimeRules || [],
+    initialDailyMinutesToggle: old.options.initialDailyMinutesToggle === true,
+    initialDailyMinutes: old.options.initialDailyMinutes || 0,
+    initialDailyDate: old.options.initialDailyDate || null,
   }, {
     createdAt: old.createdAt,
     dailyStudiedMinutes: old.dailyStudiedMinutes,
@@ -1639,6 +1642,9 @@ async function loadAndRestoreAutoScans() {
       stealthInterval: (saved.options && saved.options.stealthInterval) || 30,
       timeWindows: (saved.options && saved.options.timeWindows) || [],
       customTimeRules: (saved.options && saved.options.customTimeRules) || [],
+      initialDailyMinutesToggle: !!(saved.options && saved.options.initialDailyMinutesToggle),
+      initialDailyMinutes: (saved.options && saved.options.initialDailyMinutes) || 0,
+      initialDailyDate: (saved.options && saved.options.initialDailyDate) || null,
     };
     const s = createAutoScanSession(saved.id, saved.account, saved.coursesConfig || [], options, {
       createdAt: saved.createdAt,
@@ -1747,7 +1753,7 @@ function startAutoScanWhenFree(autoSession) {
 }
 
 app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
-  const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices } = req.body;
+  const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices, initialDailyMinutesToggle, initialDailyMinutes } = req.body;
   if (!courses || !Array.isArray(courses) || courses.length === 0) {
     return res.status(400).json({ error: 'Cần nhập ít nhất 1 khóa học' });
   }
@@ -1770,6 +1776,8 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
     : [];
 
   const started = [];
+  const vnTodayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
+
   for (const acc of targetAccounts) {
     const sessionId = `autoscan_${acc.name}_${Date.now()}`;
     const autoSession = createAutoScanSession(sessionId, acc, courses, {
@@ -1782,6 +1790,9 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
       stealthInterval: parseInt(stealthInterval, 10) || 30,
       timeWindows: validTimeWindows,
       customTimeRules: validCustomRules,
+      initialDailyMinutesToggle: initialDailyMinutesToggle === true,
+      initialDailyMinutes: parseInt(initialDailyMinutes, 10) || 0,
+      initialDailyDate: vnTodayStr,
     });
 
     startAutoScanWhenFree(autoSession);
@@ -1790,6 +1801,17 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
 
   saveAutoScanState();
   res.json({ ok: true, started });
+});
+
+// Điều chỉnh thời gian đã học hôm nay cho phiên Auto-Scan
+app.post('/lythuyet/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
+  const autoSession = autoScanSessions.get(req.params.id);
+  if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
+
+  const { minutes } = req.body;
+  const newMins = autoSession.setDailyStudiedMinutes(minutes);
+  saveAutoScanState();
+  res.json({ ok: true, dailyStudiedMinutes: newMins });
 });
 
 // Tạm dừng 1 phiên Auto-Scan

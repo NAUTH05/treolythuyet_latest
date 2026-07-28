@@ -21,6 +21,9 @@ class AutoCourseSession extends EventEmitter {
       stealth: false, // Bật/tắt anti-detection + giả lập thao tác người dùng (mặc định TẮT cho AutoCourse)
       stealthInterval: 30, // Giây giữa các hành động stealth giả lập (giống Queue thủ công)
       timeWindows: [], // [{start:'HH:MM', end:'HH:MM'}] — giới hạn khung giờ học (rỗng = không giới hạn)
+      initialDailyMinutesToggle: false, // Bật/tắt đặt trước thời gian đã học hôm nay (chỉ 1 ngày)
+      initialDailyMinutes: 0, // Số phút đặt trước
+      initialDailyDate: null, // Ngày áp dụng (YYYY-MM-DD VN)
       ...options,
     };
 
@@ -31,8 +34,17 @@ class AutoCourseSession extends EventEmitter {
     this.page = null;
     this.currentCourseIndex = 0;
     this.currentLessonIndex = 0;
-    this.dailyStudiedMinutes = 0;
     this.dailyDate = this._vnDateStr(); // Ngày VN của bộ đếm giờ học trong ngày
+    this.dailyStudiedMinutes = 0;
+
+    // Gán thời gian đã học khởi tạo nếu bật Toggle và ngày áp dụng khớp với hôm nay (giờ VN)
+    if (this.options.initialDailyMinutesToggle) {
+      const targetDate = this.options.initialDailyDate || this.dailyDate;
+      if (targetDate === this.dailyDate) {
+        this.dailyStudiedMinutes = Math.max(0, parseInt(this.options.initialDailyMinutes, 10) || 0);
+      }
+    }
+
     this.courseProgress = {}; // courseUrl -> { studiedMinutes, targetMinutes, completed }
     this._stopped = false;
     this._stealthTimer = null;
@@ -178,6 +190,15 @@ class AutoCourseSession extends EventEmitter {
     this.log(`▶️ Tiếp tục phiên Auto-Scan cho ${this.account.name}`, 'info');
     this.emit('status', this.getStatus());
     return true;
+  }
+
+  // Cập nhật lại số phút đã học hôm nay (điều chỉnh thủ công trên Dashboard)
+  setDailyStudiedMinutes(minutes) {
+    const m = Math.max(0, parseInt(minutes, 10) || 0);
+    this.dailyStudiedMinutes = m;
+    this.log(`✏️ Đã cập nhật lại thời gian đã học hôm nay thành ${this._formatMinutes(m)}`, 'info');
+    this.emit('status', this.getStatus());
+    return m;
   }
 
   // Lỗi mạng tạm thời → được phép tự thử lại (giống Queue thủ công)
