@@ -4,6 +4,13 @@ client/dist/
 logs/
 accounts.json
 queue-state.json
+autoscan-state.json
+autoscan-presets.json
+daily-logs.json
+presets.json
+admin-config.json
+firebase-config.json
 .env
 .DS_Store
+.claude/
 treohoclythuyet_correctUI/

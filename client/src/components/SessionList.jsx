@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import * as api from '../api';
 
 const BADGE_CLASS = {
@@ -23,12 +23,12 @@ function SessionCard({ session, toast }) {
 
   const handleStop = async () => {
     await api.stopSession(session.id);
-    toast('⏹ Đã gửi lệnh dừng', 'info');
+    toast('Đã gửi lệnh dừng phiên', 'info');
   };
 
   const handleRefresh = async () => {
     await api.refreshSession(session.id);
-    toast('🔄 Đã gửi lệnh F5', 'info');
+    toast('Đã gửi lệnh F5', 'info');
   };
 
   return (
@@ -37,19 +37,19 @@ function SessionCard({ session, toast }) {
 
       <div className="session-header">
         <span className="session-name">{session.account}</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div className="session-actions">
           <span className={`session-badge ${badgeClass}`}>{statusText}</span>
           {session.status === 'running' && (
-            <button className="btn btn-sm" style={{ background: 'var(--primary)', color: '#fff' }} onClick={handleRefresh}>🔄 F5</button>
+            <button className="btn btn-sm btn-outline" onClick={handleRefresh}>F5</button>
           )}
           {(session.status === 'running' || session.status === 'logging-in') && (
-            <button className="btn btn-sm btn-danger" onClick={handleStop}>⏹</button>
+            <button className="btn btn-sm btn-danger" onClick={handleStop}>Dừng</button>
           )}
         </div>
       </div>
 
-      <div className="progress-bar">
-        <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
+      <div className="progress-track">
+        <div className="progress-fill" style={{ width: `${progress}%` }} />
       </div>
 
       <div className="session-stats">
@@ -72,138 +72,77 @@ function SessionCard({ session, toast }) {
       </div>
 
       {session.error && (
-        <div style={{ color: 'var(--danger)', fontSize: 13 }}>❌ {session.error}</div>
+        <div className="session-error">{session.error}</div>
       )}
-      <div style={{ fontSize: 11, color: 'var(--text2)', wordBreak: 'break-all' }}>
-        🔗 Bài {(session.currentLessonIndex || 0) + 1}/{session.totalLessons || 1}: {session.currentUrl || ''}
+      <div className="session-meta">
+        Bài {(session.currentLessonIndex || 0) + 1}/{session.totalLessons || 1}: {session.currentUrl || ''}
       </div>
     </div>
   );
 }
 
 const QUEUE_STATUS = {
-  running: { text: 'Đang chạy', color: '#4fc3f7', badge: 'badge-running' },
-  waiting: { text: 'Đang chờ', color: '#f0ad4e', badge: 'badge-logging-in' },
-  completed: { text: 'Hoàn thành', color: '#66bb6a', badge: 'badge-completed' },
-  cancelled: { text: 'Đã hủy', color: '#999', badge: 'badge-idle' },
-  error: { text: 'Lỗi', color: '#e74c3c', badge: 'badge-error' },
+  running: { text: 'Đang chạy', cls: 'q-running', badge: 'badge-running' },
+  waiting: { text: 'Đang chờ', cls: 'q-waiting', badge: 'badge-logging-in' },
+  completed: { text: 'Hoàn thành', cls: 'q-completed', badge: 'badge-completed' },
+  cancelled: { text: 'Đã hủy', cls: 'q-cancelled', badge: 'badge-idle' },
+  error: { text: 'Lỗi', cls: 'q-error', badge: 'badge-error' },
 };
 
-function formatCompletedAt(isoStr, status) {
-  if (!isoStr) return null;
-  const d = new Date(isoStr);
-  const timeStr = d.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', second: '2-digit', day: '2-digit', month: '2-digit', year: 'numeric' });
-  if (status === 'completed') return { icon: '✅', label: 'Hoàn thành lúc', time: timeStr, color: '#66bb6a' };
-  if (status === 'cancelled') return { icon: '✕', label: 'Đã hủy lúc', time: timeStr, color: '#999' };
-  if (status === 'error') return { icon: '❌', label: 'Lỗi lúc', time: timeStr, color: '#e74c3c' };
-  return null;
-}
-
-function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
+function QueueCard({ queue, onCancel, onDelete, onRush, onAddPairs }) {
   const info = QUEUE_STATUS[queue.status] || QUEUE_STATUS.running;
-  const isActive = queue.status === 'running' || queue.status === 'waiting';
-  const [expanded, setExpanded] = useState(false);
+  const isEnded = queue.status === 'completed' || queue.status === 'cancelled' || queue.status === 'error';
 
-  const comp = !isActive ? formatCompletedAt(queue.completedAt, queue.status) : null;
-
-  // ── COMPACT ROW (done queues) ──────────────────────────────
-  if (!isActive) {
-    const pairLabel = `${queue.totalPairs} box`;
-    return (
-      <div style={{
-        border: `1px solid ${info.color}22`,
-        borderRadius: 8,
-        marginBottom: 4,
-        background: `${info.color}06`,
-        overflow: 'hidden',
-      }}>
-        {/* Header row */}
-        <div
-          style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 12px', cursor: 'pointer' }}
-          onClick={() => setExpanded(e => !e)}
-        >
-          <span style={{ fontSize: 13, fontWeight: 600, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {queue.account}
-          </span>
-          <span className={`session-badge ${info.badge}`} style={{ fontSize: 11, padding: '1px 7px', flexShrink: 0 }}>{info.text}</span>
-          <span style={{ fontSize: 11, color: 'var(--text2)', flexShrink: 0 }}>{pairLabel}</span>
-          {comp && (
-            <span style={{ fontSize: 11, color: comp.color, flexShrink: 0 }}>{comp.time}</span>
-          )}
-          <span style={{ fontSize: 12, color: 'var(--text2)', flexShrink: 0 }}>{expanded ? '▲' : '▼'}</span>
-        </div>
-
-        {/* Expandable detail */}
-        {expanded && (
-          <div style={{ borderTop: `1px solid ${info.color}22`, padding: '8px 12px', fontSize: 12, color: 'var(--text2)' }}>
-            {queue.pairs.map((pair, i) => {
-              const isDone = i < queue.currentPairIndex || queue.status === 'completed';
-              const isCancelled = queue.status === 'cancelled' || queue.status === 'error';
-              const icon = isDone && !isCancelled ? '✅' : isCancelled ? '—' : '✅';
-              const name1 = (pair.urls ? pair.urls[0]?.url : pair.url1 || '')?.split('/').pop() || '?';
-              const url2 = pair.urls ? pair.urls[1]?.url : pair.url2;
-              const name2 = url2?.split('/').pop();
-              return (
-                <div key={i} style={{ padding: '2px 0' }}>
-                  {icon} Box {i + 1}: {name1}{name2 ? ` + ${name2}` : ''}
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  // ── FULL CARD (active queues) ──────────────────────────────
   return (
-    <div style={{
-      border: `1px solid ${info.color}33`,
-      borderRadius: 10,
-      padding: 14,
-      marginBottom: 10,
-      background: `${info.color}08`,
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <span style={{ fontWeight: 700, fontSize: 15 }}>📋 {queue.account}</span>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+    <div className={`queue-card ${info.cls}`}>
+      <div className="queue-card-header">
+        <span className="queue-card-name">{queue.account}</span>
+        <div className="session-actions">
           <span className={`session-badge ${info.badge}`}>{info.text}</span>
           {queue.status === 'waiting' && (
-            <button className="btn btn-sm" style={{ background: '#f0ad4e', color: '#000', fontWeight: 600 }} onClick={() => onRush(queue.id)}>⚡ Đôn</button>
+            <button className="btn btn-sm btn-warning" onClick={() => onRush(queue.id)}>Đôn lên chạy ngay</button>
           )}
-          <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>➕ Thêm</button>
-          <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>✕ Hủy</button>
+          {!isEnded && (
+            <>
+              <button className="btn btn-sm btn-outline" onClick={() => onAddPairs(queue.id)}>+ Thêm</button>
+              <button className="btn btn-sm btn-danger" onClick={() => onCancel(queue.id)}>Hủy</button>
+            </>
+          )}
+          {isEnded && (
+            <button className="btn btn-sm btn-ghost" onClick={() => onDelete(queue.id)} title="Xóa thẻ hàng chờ này">Xóa</button>
+          )}
         </div>
       </div>
 
-      <div style={{ fontSize: 13, marginBottom: 8, color: 'var(--text2)' }}>
-        Box <strong style={{ color: 'var(--text)' }}>{queue.currentPairIndex + 1}</strong> / {queue.totalPairs}
+      <div className="queue-card-meta">
+        Box <strong>{queue.currentPairIndex + 1}</strong> / {queue.totalPairs}
         {(queue.randomStartMin != null && queue.randomStartMax != null && queue.randomStartMax > queue.randomStartMin) && (
-          <span style={{ marginLeft: 8, fontSize: 11, color: '#a78bfa' }}>🎲 +{queue.randomStartMin}–{queue.randomStartMax}m</span>
+          <span className="queue-tag">Random +{queue.randomStartMin}–{queue.randomStartMax}m</span>
         )}
       </div>
 
-      <div style={{ fontSize: 12, color: 'var(--text2)', borderLeft: '2px solid var(--border)', paddingLeft: 10 }}>
+      <div className="queue-steps">
         {queue.pairs.map((pair, i) => {
           const isCurrent = i === queue.currentPairIndex;
           const isDone = i < queue.currentPairIndex;
-          const icon = isDone ? '✅' : isCurrent ? '▶️' : '⏳';
+          const stateClass = isDone ? 'done' : isCurrent ? 'current' : '';
+          const glyph = isDone ? '✓' : isCurrent ? '▸' : '·';
           const name1 = (pair.urls ? pair.urls[0]?.url : pair.url1 || '')?.split('/').pop() || '?';
           const url2 = pair.urls ? pair.urls[1]?.url : pair.url2;
           const name2 = url2?.split('/').pop();
           return (
-            <div key={i} style={{ padding: '3px 0', color: isCurrent ? 'var(--primary)' : isDone ? '#66bb6a' : 'var(--text2)', fontWeight: isCurrent ? 600 : 400 }}>
-              {icon} Box {i + 1}: {name1}{name2 ? ` + ${name2}` : ''}
+            <div key={i} className={`queue-step ${stateClass}`}>
+              <span className="step-glyph">{glyph}</span>
+              <span>Box {i + 1}: {name1} {name2 ? `+ ${name2}` : ''}</span>
+              {pair.scheduledDateTime && (
+                <span className="step-schedule">
+                  Hẹn {new Date(pair.scheduledDateTime).toLocaleString('vi-VN', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}
+                </span>
+              )}
             </div>
           );
         })}
       </div>
-
-      {queue.nextRunTime && (
-        <div style={{ marginTop: 8, padding: '6px 10px', background: `${info.color}18`, borderRadius: 6, fontSize: 12 }}>
-          ⏰ Chạy lúc: <strong>{new Date(queue.nextRunTime).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}</strong>
-        </div>
-      )}
     </div>
   );
 }
@@ -211,48 +150,49 @@ function QueueCard({ queue, onCancel, onRush, onAddPairs }) {
 function AddPairsModal({ queueId, onClose, onSubmit }) {
   const [pairs, setPairs] = useState([{ url1: '', url2: '' }]);
 
-  const updatePair = (i, field, val) =>
-    setPairs(prev => { const n = [...prev]; n[i] = { ...n[i], [field]: val }; return n; });
+  const updatePair = (i, field, val) => {
+    setPairs(prev => {
+      const next = [...prev];
+      next[i] = { ...next[i], [field]: val };
+      return next;
+    });
+  };
 
   const addPair = () => setPairs(prev => [...prev, { url1: '', url2: '' }]);
-  const removePair = (i) => pairs.length > 1 && setPairs(prev => prev.filter((_, j) => j !== i));
+  const removePair = (i) => setPairs(prev => prev.filter((_, idx) => idx !== i));
 
   const handleSubmit = () => {
-    const valid = pairs.filter(p => p.url1?.trim());
-    if (!valid.length) return;
+    const valid = pairs.filter(p => p.url1?.trim()).map(p => ({
+      urls: [{ url: p.url1.trim() }, ...(p.url2?.trim() ? [{ url: p.url2.trim() }] : [])]
+    }));
+    if (valid.length === 0) return;
     onSubmit(queueId, valid);
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ maxWidth: 480, width: '90vw' }} onClick={e => e.stopPropagation()}>
-        <h3 style={{ marginBottom: 6 }}>➕ Thêm cặp bài học</h3>
-        <p style={{ color: 'var(--text2)', fontSize: 13, marginBottom: 16 }}>
-          Cặp mới sẽ được xếp vào cuối hàng chờ của tài khoản này
-        </p>
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={{ maxWidth: 500 }}>
+        <div className="modal-title">Thêm Box bài học vào hàng chờ</div>
 
-        {pairs.map((pair, i) => (
-          <div key={i} style={{ border: '1px solid var(--border)', borderRadius: 8, padding: 10, marginBottom: 10 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ fontWeight: 600, fontSize: 13, color: 'var(--primary)' }}>Cặp {i + 1}</span>
-              {pairs.length > 1 && (
-                <button className="btn btn-sm btn-danger" style={{ padding: '2px 8px', fontSize: 11 }} onClick={() => removePair(i)}>✕</button>
-              )}
+        {pairs.map((p, i) => (
+          <div key={i} className="box-card">
+            <div className="box-card-header">
+              <span className="box-card-title">
+                <span className="box-card-index">{i + 1}</span>
+                Box {i + 1}
+              </span>
+              {pairs.length > 1 && <button className="icon-btn" onClick={() => removePair(i)} title="Xóa box này">✕</button>}
             </div>
-            <input type="url" placeholder="Link bài 1 (bắt buộc)" value={pair.url1}
-              onChange={e => updatePair(i, 'url1', e.target.value)}
-              style={{ marginBottom: 6, width: '100%', padding: '8px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 13 }} />
-            <input type="url" placeholder="Link bài 2 (tùy chọn)" value={pair.url2}
-              onChange={e => updatePair(i, 'url2', e.target.value)}
-              style={{ width: '100%', padding: '8px 10px', background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 13 }} />
+            <input type="url" placeholder="URL bài 1 *" value={p.url1} onChange={e => updatePair(i, 'url1', e.target.value)} style={{ width: '100%', marginBottom: 6 }} />
+            <input type="url" placeholder="URL bài 2 (tùy chọn)" value={p.url2} onChange={e => updatePair(i, 'url2', e.target.value)} style={{ width: '100%' }} />
           </div>
         ))}
 
-        <button className="btn btn-outline" style={{ width: '100%', marginBottom: 12 }} onClick={addPair}>➕ Thêm một cặp nữa</button>
+        <button className="btn btn-outline btn-block" style={{ marginBottom: 12 }} onClick={addPair}>+ Thêm một cặp nữa</button>
 
         <div className="btn-group">
           <button className="btn btn-primary" onClick={handleSubmit}
-            disabled={!pairs.some(p => p.url1?.trim())}>💾 Lưu vào hàng chờ</button>
+            disabled={!pairs.some(p => p.url1?.trim())}>Lưu vào hàng chờ</button>
           <button className="btn btn-outline" onClick={onClose}>Hủy</button>
         </div>
       </div>
@@ -261,22 +201,72 @@ function AddPairsModal({ queueId, onClose, onSubmit }) {
 }
 
 export default function SessionList({ sessions, queues, toast }) {
-  const sessionEntries = Object.values(sessions);
+  const sessionEntries = Object.values(sessions || {});
   const queueEntries = Object.values(queues || {});
 
-  const activeQueues = queueEntries.filter(q => q.status === 'running' || q.status === 'waiting');
-  const doneQueues = queueEntries.filter(q => q.status === 'completed' || q.status === 'cancelled' || q.status === 'error');
-
+  const [filterAccount, setFilterAccount] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
   const [addPairsId, setAddPairsId] = useState(null);
+
+  // Extract list of all account names across sessions & queues
+  const allAccounts = useMemo(() => {
+    const set = new Set();
+    sessionEntries.forEach(s => s.account && set.add(s.account));
+    queueEntries.forEach(q => q.account && set.add(q.account));
+    return [...set].sort();
+  }, [sessionEntries, queueEntries]);
+
+  // Filtered Sessions
+  const filteredSessions = useMemo(() => {
+    return sessionEntries.filter(s => {
+      if (filterAccount && s.account !== filterAccount) return false;
+      if (filterStatus) {
+        if (filterStatus === 'running' && s.status !== 'running' && s.status !== 'logging-in') return false;
+        if (filterStatus === 'completed' && s.status !== 'completed') return false;
+        if (filterStatus === 'error' && s.status !== 'error') return false;
+      }
+      return true;
+    });
+  }, [sessionEntries, filterAccount, filterStatus]);
+
+  // Filtered Queues
+  const filteredQueues = useMemo(() => {
+    return queueEntries.filter(q => {
+      if (filterAccount && q.account !== filterAccount) return false;
+      if (filterStatus) {
+        if (filterStatus === 'running' && q.status !== 'running') return false;
+        if (filterStatus === 'waiting' && q.status !== 'waiting') return false;
+        if (filterStatus === 'completed' && q.status !== 'completed') return false;
+        if (filterStatus === 'error' && q.status !== 'error' && q.status !== 'cancelled') return false;
+      }
+      return true;
+    });
+  }, [queueEntries, filterAccount, filterStatus]);
+
+  const activeQueues = filteredQueues.filter(q => q.status === 'running' || q.status === 'waiting');
+  const doneQueues = filteredQueues.filter(q => q.status === 'completed' || q.status === 'cancelled' || q.status === 'error');
 
   const handleCancelQueue = async (queueId) => {
     await api.cancelQueue(queueId);
-    toast('✕ Đã hủy hàng chờ', 'info');
+    toast('Đã hủy hàng chờ', 'info');
+  };
+
+  const handleDeleteQueue = async (queueId) => {
+    await api.deleteQueue(queueId);
+    toast('Đã xóa thẻ hàng chờ', 'info');
+  };
+
+  const handleClearCompletedQueues = async () => {
+    if (!window.confirm('Xóa tất cả hàng chờ đã hoàn thành / kết thúc / lỗi?')) return;
+    const res = await api.clearCompletedQueues();
+    if (res.ok) {
+      toast(`Đã xóa ${res.count} hàng chờ đã xong`, 'success');
+    }
   };
 
   const handleRushQueue = async (queueId) => {
     await api.rushQueue(queueId);
-    toast('⚡ Đã đôn hàng chờ - chạy ngay!', 'success');
+    toast('Đã đôn hàng chờ — chạy ngay!', 'success');
   };
 
   const handleAddPairs = (queueId) => setAddPairsId(queueId);
@@ -284,14 +274,14 @@ export default function SessionList({ sessions, queues, toast }) {
   const handleSubmitAddPairs = async (queueId, pairs) => {
     const res = await api.addPairsToQueue(queueId, pairs);
     if (res.ok) {
-      toast(`➕ Đã thêm ${pairs.length} cặp (tổng: ${res.totalPairs})`, 'success');
+      toast(`Đã thêm ${pairs.length} cặp (tổng: ${res.totalPairs})`, 'success');
       setAddPairsId(null);
     } else {
-      toast(`❌ ${res.error}`, 'error');
+      toast(res.error || 'Lỗi thêm cặp bài học', 'error');
     }
   };
 
-  const queueCardProps = { onCancel: handleCancelQueue, onRush: handleRushQueue, onAddPairs: handleAddPairs };
+  const queueCardProps = { onCancel: handleCancelQueue, onDelete: handleDeleteQueue, onRush: handleRushQueue, onAddPairs: handleAddPairs };
 
   return (
     <>
@@ -303,39 +293,99 @@ export default function SessionList({ sessions, queues, toast }) {
         />
       )}
 
-      <div className="card" style={{ gridColumn: '1/-1' }}>
-        <div className="card-header">📊 Phiên đang chạy</div>
-        <div className="card-body">
-          {sessionEntries.length === 0 ? (
-            <div className="empty">
-              <div className="empty-icon">😴</div>
-              Chưa có phiên nào đang chạy
-            </div>
-          ) : (
-            sessionEntries.map(s => <SessionCard key={s.id} session={s} toast={toast} />)
+      {/* Filter Control Bar for Queues & Sessions */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="card-body filter-bar" style={{ padding: '12px 16px' }}>
+          <span className="filter-label">Lọc theo tài khoản</span>
+          <select
+            value={filterAccount}
+            onChange={e => setFilterAccount(e.target.value)}
+            style={{ minWidth: 180 }}
+          >
+            <option value="">Tất cả tài khoản ({allAccounts.length})</option>
+            {allAccounts.map(acc => (
+              <option key={acc} value={acc}>{acc}</option>
+            ))}
+          </select>
+
+          <span className="filter-label">Trạng thái</span>
+          <select
+            value={filterStatus}
+            onChange={e => setFilterStatus(e.target.value)}
+          >
+            <option value="">Tất cả trạng thái</option>
+            <option value="running">Đang chạy</option>
+            <option value="waiting">Đang chờ</option>
+            <option value="completed">Hoàn thành</option>
+            <option value="error">Lỗi / Đã hủy</option>
+          </select>
+
+          {(filterAccount || filterStatus) && (
+            <button
+              className="btn btn-sm btn-ghost"
+              onClick={() => {
+                setFilterAccount('');
+                setFilterStatus('');
+              }}
+            >
+              Hiển thị tất cả
+            </button>
           )}
         </div>
       </div>
 
-      <div className="card" style={{ gridColumn: '1/-1' }}>
+      {/* Active Sessions */}
+      <div className="card">
         <div className="card-header">
-          📋 Hàng chờ cặp
-          {activeQueues.length > 0 && (
-            <span style={{ marginLeft: 8, background: 'var(--primary)', color: '#fff', borderRadius: 10, padding: '1px 8px', fontSize: 11 }}>{activeQueues.length}</span>
+          Phiên đang chạy
+          {filteredSessions.length > 0 && (
+            <span className="count-pill">{filteredSessions.length}</span>
           )}
         </div>
         <div className="card-body">
-          {queueEntries.length === 0 ? (
+          {filteredSessions.length === 0 ? (
             <div className="empty">
-              <div className="empty-icon">📭</div>
-              Chưa có hàng chờ
+              <div className="empty-icon">◌</div>
+              {filterAccount ? `Tài khoản ${filterAccount} chưa có phiên nào đang chạy` : 'Chưa có phiên nào đang chạy'}
+            </div>
+          ) : (
+            filteredSessions.map(s => <SessionCard key={s.id} session={s} toast={toast} />)
+          )}
+        </div>
+      </div>
+
+      {/* Queues List */}
+      <div className="card">
+        <div className="card-header" style={{ justifyContent: 'space-between' }}>
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            Hàng chờ Box bài học
+            {activeQueues.length > 0 && (
+              <span className="count-pill">{activeQueues.length}</span>
+            )}
+          </span>
+
+          {doneQueues.length > 0 && (
+            <button
+              className="btn btn-xs btn-danger"
+              onClick={handleClearCompletedQueues}
+            >
+              Xóa tất cả đã xong ({doneQueues.length})
+            </button>
+          )}
+        </div>
+
+        <div className="card-body">
+          {filteredQueues.length === 0 ? (
+            <div className="empty">
+              <div className="empty-icon">≡</div>
+              {filterAccount ? `Tài khoản ${filterAccount} chưa có hàng chờ nào` : 'Chưa có hàng chờ'}
             </div>
           ) : (
             <>
               {activeQueues.length > 0 && (
                 <div>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8, paddingBottom: 6, borderBottom: '1px solid var(--border)' }}>
-                    ⚡ Đang hoạt động ({activeQueues.length})
+                  <div className="section-label">
+                    <span>Đang hoạt động ({activeQueues.length})</span>
                   </div>
                   {activeQueues.map(q => <QueueCard key={q.id} queue={q} {...queueCardProps} />)}
                 </div>
@@ -343,8 +393,14 @@ export default function SessionList({ sessions, queues, toast }) {
 
               {doneQueues.length > 0 && (
                 <div style={{ marginTop: activeQueues.length > 0 ? 16 : 0 }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text2)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8, paddingBottom: 6, borderBottom: '1px solid var(--border)' }}>
-                    ✅ Đã hoàn thành ({doneQueues.length})
+                  <div className="section-label">
+                    <span>Đã hoàn thành / Kết thúc ({doneQueues.length})</span>
+                    <button
+                      className="btn btn-xs btn-danger"
+                      onClick={handleClearCompletedQueues}
+                    >
+                      Xóa tất cả
+                    </button>
                   </div>
                   {doneQueues.map(q => <QueueCard key={q.id} queue={q} {...queueCardProps} />)}
                 </div>

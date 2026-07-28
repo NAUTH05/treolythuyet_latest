@@ -10,6 +10,8 @@ const LEVEL_CLASS = {
 export default function LogPanel({ logs, onClear }) {
   const boxRef = useRef(null);
   const [filterAccount, setFilterAccount] = useState('');
+  const [filterLevel, setFilterLevel] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Derive unique account names from logs
   const accountList = useMemo(
@@ -17,10 +19,22 @@ export default function LogPanel({ logs, onClear }) {
     [logs]
   );
 
-  const filteredLogs = useMemo(
-    () => (filterAccount ? logs.filter(l => l.account === filterAccount) : logs),
-    [logs, filterAccount]
-  );
+  const filteredLogs = useMemo(() => {
+    return logs.filter(l => {
+      // Account filter
+      if (filterAccount && l.account !== filterAccount) return false;
+      // Level filter
+      if (filterLevel && l.level !== filterLevel) return false;
+      // Search text filter
+      if (searchQuery) {
+        const query = searchQuery.toLowerCase();
+        const msg = (l.msg || '').toLowerCase();
+        const acc = (l.account || '').toLowerCase();
+        if (!msg.includes(query) && !acc.includes(query)) return false;
+      }
+      return true;
+    });
+  }, [logs, filterAccount, filterLevel, searchQuery]);
 
   useEffect(() => {
     if (boxRef.current) {
@@ -30,35 +44,64 @@ export default function LogPanel({ logs, onClear }) {
 
   return (
     <div className="card log-container">
-      <div className="card-header">
-        📝 Log
-        <div style={{ display: 'flex', gap: 8, marginLeft: 'auto', alignItems: 'center' }}>
+      <div className="card-header" style={{ flexWrap: 'wrap' }}>
+        <span>Logs</span>
+
+        {/* Filter Controls Bar */}
+        <div className="filter-bar" style={{ marginLeft: 'auto' }}>
+          <input
+            type="text"
+            placeholder="Tìm từ khóa..."
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            style={{ width: 140 }}
+          />
+
+          <select
+            value={filterLevel}
+            onChange={e => setFilterLevel(e.target.value)}
+          >
+            <option value="">Tất cả trạng thái</option>
+            <option value="error">Lỗi (Error)</option>
+            <option value="warn">Cảnh báo (Warn)</option>
+            <option value="success">Thành công (Success)</option>
+            <option value="info">Thông tin (Info)</option>
+          </select>
+
           <select
             value={filterAccount}
             onChange={e => setFilterAccount(e.target.value)}
-            style={{
-              padding: '4px 10px',
-              background: 'var(--surface2)',
-              border: '1px solid var(--border)',
-              borderRadius: '6px',
-              color: 'var(--text)',
-              fontSize: '12px',
-              cursor: 'pointer',
-              outline: 'none',
-            }}
           >
-            <option value="">👥 Tất cả tài khoản</option>
+            <option value="">Tất cả tài khoản</option>
             {accountList.map(a => (
               <option key={a} value={a}>{a}</option>
             ))}
           </select>
-          <button className="btn btn-sm btn-outline" onClick={onClear}>Xóa</button>
+
+          {(filterAccount || filterLevel || searchQuery) && (
+            <button
+              className="btn btn-sm btn-ghost"
+              onClick={() => {
+                setFilterAccount('');
+                setFilterLevel('');
+                setSearchQuery('');
+              }}
+              title="Reset bộ lọc"
+            >
+              Reset
+            </button>
+          )}
+
+          <button className="btn btn-sm btn-outline" onClick={onClear}>Xóa log</button>
         </div>
       </div>
+
       <div className="card-body" style={{ padding: 12 }}>
         <div className="log-box" ref={boxRef}>
           {filteredLogs.length === 0 ? (
-            <div style={{ color: '#555', textAlign: 'center', padding: '20px 0' }}>Chưa có log{filterAccount ? ` cho ${filterAccount}` : ''}</div>
+            <div className="empty" style={{ padding: '20px 0' }}>
+              Chưa có log phù hợp bộ lọc
+            </div>
           ) : (
             filteredLogs.map((entry, i) => (
               <div key={i} className="log-line">
