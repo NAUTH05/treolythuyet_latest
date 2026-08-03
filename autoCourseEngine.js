@@ -762,10 +762,14 @@ class AutoCourseSession extends EventEmitter {
         }
       }
 
+      const SCHEDULED_STATUSES = new Set(['daily-limit', 'date-limit', 'time-window']);
       if (this._stopped) {
         this.status = 'stopped';
         this.emit('status', this.getStatus());
-      } else if (this.status !== 'paused') {
+      } else if (SCHEDULED_STATUSES.has(this.status) || this.status === 'paused') {
+        // Giữ nguyên trạng thái giới hạn / tạm dừng — không ghi đè thành completed!
+        this.emit('status', this.getStatus());
+      } else {
         this.status = 'completed';
         this.log(`🎉 Tất cả các khóa học đã được quét và treo xong!`, 'success');
         this.emit('status', this.getStatus());
