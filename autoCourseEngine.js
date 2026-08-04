@@ -720,14 +720,18 @@ class AutoCourseSession extends EventEmitter {
             this.emit('status', this.getStatus());
 
             if (elapsedMs < durationMs && !this._stopped) {
+              let reloadOk = false;
               try {
-                await this.page.reload({ waitUntil: 'load', timeout: 60000 });
+                await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
                 await this._fakeVisibilityAPI();
                 await this.page.waitForTimeout(7000); // Chờ 7s cho Odoo JS render & chốt checkpoint lên server
+                reloadOk = true;
               } catch (err) {
                 if (!this._isNetworkError(err)) throw err;
-                this.log(`⚠️ F5 lỗi mạng: ${String(err.message).split('\n')[0]} → sẽ thử lại ở chu kỳ sau`, 'warn');
+                this.log(`⚠️ F5 lỗi mạng: ${String(err.message).split('\n')[0]} → Đang chờ hệ thống cho phép vào lại...`, 'warn');
+                reloadOk = await this._waitUntilOnUrl(lesson.url);
               }
+
               if (!this._stopped && !this._isOnUrl(lesson.url)) {
                 this.log(`⚠️ F5 bị redirect: ${this.page.url()} → Đang chờ hệ thống cho phép vào lại...`, 'warn');
                 const reentered = await this._waitUntilOnUrl(lesson.url);
@@ -737,12 +741,51 @@ class AutoCourseSession extends EventEmitter {
               // Heartbeat Check: Đọc lại bộ đếm web sau F5 nếu tìm thấy thời gian đếm ngược hợp lệ (>0 phút)
               if (!this._stopped && this._isOnUrl(lesson.url)) {
                 const checkTimer = await readDomTimer(this.page);
-                if (checkTimer && checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
-                  const remainingWebMs = checkTimer.totalMinutes * 60 * 1000;
-                  if (lessonMinutes === 240 || remainingWebMs < (durationMs - elapsedMs)) {
-                    lessonMinutes = Math.round((elapsedMs + remainingWebMs) / 60000);
-                    durationMs = elapsedMs + remainingWebMs;
-                    this.log(`⏱️ Thời gian đếm ngược trên web cập nhật còn lại: ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút)`, 'info');
+                if (checkTimer) {
+                  if (checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
+                    const remainingWebMs = checkTimer.totalMinutes * 60 * 1000;
+                    if (lessonMinutes === 240 || Math.abs(durationMs - (elapsedMs + remainingWebMs)) > 60000) {
+                      lessonMinutes = Math.round((elapsedMs + remainingWebMs) / 60000);
+                      durationMs = elapsedMs + remainingWebMs;
+                      this.log(`⏱️ Thời gian đếm ngược trên web cập nhật còn lại: ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút)`, 'info');
+                    }
+                  } else if (checkTimer.hours === 0 && checkTimer.minutes === 0 && checkTimer.seconds === 0) {
+                    durationMs = elapsedMs; // Web báo đã xong 0s -> kết thúc treo bài ngay
+                  }
+                }
+              }
+            }
+
+            // Kiểm tra xác minh lượt cuối khi elapsedMs chuẩn bị chạm hoặc đã bằng durationMs
+            if (elapsedMs >= durationMs && !this._stopped) {
+              this.log(`🔍 Đang xác minh lại trạng thái bài học trên Web Odoo...`, 'info');
+              
+              if (this._isOnUrl(lesson.url)) {
+                try {
+                  await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                  await this._fakeVisibilityAPI();
+                  await this.page.waitForTimeout(5000);
+                } catch {
+                  await this._waitUntilOnUrl(lesson.url);
+                }
+
+                if (this._isOnUrl(lesson.url)) {
+                  const isBadgeCompleted = await this.page.evaluate(() => {
+                    const badge = document.querySelector('.badge, [class*="badge"]');
+                    if (badge && badge.textContent.includes('100')) return true;
+                    const checkIcon = document.querySelector('.fa-check-circle, .fa-check, [class*="completed"]');
+                    if (checkIcon) return true;
+                    return false;
+                  });
+
+                  if (!isBadgeCompleted) {
+                    const finalTimer = await readDomTimer(this.page);
+                    if (finalTimer && finalTimer.totalMinutes > 0 && !isNaN(finalTimer.totalMinutes)) {
+                      this.log(`⚠️ Đồng hồ local đã đếm hết nhưng Web Odoo vẫn còn ${finalTimer.hours}h ${finalTimer.minutes}m ${finalTimer.seconds}s (${finalTimer.totalMinutes} phút) ➔ Tự động gia hạn treo tiếp!`, 'warn');
+                      const extraMs = finalTimer.totalMinutes * 60 * 1000;
+                      lessonMinutes += finalTimer.totalMinutes;
+                      durationMs += extraMs;
+                    }
                   }
                 }
               }
