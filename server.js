@@ -142,15 +142,33 @@ const logHistory = [];         // Lưu 500 dòng log gần nhất
 const MAX_LOG = 500;
 
 // =================== DAILY LOGS (ngày → user) =====================
-// Lưu TOÀN BỘ logs của từng ngày, phân theo user, đẩy lên Firebase
-// collection system_logs_daily (doc: <yyyy-mm-dd>_<user>) để xem lại
-// đầy đủ không bị ngắt đoạn. Flush theo chu kỳ để không spam Firestore.
-
+// =================== DAILY LOGS (ngày DD-MM-YYYY → folder/user) =====================
 const DAILY_LOGS_FILE = path.join(__dirname, 'daily-logs.json');
+const LOGS_DAILY_DIR = path.join(__dirname, 'logs', 'daily');
 const MAX_DAILY_LOGS_PER_USER = 5000; // Giới hạn an toàn dưới 1MB/doc Firestore
+
+if (!fs.existsSync(LOGS_DAILY_DIR)) {
+  try { fs.mkdirSync(LOGS_DAILY_DIR, { recursive: true }); } catch { /* ignore */ }
+}
 
 function vnDateStr(d = new Date()) {
   return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
+}
+
+function vnDateDDMMYYYY(d = new Date()) {
+  const parts = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).split('-');
+  return `${parts[2]}-${parts[1]}-${parts[0]}`;
+}
+
+function formatToDDMMYYYY(str) {
+  if (!str) return vnDateDDMMYYYY();
+  const cleaned = String(str).trim();
+  if (/^\d{2}-\d{2}-\d{4}$/.test(cleaned)) return cleaned;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
+    const [y, m, d] = cleaned.split('-');
+    return `${d}-${m}-${y}`;
+  }
+  return cleaned;
 }
 
 function slugifyAccount(name) {
@@ -163,69 +181,135 @@ function slugifyAccount(name) {
     .replace(/^_+|_+$/g, '') || 'system';
 }
 
-let dailyLogs = { date: vnDateStr(), users: {} };
+let dailyLogs = { date: vnDateDDMMYYYY(), users: {}, allLogs: [] };
 let dailyLogsDirtyUsers = new Set();
 let latestLogsDirty = false;
 
-// Khôi phục logs trong ngày từ file local (nếu server restart giữa ngày)
-try {
-  if (fs.existsSync(DAILY_LOGS_FILE)) {
-    const saved = JSON.parse(fs.readFileSync(DAILY_LOGS_FILE, 'utf8'));
-    if (saved && saved.date === dailyLogs.date && saved.users) {
-      dailyLogs = saved;
-    }
+// Khôi phục & migrate logs trong ngày / các ngày cũ
+function initDailyLogsStore() {
+  const today = vnDateDDMMYYYY();
+  const todayDir = path.join(LOGS_DAILY_DIR, today);
+  if (!fs.existsSync(todayDir)) {
+    try { fs.mkdirSync(todayDir, { recursive: true }); } catch { /* ignore */ }
   }
-} catch { /* ignore */ }
 
-function flushDailyLogsFor(store, users) {
+  // Migrate legacy daily-logs.json if present
   try {
+    if (fs.existsSync(DAILY_LOGS_FILE)) {
+      const legacy = JSON.parse(fs.readFileSync(DAILY_LOGS_FILE, 'utf8'));
+      if (legacy && legacy.date && legacy.users) {
+        const legacyDateFormatted = formatToDDMMYYYY(legacy.date);
+        const legacyDir = path.join(LOGS_DAILY_DIR, legacyDateFormatted);
+        if (!fs.existsSync(legacyDir)) {
+          fs.mkdirSync(legacyDir, { recursive: true });
+        }
+        const legacyFile = path.join(legacyDir, 'logs.json');
+        if (!fs.existsSync(legacyFile)) {
+          let allMigrated = [];
+          for (const u of Object.keys(legacy.users)) {
+            if (Array.isArray(legacy.users[u])) {
+              allMigrated.push(...legacy.users[u]);
+            }
+          }
+          fs.writeFileSync(legacyFile, JSON.stringify(allMigrated, null, 2), 'utf8');
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[LOGS] Lỗi migrate legacy daily logs:', e.message);
+  }
+
+  // Load today's logs from logs/daily/DD-MM-YYYY/logs.json
+  const todayFile = path.join(todayDir, 'logs.json');
+  let loadedEntries = [];
+  if (fs.existsSync(todayFile)) {
+    try {
+      loadedEntries = JSON.parse(fs.readFileSync(todayFile, 'utf8'));
+    } catch { loadedEntries = []; }
+  }
+
+  const usersMap = {};
+  for (const entry of loadedEntries) {
+    const key = entry.account || 'system';
+    if (!usersMap[key]) usersMap[key] = [];
+    usersMap[key].push(entry);
+  }
+
+  dailyLogs = {
+    date: today,
+    users: usersMap,
+    allLogs: loadedEntries,
+  };
+}
+
+initDailyLogsStore();
+
+function flushDailyLogsFor(store) {
+  if (!store || !store.date) return;
+  const folderName = formatToDDMMYYYY(store.date);
+  const dirPath = path.join(LOGS_DAILY_DIR, folderName);
+  if (!fs.existsSync(dirPath)) {
+    try { fs.mkdirSync(dirPath, { recursive: true }); } catch { /* ignore */ }
+  }
+
+  const logsFilePath = path.join(dirPath, 'logs.json');
+  const entries = store.allLogs || [];
+  try {
+    fs.writeFileSync(logsFilePath, JSON.stringify(entries, null, 2), 'utf8');
     fs.writeFileSync(DAILY_LOGS_FILE, JSON.stringify(store), 'utf8');
   } catch (e) {
     console.error('[LOGS] Không thể lưu daily-logs local:', e.message);
   }
+
   const fbConfig = fbService.loadFirebaseConfig();
   if (!fbConfig || !fbConfig.projectId) return;
+  const users = store.users ? Object.keys(store.users) : [];
   for (const account of users) {
-    const entries = store.users[account];
-    if (!entries || entries.length === 0) continue;
-    const docId = `${store.date}_${slugifyAccount(account)}`;
+    const userEntries = store.users[account];
+    if (!userEntries || userEntries.length === 0) continue;
+    const docId = `${folderName}_${slugifyAccount(account)}`;
     fbService.syncToFirebaseREST('system_logs_daily', docId, {
-      date: store.date,
+      date: folderName,
       account,
-      count: entries.length,
-      logs: entries,
+      count: userEntries.length,
+      logs: userEntries,
       updatedAt: new Date().toISOString(),
     }, fbConfig);
   }
 }
 
 function recordDailyLog(entry) {
-  const today = vnDateStr();
+  const today = vnDateDDMMYYYY();
+  const entryWithDate = { ...entry, date: today };
+
   if (dailyLogs.date !== today) {
     // Sang ngày mới (giờ VN): flush nốt ngày cũ rồi mở store mới
     const oldStore = dailyLogs;
-    const oldUsers = Object.keys(oldStore.users);
-    dailyLogs = { date: today, users: {} };
+    dailyLogs = { date: today, users: {}, allLogs: [] };
     dailyLogsDirtyUsers.clear();
-    try { flushDailyLogsFor(oldStore, oldUsers); } catch { /* ignore */ }
+    try { flushDailyLogsFor(oldStore); } catch { /* ignore */ }
   }
+
   const key = entry.account || 'system';
   if (!dailyLogs.users[key]) dailyLogs.users[key] = [];
-  dailyLogs.users[key].push(entry);
+  dailyLogs.users[key].push(entryWithDate);
   if (dailyLogs.users[key].length > MAX_DAILY_LOGS_PER_USER) dailyLogs.users[key].shift();
+
+  if (!dailyLogs.allLogs) dailyLogs.allLogs = [];
+  dailyLogs.allLogs.push(entryWithDate);
+  if (dailyLogs.allLogs.length > 20000) dailyLogs.allLogs.shift();
+
   dailyLogsDirtyUsers.add(key);
 }
 
-// Flush daily logs lên Firebase mỗi 60 giây (chỉ user có log mới)
+// Flush daily logs định kỳ mỗi 60 giây
 setInterval(() => {
   if (dailyLogsDirtyUsers.size === 0) return;
-  const users = [...dailyLogsDirtyUsers];
   dailyLogsDirtyUsers.clear();
-  try { flushDailyLogsFor(dailyLogs, users); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
+  try { flushDailyLogsFor(dailyLogs); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
 }, 60 * 1000);
 
-// Sync system_logs/latest (100 dòng gần nhất) debounce 15 giây —
-// trước đây sync từng dòng gây 1 Firestore write/log, rất nặng server
+// Sync system_logs/latest (100 dòng gần nhất) debounce 15 giây
 setInterval(() => {
   if (!latestLogsDirty) return;
   latestLogsDirty = false;
@@ -2192,7 +2276,112 @@ app.put('/lythuyet/api/edit-queue/:id', (req, res) => {
   res.json({ ok: true, totalPairs: queue.pairs.length });
 });
 
-// Lấy log
+// Lấy danh sách các folder logs theo ngày (DD-MM-YYYY)
+app.get('/lythuyet/api/logs/folders', (req, res) => {
+  try {
+    const today = vnDateDDMMYYYY();
+    const folderMap = new Map();
+
+    folderMap.set(today, {
+      date: today,
+      count: dailyLogs.allLogs ? dailyLogs.allLogs.length : 0,
+      isToday: true,
+    });
+
+    if (fs.existsSync(LOGS_DAILY_DIR)) {
+      const dirs = fs.readdirSync(LOGS_DAILY_DIR, { withFileTypes: true });
+      for (const d of dirs) {
+        if (d.isDirectory()) {
+          const folderName = formatToDDMMYYYY(d.name);
+          const logsFile = path.join(LOGS_DAILY_DIR, d.name, 'logs.json');
+          let count = 0;
+          if (folderName === today && dailyLogs.allLogs) {
+            count = dailyLogs.allLogs.length;
+          } else if (fs.existsSync(logsFile)) {
+            try {
+              const fileData = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
+              count = Array.isArray(fileData) ? fileData.length : 0;
+            } catch { count = 0; }
+          }
+          folderMap.set(folderName, {
+            date: folderName,
+            count,
+            isToday: folderName === today,
+          });
+        }
+      }
+    }
+
+    const folders = Array.from(folderMap.values()).sort((a, b) => {
+      const [da, ma, ya] = a.date.split('-').map(Number);
+      const [db, mb, yb] = b.date.split('-').map(Number);
+      const ta = (ya || 0) * 10000 + (ma || 0) * 100 + (da || 0);
+      const tb = (yb || 0) * 10000 + (mb || 0) * 100 + (db || 0);
+      return tb - ta;
+    });
+
+    res.json(folders);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lấy toàn bộ logs theo ngày (date=DD-MM-YYYY hoặc YYYY-MM-DD)
+app.get('/lythuyet/api/logs/by-date', (req, res) => {
+  const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
+  const today = vnDateDDMMYYYY();
+
+  if (reqDate === today && dailyLogs.allLogs) {
+    return res.json({ date: today, logs: dailyLogs.allLogs, isToday: true });
+  }
+
+  const targetDir = path.join(LOGS_DAILY_DIR, reqDate);
+  const targetFile = path.join(targetDir, 'logs.json');
+
+  if (fs.existsSync(targetFile)) {
+    try {
+      const logs = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
+      return res.json({ date: reqDate, logs: Array.isArray(logs) ? logs : [], isToday: false });
+    } catch (e) {
+      return res.status(500).json({ error: 'Lỗi đọc file log: ' + e.message });
+    }
+  }
+
+  res.json({ date: reqDate, logs: [], isToday: reqDate === today });
+});
+
+// Xóa folder / xóa logs của một ngày
+app.delete('/lythuyet/api/logs/by-date', (req, res) => {
+  const reqDate = formatToDDMMYYYY(req.query.date);
+  if (!reqDate) return res.status(400).json({ error: 'Thiếu tham số date' });
+  const today = vnDateDDMMYYYY();
+
+  if (reqDate === today) {
+    dailyLogs.users = {};
+    dailyLogs.allLogs = [];
+    logHistory.length = 0;
+  }
+
+  const targetDir = path.join(LOGS_DAILY_DIR, reqDate);
+  if (fs.existsSync(targetDir)) {
+    try {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    } catch (e) {
+      return res.status(500).json({ error: 'Không thể xóa folder log: ' + e.message });
+    }
+  }
+
+  addLog({
+    timestamp: formatVN(new Date()),
+    account: 'system',
+    msg: `🗑️ Đã xóa logs ngày ${reqDate}`,
+    level: 'info',
+  });
+
+  res.json({ ok: true, date: reqDate });
+});
+
+// Lấy log gần nhất
 app.get('/lythuyet/api/logs', (req, res) => {
   res.json(logHistory);
 });

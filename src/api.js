@@ -74,6 +74,11 @@ export const changePassword = (oldPassword, newPassword) =>
 export const fetchFirebaseConfig = () => apiGet('/api/admin/firebase-config');
 export const saveFirebaseConfig = (config) => apiSend('/api/admin/firebase-config', 'POST', { config });
 
+// ── Logs ──
+export const fetchLogFolders = () => apiGet('/api/logs/folders');
+export const fetchLogsByDate = (date) => apiGet(`/api/logs/by-date?date=${encodeURIComponent(date)}`);
+export const deleteLogFolder = (date) => apiSend(`/api/logs/by-date?date=${encodeURIComponent(date)}`, 'DELETE');
+
 // Đăng xuất — thu hồi token trên server rồi xóa client (không reload ở đây, App xử lý)
 export async function logout() {
   try {
