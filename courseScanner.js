@@ -188,7 +188,7 @@ function getNextShiftStart(fromDate = new Date(), customTimeRules = [], allowedR
   const statusToday = calcMsRemainingInShift(fromDate, shiftsToday);
 
   // 1. Nếu hôm nay còn Ca học phía sau (chưa đến giờ):
-  if (statusToday.nextShiftToday) {
+  if (isAllowedStudyDate(fromDate, allowedRanges) && statusToday.nextShiftToday) {
     const s = statusToday.nextShiftToday;
     const startH = Math.floor(s.startMins / 60);
     const startM = s.startMins % 60;

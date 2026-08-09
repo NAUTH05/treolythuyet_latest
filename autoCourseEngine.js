@@ -11,6 +11,26 @@ function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted 
   return target > 0 ? studied >= target : allLessonsCompleted;
 }
 
+function isAutoCourseAccountBlockingStatus(status) {
+  return ['idle', 'logging-in', 'scanning', 'studying', 'paused'].includes(status);
+}
+
+function getPersistentAutoCourseOptions(options = {}) {
+  return {
+    dailyMaxMinutes: options.dailyMaxMinutes ?? 480,
+    allowedDateRanges: options.allowedDateRanges || [],
+    newDayStartTime: options.newDayStartTime || '06:00',
+    refreshInterval: options.refreshInterval || 15,
+    stealthInterval: options.stealthInterval || 30,
+    stealth: options.stealth === true,
+    timeWindows: options.timeWindows || [],
+    customTimeRules: options.customTimeRules || [],
+    initialDailyMinutesToggle: options.initialDailyMinutesToggle === true,
+    initialDailyMinutes: options.initialDailyMinutes || 0,
+    initialDailyDate: options.initialDailyDate || null,
+  };
+}
+
 class AutoCourseSession extends EventEmitter {
   constructor(id, account, coursesConfig = [], options = {}) {
     super();
@@ -54,6 +74,8 @@ class AutoCourseSession extends EventEmitter {
     this.courseProgress = {}; // courseUrl -> { studiedMinutes, targetMinutes, completed }
     this._stopped = false;
     this._stealthTimer = null;
+    this._pauseStartedAt = null;
+    this._totalPausedMs = 0;
   }
 
   _randomBetween(min, max) {
@@ -243,12 +265,41 @@ class AutoCourseSession extends EventEmitter {
     }
   }
 
+  _getTotalPausedMs(now = Date.now()) {
+    const currentPauseMs = this._pauseStartedAt == null ? 0 : Math.max(0, now - this._pauseStartedAt);
+    return this._totalPausedMs + currentPauseMs;
+  }
+
+  // Wait for active study time only. Paused wall-clock time must never advance progress.
+  async _waitForActiveStudyTime(targetMs) {
+    const target = Math.max(0, Number(targetMs) || 0);
+    let activeElapsedMs = 0;
+
+    while (activeElapsedMs < target && !this._stopped) {
+      await this._checkPaused();
+      if (this._stopped) break;
+      if (this._msRemainingInWindow() === -2 || !this._checkCustomShifts().inShift) break;
+
+      const stepMs = Math.min(1000, target - activeElapsedMs);
+      const startedAt = Date.now();
+      const pausedBefore = this._getTotalPausedMs(startedAt);
+      await new Promise(resolve => setTimeout(resolve, stepMs));
+      const endedAt = Date.now();
+      const pausedAfter = this._getTotalPausedMs(endedAt);
+      const activeStepMs = Math.max(0, (endedAt - startedAt) - (pausedAfter - pausedBefore));
+      activeElapsedMs += Math.min(stepMs, activeStepMs);
+    }
+
+    return activeElapsedMs;
+  }
+
   // Tạm dừng phiên
   pause() {
     if (this._stopped || this.status === 'stopped' || this.status === 'completed' || this.status === 'error' || this.status === 'paused') {
       return false;
     }
     this.pausedFromStatus = this.status;
+    this._pauseStartedAt = Date.now();
     this.status = 'paused';
     this.log(`⏸ Tạm dừng phiên Auto-Scan cho ${this.account.name}`, 'info');
     this.emit('status', this.getStatus());
@@ -259,6 +310,10 @@ class AutoCourseSession extends EventEmitter {
   resume() {
     if (this.status !== 'paused') return false;
     const prev = this.pausedFromStatus || 'studying';
+    if (this._pauseStartedAt != null) {
+      this._totalPausedMs += Math.max(0, Date.now() - this._pauseStartedAt);
+      this._pauseStartedAt = null;
+    }
     this.pausedFromStatus = null;
     this.status = prev;
     this.log(`▶️ Tiếp tục phiên Auto-Scan cho ${this.account.name}`, 'info');
@@ -774,16 +829,13 @@ class AutoCourseSession extends EventEmitter {
               waitStep = Math.min(waitStep, Math.max(5000, windowRemainingMs));
             }
 
-            await this.page.waitForTimeout(waitStep);
-
-            // Re-check pause after waitStep
-            await this._checkPaused();
+            const activeWaitMs = await this._waitForActiveStudyTime(waitStep);
             if (this._stopped) break;
 
-            elapsedMs += waitStep;
+            elapsedMs += activeWaitMs;
 
             this._rolloverDailyCounter();
-            const addMins = Math.round(waitStep / 60000);
+            const addMins = Math.round(activeWaitMs / 60000);
             this.dailyStudiedMinutes += addMins;
             courseStudiedMins += addMins;
             this.courseProgress[cConfig.courseUrl].studiedMinutes = courseStudiedMins;
@@ -791,6 +843,11 @@ class AutoCourseSession extends EventEmitter {
             const remainingDailyMins = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes);
             this.log(`📊 Đang treo bài [${lesson.title}]: Đã treo ${Math.round(elapsedMs / 60000)}/${lessonMinutes} phút | Hôm nay: ${this._formatMinutes(this.dailyStudiedMinutes)} / ${this._formatMinutes(this.options.dailyMaxMinutes)} (Còn lại: ${this._formatMinutes(remainingDailyMins)})`, 'info');
             this.emit('status', this.getStatus());
+
+            if (activeWaitMs < waitStep && !this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
+              try { await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch { /* ignore */ }
+              return;
+            }
 
             // Ghi nhận phần vừa học trước, sau đó mới hẹn tiếp ca/ngày kế tiếp.
             if (!this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
@@ -955,4 +1012,6 @@ class AutoCourseSession extends EventEmitter {
 module.exports = {
   AutoCourseSession,
   courseReachedTarget,
+  isAutoCourseAccountBlockingStatus,
+  getPersistentAutoCourseOptions,
 };
