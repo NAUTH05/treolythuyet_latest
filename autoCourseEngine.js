@@ -5,6 +5,32 @@ const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, readDomT
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
 
+function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted = false) {
+  const target = Math.max(0, Number(targetMinutes) || 0);
+  const studied = Math.max(0, Number(studiedMinutes) || 0);
+  return target > 0 ? studied >= target : allLessonsCompleted;
+}
+
+function isAutoCourseAccountBlockingStatus(status) {
+  return ['idle', 'logging-in', 'scanning', 'studying', 'paused'].includes(status);
+}
+
+function getPersistentAutoCourseOptions(options = {}) {
+  return {
+    dailyMaxMinutes: options.dailyMaxMinutes ?? 480,
+    allowedDateRanges: options.allowedDateRanges || [],
+    newDayStartTime: options.newDayStartTime || '06:00',
+    refreshInterval: options.refreshInterval || 15,
+    stealthInterval: options.stealthInterval || 30,
+    stealth: options.stealth === true,
+    timeWindows: options.timeWindows || [],
+    customTimeRules: options.customTimeRules || [],
+    initialDailyMinutesToggle: options.initialDailyMinutesToggle === true,
+    initialDailyMinutes: options.initialDailyMinutes || 0,
+    initialDailyDate: options.initialDailyDate || null,
+  };
+}
+
 class AutoCourseSession extends EventEmitter {
   constructor(id, account, coursesConfig = [], options = {}) {
     super();
@@ -27,7 +53,7 @@ class AutoCourseSession extends EventEmitter {
       ...options,
     };
 
-    this.status = 'idle'; // idle | logging-in | scanning | studying | paused | date-limit | daily-limit | completed | stopped | error
+    this.status = 'idle'; // idle | logging-in | scanning | studying | paused | date-limit | daily-limit | time-window | next-day | completed | stopped | error
     this.pausedFromStatus = null;
     this.browser = null;
     this.context = null;
@@ -48,6 +74,8 @@ class AutoCourseSession extends EventEmitter {
     this.courseProgress = {}; // courseUrl -> { studiedMinutes, targetMinutes, completed }
     this._stopped = false;
     this._stealthTimer = null;
+    this._pauseStartedAt = null;
+    this._totalPausedMs = 0;
   }
 
   _randomBetween(min, max) {
@@ -162,11 +190,107 @@ class AutoCourseSession extends EventEmitter {
     }
   }
 
+  _hitDailyLimit() {
+    this._rolloverDailyCounter();
+    if (this.dailyStudiedMinutes < this.options.dailyMaxMinutes) return false;
+    this.status = 'daily-limit';
+    this.log(`🛑 Đã đạt giới hạn học tối đa trong ngày (${this._formatMinutes(this.options.dailyMaxMinutes)}) → Hẹn ${this.options.newDayStartTime || '06:00'} sáng ngày học tiếp theo tiếp tục!`, 'warn');
+    this.emit('status', this.getStatus());
+    return true;
+  }
+
+  _hitSchedulingLimit() {
+    return this._hitDailyLimit() || this._hitTimeShiftLimit() || this._hitTimeWindowLimit();
+  }
+
+  _allConfiguredCoursesCompleted() {
+    return this.coursesConfig.length > 0
+      && this.coursesConfig.every(course => this.courseProgress[course.courseUrl]?.completed === true);
+  }
+
+  // Chỉ dùng marker hoàn thành thuộc chính slide hiện tại. Selector `.badge` hoặc
+  // `.fa-check` toàn trang có thể trúng badge 100%/icon của menu, quiz hay header.
+  async _isCurrentLessonCompleted() {
+    if (!this.page) return false;
+    try {
+      return await this.page.evaluate(() => {
+        const doneContainer = document.querySelector('.o_wslides_sidebar_done_button[data-completed]');
+        if (doneContainer) {
+          return String(doneContainer.getAttribute('data-completed')).toLowerCase() === 'true';
+        }
+        return Boolean(document.querySelector(
+          '.o_wslides_sidebar_done_button .o_wslides_slide_completed:not(.d-none), ' +
+          '.o_wslides_sidebar_done_button .o_wslides_undone_button, ' +
+          'a.o_wslides_undone_button, button.o_wslides_undone_button'
+        ));
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  // Xác minh chéo tiến độ ngay trên trang khóa học bằng một tab dùng chung
+  // phiên đăng nhập. Chỉ progress 100% của đúng URL bài mới được coi là xong.
+  async _verifyLessonProgressFromCourse(courseUrl, lessonUrl) {
+    if (!this.context) return { completed: false, progressPercent: null };
+    let verifyPage = null;
+    try {
+      verifyPage = await this.context.newPage();
+      const result = await scanCourseDetails(verifyPage, courseUrl);
+      if (!result || !Array.isArray(result.allLessons)) {
+        return { completed: false, progressPercent: null };
+      }
+      const expectedPath = new URL(lessonUrl).pathname;
+      const matchedLesson = result.allLessons.find(item => {
+        try { return new URL(item.url).pathname === expectedPath; } catch { return false; }
+      });
+      return {
+        completed: matchedLesson?.progressPercent >= 100,
+        progressPercent: matchedLesson?.progressPercent ?? null,
+      };
+    } catch (err) {
+      this.log(`⚠️ Không thể xác minh tiến độ bài từ trang khóa học: ${String(err.message).split('\n')[0]}`, 'warn');
+      return { completed: false, progressPercent: null };
+    } finally {
+      if (verifyPage) {
+        try { await verifyPage.close(); } catch { /* ignore */ }
+      }
+    }
+  }
+
   // Chờ nếu phiên đang ở trạng thái Tạm dừng (paused)
   async _checkPaused() {
     while (this.status === 'paused' && !this._stopped) {
       await new Promise(r => setTimeout(r, 2000));
     }
+  }
+
+  _getTotalPausedMs(now = Date.now()) {
+    const currentPauseMs = this._pauseStartedAt == null ? 0 : Math.max(0, now - this._pauseStartedAt);
+    return this._totalPausedMs + currentPauseMs;
+  }
+
+  // Wait for active study time only. Paused wall-clock time must never advance progress.
+  async _waitForActiveStudyTime(targetMs) {
+    const target = Math.max(0, Number(targetMs) || 0);
+    let activeElapsedMs = 0;
+
+    while (activeElapsedMs < target && !this._stopped) {
+      await this._checkPaused();
+      if (this._stopped) break;
+      if (this._msRemainingInWindow() === -2 || !this._checkCustomShifts().inShift) break;
+
+      const stepMs = Math.min(1000, target - activeElapsedMs);
+      const startedAt = Date.now();
+      const pausedBefore = this._getTotalPausedMs(startedAt);
+      await new Promise(resolve => setTimeout(resolve, stepMs));
+      const endedAt = Date.now();
+      const pausedAfter = this._getTotalPausedMs(endedAt);
+      const activeStepMs = Math.max(0, (endedAt - startedAt) - (pausedAfter - pausedBefore));
+      activeElapsedMs += Math.min(stepMs, activeStepMs);
+    }
+
+    return activeElapsedMs;
   }
 
   // Tạm dừng phiên
@@ -175,6 +299,7 @@ class AutoCourseSession extends EventEmitter {
       return false;
     }
     this.pausedFromStatus = this.status;
+    this._pauseStartedAt = Date.now();
     this.status = 'paused';
     this.log(`⏸ Tạm dừng phiên Auto-Scan cho ${this.account.name}`, 'info');
     this.emit('status', this.getStatus());
@@ -185,6 +310,10 @@ class AutoCourseSession extends EventEmitter {
   resume() {
     if (this.status !== 'paused') return false;
     const prev = this.pausedFromStatus || 'studying';
+    if (this._pauseStartedAt != null) {
+      this._totalPausedMs += Math.max(0, Date.now() - this._pauseStartedAt);
+      this._pauseStartedAt = null;
+    }
     this.pausedFromStatus = null;
     this.status = prev;
     this.log(`▶️ Tiếp tục phiên Auto-Scan cho ${this.account.name}`, 'info');
@@ -438,6 +567,7 @@ class AutoCourseSession extends EventEmitter {
       for (let cIdx = 0; cIdx < this.coursesConfig.length; cIdx++) {
         if (this._stopped) break;
         await this._checkPaused();
+        if (this._hitSchedulingLimit()) return;
 
         const cConfig = this.coursesConfig[cIdx];
         this.currentCourseIndex = cIdx;
@@ -473,17 +603,6 @@ class AutoCourseSession extends EventEmitter {
           this.log(`   └─ Bài ${idx + 1}: ${l.title} -> ${l.progressPercent}% (${l.isCompleted ? 'Đã hoàn thành' : 'CHƯA XONG'})`, l.isCompleted ? 'info' : 'warn');
         });
 
-        if (scanResult.uncompletedLessons.length === 0) {
-          this.log(`🎉 Tất cả ${scanResult.totalLessons} bài học trong Khóa [${scanResult.courseTitle}] đều đã hoàn thành 100%! Bỏ qua khóa này.`, 'success');
-          this.courseProgress[cConfig.courseUrl] = {
-            title: scanResult.courseTitle,
-            targetMinutes,
-            studiedMinutes: targetMinutes,
-            completed: true,
-          };
-          continue;
-        }
-
         let courseStudiedMins = scanResult.actualStudiedMinutes || 0;
         this.courseProgress[cConfig.courseUrl] = {
           title: scanResult.courseTitle,
@@ -496,6 +615,17 @@ class AutoCourseSession extends EventEmitter {
           this.log(`⏱️ Thời gian đã hoàn thành tích lũy trên web: ${scanResult.actualStudiedText} (${courseStudiedMins} phút)`, 'info');
         }
 
+        if (scanResult.uncompletedLessons.length === 0) {
+          const reachedTarget = courseReachedTarget(targetMinutes, courseStudiedMins, true);
+          this.courseProgress[cConfig.courseUrl].completed = reachedTarget;
+          if (reachedTarget) {
+            this.log(`🎉 Tất cả ${scanResult.totalLessons} bài học trong Khóa [${scanResult.courseTitle}] đều đã hoàn thành${targetMinutes > 0 ? ' và khóa đã đạt mục tiêu thời gian' : ' 100%'}!`, 'success');
+          } else {
+            this.log(`⚠️ Các bài trong Khóa [${scanResult.courseTitle}] đang hiển thị 100% nhưng thời gian tích lũy mới ${this._formatMinutes(courseStudiedMins)}/${this._formatMinutes(targetMinutes)} — chưa đánh dấu hoàn thành, sẽ quét lại vào ngày học tiếp theo.`, 'warn');
+          }
+          continue;
+        }
+
         if (targetMinutes > 0 && courseStudiedMins >= targetMinutes) {
           this.log(`🎉 Khóa học [${scanResult.courseTitle}] trên web đã đạt ${scanResult.actualStudiedText || (courseStudiedMins + ' phút')} (Đã đạt/vượt mục tiêu ${cConfig.targetHours}h ${cConfig.targetMinutes}m)! Bỏ qua khóa này.`, 'success');
           this.courseProgress[cConfig.courseUrl].completed = true;
@@ -506,15 +636,10 @@ class AutoCourseSession extends EventEmitter {
         for (let lIdx = 0; lIdx < scanResult.uncompletedLessons.length; lIdx++) {
           if (this._stopped) break;
           await this._checkPaused();
+          if (this._hitSchedulingLimit()) return;
 
           this._rolloverDailyCounter();
           const remainingDailyMins = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes);
-          if (this.dailyStudiedMinutes >= this.options.dailyMaxMinutes) {
-            this.status = 'daily-limit';
-            this.log(`🛑 Đã đạt giới hạn học tối đa trong ngày (${this._formatMinutes(this.options.dailyMaxMinutes)}) → Hẹn ${this.options.newDayStartTime || '06:00'} sáng ngày mai tiếp tục!`, 'warn');
-            this.emit('status', this.getStatus());
-            return;
-          }
 
           this.log(`⏳ Thời gian học trong ngày còn lại: ${this._formatMinutes(remainingDailyMins)} (${remainingDailyMins} phút / tối đa ${this._formatMinutes(this.options.dailyMaxMinutes)})`, 'info');
 
@@ -609,9 +734,15 @@ class AutoCourseSession extends EventEmitter {
                   this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer (lần thử ${retry}/${maxDomRetries}): ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
                   break;
                 } else if (domTimer.hours === 0 && domTimer.minutes === 0 && domTimer.seconds === 0) {
-                  lessonMinutes = 0;
-                  this.log(`🎉 Bộ đếm DOM Timer trả về 0h 0m 0s (lần thử ${retry}/${maxDomRetries}) — Bài học đã hoàn thành trước đó ➔ Bỏ qua / Hoàn thành ngay!`, 'success');
-                  break;
+                  const isTrulyCompleted = await this._isCurrentLessonCompleted();
+
+                  if (isTrulyCompleted) {
+                    lessonMinutes = 0;
+                    this.log(`🎉 Giao diện web xác nhận bài học đã hoàn thành 100% ➔ Bỏ qua bài này!`, 'success');
+                    break;
+                  } else {
+                    this.log(`⚠️ DOM Timer tạm trả về 0h 0m 0s nhưng bài chưa đạt 100% trên web (lần thử ${retry}/${maxDomRetries}) ➔ Tiếp tục tải lại...`, 'warn');
+                  }
                 }
               }
 
@@ -642,12 +773,14 @@ class AutoCourseSession extends EventEmitter {
           }
 
           if (this._stopped) break;
+          if (this._hitSchedulingLimit()) return;
 
           this.status = 'studying';
           this.emit('status', this.getStatus());
 
           let durationMs = lessonMinutes * 60 * 1000;
           let elapsedMs = 0;
+          let lessonConfirmedCompleted = lessonMinutes === 0;
 
           while (elapsedMs < durationMs && !this._stopped) {
             await this._checkPaused();
@@ -676,6 +809,14 @@ class AutoCourseSession extends EventEmitter {
             const jitteredMs = Math.round(refreshIntervalMs + (Math.random() * 2 - 1) * jitter);
             let waitStep = Math.min(Math.max(60000, jitteredMs), durationMs - elapsedMs);
 
+            // Không học vượt ngân sách phút còn lại trong ngày.
+            const dailyRemainingMs = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes) * 60000;
+            waitStep = Math.min(waitStep, dailyRemainingMs);
+            if (waitStep <= 0) {
+              this._hitDailyLimit();
+              return;
+            }
+
             // Không chờ vượt quá thời điểm kết thúc Ca học hiện tại
             const shiftCheck = this._checkCustomShifts();
             if (shiftCheck.currentShift && shiftCheck.remainingMs < waitStep) {
@@ -688,17 +829,13 @@ class AutoCourseSession extends EventEmitter {
               waitStep = Math.min(waitStep, Math.max(5000, windowRemainingMs));
             }
 
-            await this.page.waitForTimeout(waitStep);
-
-            // Re-check pause & shift limit after waitStep
-            await this._checkPaused();
+            const activeWaitMs = await this._waitForActiveStudyTime(waitStep);
             if (this._stopped) break;
-            if (this._hitTimeShiftLimit()) return;
 
-            elapsedMs += waitStep;
+            elapsedMs += activeWaitMs;
 
             this._rolloverDailyCounter();
-            const addMins = Math.round(waitStep / 60000);
+            const addMins = Math.round(activeWaitMs / 60000);
             this.dailyStudiedMinutes += addMins;
             courseStudiedMins += addMins;
             this.courseProgress[cConfig.courseUrl].studiedMinutes = courseStudiedMins;
@@ -707,40 +844,107 @@ class AutoCourseSession extends EventEmitter {
             this.log(`📊 Đang treo bài [${lesson.title}]: Đã treo ${Math.round(elapsedMs / 60000)}/${lessonMinutes} phút | Hôm nay: ${this._formatMinutes(this.dailyStudiedMinutes)} / ${this._formatMinutes(this.options.dailyMaxMinutes)} (Còn lại: ${this._formatMinutes(remainingDailyMins)})`, 'info');
             this.emit('status', this.getStatus());
 
+            if (activeWaitMs < waitStep && !this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
+              try { await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch { /* ignore */ }
+              return;
+            }
+
+            // Ghi nhận phần vừa học trước, sau đó mới hẹn tiếp ca/ngày kế tiếp.
+            if (!this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
+              try { await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch { /* ignore */ }
+              return;
+            }
+
             if (elapsedMs < durationMs && !this._stopped) {
+              let reloadOk = false;
               try {
-                await this.page.reload({ waitUntil: 'load', timeout: 60000 });
+                await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
                 await this._fakeVisibilityAPI();
-                await this.page.waitForTimeout(2000);
+                await this.page.waitForTimeout(7000); // Chờ 7s cho Odoo JS render & chốt checkpoint lên server
+                reloadOk = true;
               } catch (err) {
                 if (!this._isNetworkError(err)) throw err;
-                this.log(`⚠️ F5 lỗi mạng: ${String(err.message).split('\n')[0]} → sẽ thử lại ở chu kỳ sau`, 'warn');
+                this.log(`⚠️ F5 lỗi mạng: ${String(err.message).split('\n')[0]} → Đang chờ hệ thống cho phép vào lại...`, 'warn');
+                reloadOk = await this._waitUntilOnUrl(lesson.url);
               }
+
               if (!this._stopped && !this._isOnUrl(lesson.url)) {
                 this.log(`⚠️ F5 bị redirect: ${this.page.url()} → Đang chờ hệ thống cho phép vào lại...`, 'warn');
                 const reentered = await this._waitUntilOnUrl(lesson.url);
                 if (reentered) this.log(`✅ Đã vào lại bài học sau khi F5 bị redirect`, 'success');
               }
 
-              // Heartbeat Check: Đọc lại bộ đếm web sau F5 xem bài học có hoàn thành sớm hoặc hết giờ không
+              // Heartbeat Check: Đọc lại bộ đếm web sau F5 nếu tìm thấy thời gian đếm ngược hợp lệ (>0 phút)
               if (!this._stopped && this._isOnUrl(lesson.url)) {
                 const checkTimer = await readDomTimer(this.page);
-                if (checkTimer && checkTimer.hours === 0 && checkTimer.minutes === 0 && checkTimer.seconds === 0) {
-                  this.log('🎉 Bộ đếm DOM Timer trên web đã về 0h 0m 0s (Đã đạt 100% / Hoàn thành bài trên web) ➔ Hoàn thành bài học sớm!', 'success');
-                  break;
-                } else if (checkTimer && checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
-                  const remainingWebMs = checkTimer.totalMinutes * 60 * 1000;
-                  if (lessonMinutes === 240 || remainingWebMs < (durationMs - elapsedMs)) {
-                    lessonMinutes = checkTimer.totalMinutes;
-                    durationMs = elapsedMs + remainingWebMs;
-                    this.log(`⏱️ Thời gian đếm ngược trên web đã cập nhật còn ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút) ➔ Tự động cập nhật rút ngắn thời gian treo!`, 'info');
+                if (checkTimer) {
+                  if (checkTimer.totalMinutes > 0 && !isNaN(checkTimer.totalMinutes)) {
+                    const remainingWebMs = checkTimer.totalMinutes * 60 * 1000;
+                    if (lessonMinutes === 240 || Math.abs(durationMs - (elapsedMs + remainingWebMs)) > 60000) {
+                      lessonMinutes = Math.round((elapsedMs + remainingWebMs) / 60000);
+                      durationMs = elapsedMs + remainingWebMs;
+                      this.log(`⏱️ Thời gian đếm ngược trên web cập nhật còn lại: ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút)`, 'info');
+                    }
+                  } else if (checkTimer.hours === 0 && checkTimer.minutes === 0 && checkTimer.seconds === 0) {
+                    const completedOnSlide = await this._isCurrentLessonCompleted();
+                    if (completedOnSlide) {
+                      lessonConfirmedCompleted = true;
+                      durationMs = elapsedMs;
+                      this.log(`✅ Web Odoo xác nhận bài đã hoàn thành sau heartbeat`, 'success');
+                    } else {
+                      this.log(`⚠️ Timer heartbeat trả về 0:00 nhưng bài chưa được Web Odoo xác nhận — giữ nguyên thời lượng ${lessonMinutes} phút, không kết thúc sớm.`, 'warn');
+                    }
+                  }
+                }
+              }
+            }
+
+            // Kiểm tra xác minh lượt cuối khi elapsedMs chuẩn bị chạm hoặc đã bằng durationMs
+            if (elapsedMs >= durationMs && !this._stopped) {
+              this.log(`🔍 Đang xác minh lại trạng thái bài học trên Web Odoo...`, 'info');
+              
+              if (this._isOnUrl(lesson.url)) {
+                try {
+                  await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                  await this._fakeVisibilityAPI();
+                  await this.page.waitForTimeout(5000);
+                } catch {
+                  await this._waitUntilOnUrl(lesson.url);
+                }
+
+                if (this._isOnUrl(lesson.url)) {
+                  const isBadgeCompleted = await this._isCurrentLessonCompleted();
+
+                  if (isBadgeCompleted) {
+                    lessonConfirmedCompleted = true;
+                  } else {
+                    const finalTimer = await readDomTimer(this.page);
+                    if (finalTimer && finalTimer.totalMinutes > 0 && !isNaN(finalTimer.totalMinutes)) {
+                      this.log(`⚠️ Đồng hồ local đã đếm hết nhưng Web Odoo vẫn còn ${finalTimer.hours}h ${finalTimer.minutes}m ${finalTimer.seconds}s (${finalTimer.totalMinutes} phút) ➔ Tự động gia hạn treo tiếp!`, 'warn');
+                      durationMs = elapsedMs + finalTimer.totalMinutes * 60 * 1000;
+                      lessonMinutes = Math.ceil(durationMs / 60000);
+                    } else {
+                      const courseVerification = await this._verifyLessonProgressFromCourse(cConfig.courseUrl, lesson.url);
+                      if (courseVerification.completed) {
+                        lessonConfirmedCompleted = true;
+                        this.log(`✅ Trang khóa học xác nhận bài [${lesson.title}] đã đạt 100%`, 'success');
+                      } else {
+                        const retryMinutes = Math.max(1, parseInt(this.options.refreshInterval, 10) || 15);
+                        durationMs = elapsedMs + retryMinutes * 60 * 1000;
+                        lessonMinutes = Math.ceil(durationMs / 60000);
+                        const progressText = courseVerification.progressPercent == null
+                          ? 'chưa đọc được tiến độ'
+                          : `mới ${courseVerification.progressPercent}%`;
+                        this.log(`⚠️ Timer đã về 0:00 nhưng trang khóa học ${progressText} — gia hạn thêm ${retryMinutes} phút và tiếp tục treo, không đánh dấu hoàn thành.`, 'warn');
+                      }
+                    }
                   }
                 }
               }
             }
           }
 
-          if (!this._stopped && this.status !== 'paused') {
+          if (!this._stopped && this.status !== 'paused' && lessonConfirmedCompleted) {
             this.log(`✅ Hoàn thành treo bài [${lesson.title}] (${lessonMinutes} phút)!`, 'success');
             this.emit('progress-saved', {
               account: this.account.name,
@@ -749,16 +953,35 @@ class AutoCourseSession extends EventEmitter {
               studiedMinutes: lessonMinutes,
               courseRemainingMinutes: Math.max(0, targetMinutes - courseStudiedMins),
             });
+          } else if (!this._stopped && this.status !== 'paused') {
+            this.log(`⚠️ Bài [${lesson.title}] chưa được Web Odoo xác nhận hoàn thành — không ghi nhận là đã xong.`, 'warn');
           }
+        }
+
+        if (courseReachedTarget(targetMinutes, courseStudiedMins, true)) {
+          this.courseProgress[cConfig.courseUrl].completed = true;
         }
       }
 
+      const SCHEDULED_STATUSES = new Set(['daily-limit', 'date-limit', 'time-window', 'next-day']);
       if (this._stopped) {
         this.status = 'stopped';
         this.emit('status', this.getStatus());
-      } else if (this.status !== 'paused') {
-        this.status = 'completed';
-        this.log(`🎉 Tất cả các khóa học đã được quét và treo xong!`, 'success');
+      } else if (SCHEDULED_STATUSES.has(this.status) || this.status === 'paused') {
+        // Giữ nguyên trạng thái giới hạn / tạm dừng — không ghi đè thành completed!
+        this.emit('status', this.getStatus());
+      } else {
+        const incompleteCourses = this.coursesConfig.filter(c => !this.courseProgress[c.courseUrl]?.completed);
+        if (incompleteCourses.length > 0) {
+          // Bắt lại đúng loại lịch hẹn nếu ca/khung/ngân sách ngày vừa kết thúc
+          // trong lúc xử lý bài cuối cùng của lượt quét.
+          if (this._hitSchedulingLimit()) return;
+          this.status = 'next-day';
+          this.log(`⏭️ Đã quét hết lượt hôm nay nhưng còn ${incompleteCourses.length}/${this.coursesConfig.length} khóa chưa đạt mục tiêu thời gian → Hẹn ${this.options.newDayStartTime || '06:00'} ngày học tiếp theo quét và treo tiếp!`, 'warn');
+        } else {
+          this.status = 'completed';
+          this.log(`🎉 Tất cả các khóa học đã đạt mục tiêu và treo xong!`, 'success');
+        }
         this.emit('status', this.getStatus());
       }
     } catch (err) {
@@ -788,4 +1011,7 @@ class AutoCourseSession extends EventEmitter {
 
 module.exports = {
   AutoCourseSession,
+  courseReachedTarget,
+  isAutoCourseAccountBlockingStatus,
+  getPersistentAutoCourseOptions,
 };

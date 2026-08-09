@@ -5,9 +5,24 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { BotSession } = require('./bot');
-const { AutoCourseSession } = require('./autoCourseEngine');
-const { isAllowedStudyDate, getNextAllowedStudyDate } = require('./courseScanner');
+const { AutoCourseSession, isAutoCourseAccountBlockingStatus, getPersistentAutoCourseOptions } = require('./autoCourseEngine');
+const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
+const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
+const { SerializedStateSync, readStateDocument, writeJsonAtomicSync } = require('./stateSync');
+
+async function respondAfterStateSync(res, pending, body) {
+  try {
+    await pending;
+    return res.json(body);
+  } catch (error) {
+    return res.status(503).json({
+      ok: false,
+      localApplied: true,
+      error: `Đã cập nhật local nhưng chưa thể xác nhận đồng bộ Firebase: ${error.message}`,
+    });
+  }
+}
 
 const ADMIN_CONFIG_FILE = path.join(__dirname, 'admin-config.json');
 
@@ -57,6 +72,12 @@ function requireAdmin(req, res, next) {
 // =================== PRESETS PERSISTENCE ===================
 
 const PRESETS_FILE = path.join(__dirname, 'presets.json');
+const presetsState = readStateDocument(PRESETS_FILE, 'presets');
+const presetsSync = new SerializedStateSync({
+  label: 'presets', filePath: PRESETS_FILE, collection: 'system_presets', documentId: 'list',
+  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  initialRevision: presetsState.revision,
+});
 
 function loadPresets() {
   if (!fs.existsSync(PRESETS_FILE)) return [];
@@ -69,19 +90,27 @@ function loadPresets() {
 
 function savePresets(presets) {
   try {
-    fs.writeFileSync(PRESETS_FILE, JSON.stringify({ presets }, null, 2), 'utf8');
-    const fbConfig = fbService.loadFirebaseConfig();
-    if (fbConfig && fbConfig.projectId) {
-      fbService.syncToFirebaseREST('system_presets', 'list', { presets, updatedAt: new Date().toISOString() }, fbConfig);
-    }
+    const pending = presetsSync.persist({ presets });
+    pending.catch(e => console.error('[PRESETS] Firebase sync failed:', e.message));
+    return pending;
   } catch (e) {
     console.error('[PRESETS] Không thể lưu presets:', e.message);
+    const failed = Promise.reject(e);
+    failed.catch(() => undefined);
+    return failed;
   }
 }
 
 // =================== AUTO-SCAN PRESETS =====================
 
 const AUTO_PRESETS_FILE = path.join(__dirname, 'autoscan-presets.json');
+const autoPresetsState = readStateDocument(AUTO_PRESETS_FILE, 'presets');
+const autoPresetsSync = new SerializedStateSync({
+  label: 'auto-scan presets', filePath: AUTO_PRESETS_FILE,
+  collection: 'system_autoscan_presets', documentId: 'list',
+  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  initialRevision: autoPresetsState.revision,
+});
 
 function loadAutoPresets() {
   if (!fs.existsSync(AUTO_PRESETS_FILE)) return [];
@@ -94,13 +123,14 @@ function loadAutoPresets() {
 
 function saveAutoPresets(presets) {
   try {
-    fs.writeFileSync(AUTO_PRESETS_FILE, JSON.stringify({ presets }, null, 2), 'utf8');
-    const fbConfig = fbService.loadFirebaseConfig();
-    if (fbConfig && fbConfig.projectId) {
-      fbService.syncToFirebaseREST('system_autoscan_presets', 'list', { presets, updatedAt: new Date().toISOString() }, fbConfig);
-    }
+    const pending = autoPresetsSync.persist({ presets });
+    pending.catch(e => console.error('[AUTO-PRESETS] Firebase sync failed:', e.message));
+    return pending;
   } catch (e) {
     console.error('[AUTO-PRESETS] Không thể lưu auto-scan presets:', e.message);
+    const failed = Promise.reject(e);
+    failed.catch(() => undefined);
+    return failed;
   }
 }
 
@@ -142,15 +172,13 @@ const logHistory = [];         // Lưu 500 dòng log gần nhất
 const MAX_LOG = 500;
 
 // =================== DAILY LOGS (ngày → user) =====================
-// Lưu TOÀN BỘ logs của từng ngày, phân theo user, đẩy lên Firebase
-// collection system_logs_daily (doc: <yyyy-mm-dd>_<user>) để xem lại
-// đầy đủ không bị ngắt đoạn. Flush theo chu kỳ để không spam Firestore.
-
+// =================== DAILY LOGS (ngày DD-MM-YYYY → folder/user) =====================
 const DAILY_LOGS_FILE = path.join(__dirname, 'daily-logs.json');
+const LOGS_DAILY_DIR = path.join(__dirname, 'logs', 'daily');
 const MAX_DAILY_LOGS_PER_USER = 5000; // Giới hạn an toàn dưới 1MB/doc Firestore
 
-function vnDateStr(d = new Date()) {
-  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
+if (!fs.existsSync(LOGS_DAILY_DIR)) {
+  try { fs.mkdirSync(LOGS_DAILY_DIR, { recursive: true }); } catch { /* ignore */ }
 }
 
 function slugifyAccount(name) {
@@ -163,69 +191,146 @@ function slugifyAccount(name) {
     .replace(/^_+|_+$/g, '') || 'system';
 }
 
-let dailyLogs = { date: vnDateStr(), users: {} };
+let dailyLogs = { date: vnDateDDMMYYYY(), users: {}, allLogs: [] };
 let dailyLogsDirtyUsers = new Set();
 let latestLogsDirty = false;
 
-// Khôi phục logs trong ngày từ file local (nếu server restart giữa ngày)
-try {
-  if (fs.existsSync(DAILY_LOGS_FILE)) {
-    const saved = JSON.parse(fs.readFileSync(DAILY_LOGS_FILE, 'utf8'));
-    if (saved && saved.date === dailyLogs.date && saved.users) {
-      dailyLogs = saved;
-    }
+// Khôi phục & migrate logs trong ngày / các ngày cũ
+function initDailyLogsStore() {
+  const today = vnDateDDMMYYYY();
+  const todayDir = path.join(LOGS_DAILY_DIR, today);
+  if (!fs.existsSync(todayDir)) {
+    try { fs.mkdirSync(todayDir, { recursive: true }); } catch { /* ignore */ }
   }
-} catch { /* ignore */ }
 
-function flushDailyLogsFor(store, users) {
+  // Migrate legacy daily-logs.json if present
   try {
+    if (fs.existsSync(DAILY_LOGS_FILE)) {
+      const legacy = JSON.parse(fs.readFileSync(DAILY_LOGS_FILE, 'utf8'));
+      if (legacy && legacy.date && legacy.users) {
+        const legacyDateFormatted = formatToDDMMYYYY(legacy.date);
+        if (!legacyDateFormatted) throw new Error(`Ngày log legacy không hợp lệ: ${legacy.date}`);
+        const legacyDir = path.join(LOGS_DAILY_DIR, legacyDateFormatted);
+        if (!fs.existsSync(legacyDir)) {
+          fs.mkdirSync(legacyDir, { recursive: true });
+        }
+        const legacyFile = path.join(legacyDir, 'logs.json');
+        if (!fs.existsSync(legacyFile)) {
+          let allMigrated = [];
+          for (const u of Object.keys(legacy.users)) {
+            if (Array.isArray(legacy.users[u])) {
+              allMigrated.push(...legacy.users[u]);
+            }
+          }
+          fs.writeFileSync(legacyFile, JSON.stringify(allMigrated, null, 2), 'utf8');
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[LOGS] Lỗi migrate legacy daily logs:', e.message);
+  }
+
+  // Load today's logs from logs/daily/DD-MM-YYYY/logs.json
+  const todayFile = path.join(todayDir, 'logs.json');
+  let loadedEntries = [];
+  if (fs.existsSync(todayFile)) {
+    try {
+      const fileEntries = JSON.parse(fs.readFileSync(todayFile, 'utf8'));
+      loadedEntries = filterLogsForDate(fileEntries, today, true)
+        .map(entry => ({ ...entry, date: today }));
+    } catch { loadedEntries = []; }
+  }
+
+  const usersMap = {};
+  for (const entry of loadedEntries) {
+    const key = entry.account || 'system';
+    if (!usersMap[key]) usersMap[key] = [];
+    usersMap[key].push(entry);
+  }
+
+  dailyLogs = {
+    date: today,
+    users: usersMap,
+    allLogs: loadedEntries,
+  };
+}
+
+initDailyLogsStore();
+
+// API đọc log cũng phải tự xoay ngày. Trước đây store chỉ đổi ngày khi có log
+// mới, nên sau 0 giờ (chưa có dòng mới) mục "Hôm nay" vẫn trả log hôm qua.
+function ensureDailyLogsCurrent() {
+  const today = vnDateDDMMYYYY();
+  if (dailyLogs.date === today) return false;
+
+  const oldStore = dailyLogs;
+  dailyLogs = { date: today, users: {}, allLogs: [] };
+  dailyLogsDirtyUsers.clear();
+  logHistory.length = 0; // Không để live stream của ngày cũ bị ghép vào ngày mới.
+  try { flushDailyLogsFor(oldStore); } catch { /* ignore */ }
+  return true;
+}
+
+function flushDailyLogsFor(store) {
+  if (!store || !store.date) return;
+  const folderName = formatToDDMMYYYY(store.date);
+  const dirPath = path.join(LOGS_DAILY_DIR, folderName);
+  if (!fs.existsSync(dirPath)) {
+    try { fs.mkdirSync(dirPath, { recursive: true }); } catch { /* ignore */ }
+  }
+
+  const logsFilePath = path.join(dirPath, 'logs.json');
+  const entries = store.allLogs || [];
+  try {
+    fs.writeFileSync(logsFilePath, JSON.stringify(entries, null, 2), 'utf8');
     fs.writeFileSync(DAILY_LOGS_FILE, JSON.stringify(store), 'utf8');
   } catch (e) {
     console.error('[LOGS] Không thể lưu daily-logs local:', e.message);
   }
+
   const fbConfig = fbService.loadFirebaseConfig();
   if (!fbConfig || !fbConfig.projectId) return;
+  const users = store.users ? Object.keys(store.users) : [];
   for (const account of users) {
-    const entries = store.users[account];
-    if (!entries || entries.length === 0) continue;
-    const docId = `${store.date}_${slugifyAccount(account)}`;
+    const userEntries = store.users[account];
+    if (!userEntries || userEntries.length === 0) continue;
+    const docId = `${folderName}_${slugifyAccount(account)}`;
     fbService.syncToFirebaseREST('system_logs_daily', docId, {
-      date: store.date,
+      date: folderName,
       account,
-      count: entries.length,
-      logs: entries,
+      count: userEntries.length,
+      logs: userEntries,
       updatedAt: new Date().toISOString(),
     }, fbConfig);
   }
 }
 
 function recordDailyLog(entry) {
-  const today = vnDateStr();
-  if (dailyLogs.date !== today) {
-    // Sang ngày mới (giờ VN): flush nốt ngày cũ rồi mở store mới
-    const oldStore = dailyLogs;
-    const oldUsers = Object.keys(oldStore.users);
-    dailyLogs = { date: today, users: {} };
-    dailyLogsDirtyUsers.clear();
-    try { flushDailyLogsFor(oldStore, oldUsers); } catch { /* ignore */ }
-  }
+  const today = vnDateDDMMYYYY();
+  const entryWithDate = { ...entry, date: today };
+
+  ensureDailyLogsCurrent();
+
   const key = entry.account || 'system';
   if (!dailyLogs.users[key]) dailyLogs.users[key] = [];
-  dailyLogs.users[key].push(entry);
+  dailyLogs.users[key].push(entryWithDate);
   if (dailyLogs.users[key].length > MAX_DAILY_LOGS_PER_USER) dailyLogs.users[key].shift();
+
+  if (!dailyLogs.allLogs) dailyLogs.allLogs = [];
+  dailyLogs.allLogs.push(entryWithDate);
+  if (dailyLogs.allLogs.length > 20000) dailyLogs.allLogs.shift();
+
   dailyLogsDirtyUsers.add(key);
 }
 
-// Flush daily logs lên Firebase mỗi 60 giây (chỉ user có log mới)
+// Flush daily logs định kỳ mỗi 60 giây
 setInterval(() => {
   if (dailyLogsDirtyUsers.size === 0) return;
-  const users = [...dailyLogsDirtyUsers];
   dailyLogsDirtyUsers.clear();
-  try { flushDailyLogsFor(dailyLogs, users); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
+  try { flushDailyLogsFor(dailyLogs); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
 }, 60 * 1000);
 
-// Sync system_logs/latest (100 dòng gần nhất) debounce 15 giây —
-// trước đây sync từng dòng gây 1 Firestore write/log, rất nặng server
+// Sync system_logs/latest (100 dòng gần nhất) debounce 15 giây
 setInterval(() => {
   if (!latestLogsDirty) return;
   latestLogsDirty = false;
@@ -236,10 +341,12 @@ setInterval(() => {
 }, 15 * 1000);
 
 function addLog(entry) {
-  logHistory.push(entry);
+  ensureDailyLogsCurrent();
+  const datedEntry = { ...entry, date: vnDateDDMMYYYY() };
+  logHistory.push(datedEntry);
   if (logHistory.length > MAX_LOG) logHistory.shift();
-  io.emit('log', entry);
-  recordDailyLog(entry);
+  io.emit('log', datedEntry);
+  recordDailyLog(datedEntry);
   latestLogsDirty = true;
 }
 
@@ -261,6 +368,12 @@ const queues = new Map();   // queueId -> queue data
 // =================== QUEUE STATE PERSISTENCE ==============
 
 const QUEUE_STATE_FILE = path.join(__dirname, 'queue-state.json');
+const queueFileState = readStateDocument(QUEUE_STATE_FILE, 'queues');
+const queueStateSync = new SerializedStateSync({
+  label: 'queues', filePath: QUEUE_STATE_FILE, collection: 'system_queues', documentId: 'state',
+  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  initialRevision: queueFileState.revision,
+});
 
 function saveQueueState() {
   try {
@@ -285,15 +398,14 @@ function saveQueueState() {
         createdAt: queue.createdAt.toISOString(),
       });
     }
-    fs.writeFileSync(QUEUE_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-
-    // Auto sync to Firebase if configured
-    const fbConfig = fbService.loadFirebaseConfig();
-    if (fbConfig && fbConfig.projectId) {
-      fbService.syncToFirebaseREST('system_queues', 'state', { queues: state, updatedAt: new Date().toISOString() }, fbConfig);
-    }
+    const pending = queueStateSync.persist({ queues: state });
+    pending.catch(e => console.error('[STATE] Queue Firebase sync failed:', e.message));
+    return pending;
   } catch (e) {
     console.error('[STATE] Không thể lưu queue state:', e.message);
+    const failed = Promise.reject(e);
+    failed.catch(() => undefined);
+    return failed;
   }
 }
 
@@ -301,9 +413,14 @@ function loadAndRestoreQueues() {
   if (!fs.existsSync(QUEUE_STATE_FILE)) return;
   let state;
   try {
-    state = JSON.parse(fs.readFileSync(QUEUE_STATE_FILE, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(QUEUE_STATE_FILE, 'utf8'));
+    state = Array.isArray(parsed) ? parsed : parsed.queues;
   } catch (e) {
     console.error('[STATE] Không thể đọc queue state:', e.message);
+    return;
+  }
+  if (!Array.isArray(state)) {
+    console.error('[STATE] Queue state không đúng định dạng, bỏ qua khôi phục.');
     return;
   }
 
@@ -493,7 +610,7 @@ function loadAndRestoreQueues() {
 // Wrapper: emit queue-update VÀ persist state cùng lúc
 function updateQueue(queue) {
   io.emit('queue-update', getQueueStatus(queue));
-  saveQueueState();
+  return saveQueueState();
 }
 
 function getQueueStatus(queue) {
@@ -908,24 +1025,23 @@ function scheduleNextPair(queue) {
 
 // ==================== ACCOUNTS MGMT ========================
 
+const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
+const accountsFileState = readStateDocument(ACCOUNTS_FILE, 'accounts');
+const accountsStateSync = new SerializedStateSync({
+  label: 'accounts', filePath: ACCOUNTS_FILE, collection: 'system_accounts', documentId: 'list',
+  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  initialRevision: accountsFileState.revision,
+});
+
 function loadAccounts() {
-  const p = path.join(__dirname, 'accounts.json');
-  if (!fs.existsSync(p)) return [];
-  return JSON.parse(fs.readFileSync(p, 'utf8')).accounts || [];
+  if (!fs.existsSync(ACCOUNTS_FILE)) return [];
+  return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')).accounts || [];
 }
 
 function saveAccounts(accounts) {
-  fs.writeFileSync(
-    path.join(__dirname, 'accounts.json'),
-    JSON.stringify({ accounts }, null, 2),
-    'utf8'
-  );
-
-  // Auto sync to Firebase if configured
-  const fbConfig = fbService.loadFirebaseConfig();
-  if (fbConfig && fbConfig.projectId) {
-    fbService.syncToFirebaseREST('system_accounts', 'list', { accounts, updatedAt: new Date().toISOString() }, fbConfig);
-  }
+  const pending = accountsStateSync.persist({ accounts });
+  pending.catch(e => console.error('[ACCOUNTS] Firebase sync failed:', e.message));
+  return pending;
 }
 
 // ===================== ADMIN & FIREBASE API ==================
@@ -983,18 +1099,23 @@ app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
   }
   const saved = fbService.saveFirebaseConfig(config);
   if (saved) {
-    // Sync current accounts, state, and logs immediately to Firebase
-    const accounts = loadAccounts();
-    await fbService.syncToFirebaseREST('system_accounts', 'list', { accounts, updatedAt: new Date().toISOString() }, config);
-    await fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, config);
-    await fbService.syncToFirebaseREST('system_settings', 'config_info', {
-      updatedAt: new Date().toISOString(),
-      status: 'connected',
-    }, config);
-
-    saveQueueState();
-    saveAutoScanState();
-    return res.json({ ok: true, connected: true });
+    try {
+      const directResults = await Promise.all([
+        fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, config),
+        fbService.syncToFirebaseREST('system_settings', 'config_info', { updatedAt: new Date().toISOString(), status: 'connected' }, config),
+      ]);
+      if (directResults.some(ok => !ok)) throw new Error('Firebase rejected initial connection data');
+      await Promise.all([
+        saveAccounts(loadAccounts()),
+        savePresets(loadPresets()),
+        saveAutoPresets(loadAutoPresets()),
+        saveQueueState(),
+        saveAutoScanState(),
+      ]);
+      return res.json({ ok: true, connected: true });
+    } catch (error) {
+      return res.status(503).json({ ok: false, connected: false, error: `Không thể đồng bộ đầy đủ Firebase: ${error.message}` });
+    }
   }
   res.status(500).json({ error: 'Không thể lưu file cấu hình Firebase' });
 });
@@ -1014,27 +1135,25 @@ app.get('/lythuyet/api/accounts', (req, res) => {
 });
 
 // Thêm tài khoản
-app.post('/lythuyet/api/accounts', (req, res) => {
+app.post('/lythuyet/api/accounts', async (req, res) => {
   const { name, email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Cần email và mật khẩu' });
   const accounts = loadAccounts();
   accounts.push({ name: name || email, email, password });
-  saveAccounts(accounts);
-  res.json({ ok: true, count: accounts.length });
+  return respondAfterStateSync(res, saveAccounts(accounts), { ok: true, count: accounts.length });
 });
 
 // Xóa tài khoản
-app.delete('/lythuyet/api/accounts/:index', (req, res) => {
+app.delete('/lythuyet/api/accounts/:index', async (req, res) => {
   const idx = parseInt(req.params.index) - 1;
   const accounts = loadAccounts();
   if (idx < 0 || idx >= accounts.length) return res.status(404).json({ error: 'Không tìm thấy' });
   accounts.splice(idx, 1);
-  saveAccounts(accounts);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAccounts(accounts), { ok: true });
 });
 
 // Sửa tài khoản
-app.put('/lythuyet/api/accounts/:index', (req, res) => {
+app.put('/lythuyet/api/accounts/:index', async (req, res) => {
   const idx = parseInt(req.params.index) - 1;
   const accounts = loadAccounts();
   if (idx < 0 || idx >= accounts.length) return res.status(404).json({ error: 'Không tìm thấy' });
@@ -1042,8 +1161,7 @@ app.put('/lythuyet/api/accounts/:index', (req, res) => {
   if (name) accounts[idx].name = name;
   if (email) accounts[idx].email = email;
   if (password) accounts[idx].password = password;
-  saveAccounts(accounts);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAccounts(accounts), { ok: true });
 });
 
 // Lấy trạng thái tất cả sessions
@@ -1056,7 +1174,7 @@ app.get('/lythuyet/api/sessions', (req, res) => {
 });
 
 // Bắt đầu treo bài (hàng chờ cặp)
-app.post('/lythuyet/api/start', (req, res) => {
+app.post('/lythuyet/api/start', async (req, res) => {
   const { pairs, startHour, delayStart, scheduledDateTime, accountIndices, time, refreshInterval, stealthInterval, randomStartMin, randomStartMax } = req.body;
 
   if (!pairs || !Array.isArray(pairs) || pairs.length === 0) {
@@ -1206,7 +1324,7 @@ app.post('/lythuyet/api/start', (req, res) => {
     started.push({ queueId, account: account.name, pairs: pairs.length });
   }
 
-  res.json({ ok: true, started });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true, started });
 });
 
 // Dừng session
@@ -1214,7 +1332,7 @@ app.post('/lythuyet/api/stop/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   await session.stop();
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true });
 });
 
 // F5 thủ công
@@ -1227,7 +1345,7 @@ app.post('/lythuyet/api/refresh/:id', async (req, res) => {
 });
 
 // Tạm dừng session
-app.post('/lythuyet/api/pause-session/:id', (req, res) => {
+app.post('/lythuyet/api/pause-session/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   if (!session.pause()) return res.status(400).json({ error: 'Session không đang chạy' });
@@ -1239,11 +1357,11 @@ app.post('/lythuyet/api/pause-session/:id', (req, res) => {
       updateQueue(queue);
     }
   }
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true });
 });
 
 // Tiếp tục session
-app.post('/lythuyet/api/resume-session/:id', (req, res) => {
+app.post('/lythuyet/api/resume-session/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   if (!session.resume()) return res.status(400).json({ error: 'Session không đang tạm dừng' });
@@ -1254,7 +1372,7 @@ app.post('/lythuyet/api/resume-session/:id', (req, res) => {
       updateQueue(queue);
     }
   }
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true });
 });
 
 // D\u1EEBng t\u1EA5t c\u1EA3
@@ -1276,7 +1394,7 @@ app.post('/lythuyet/api/stop-all', async (req, res) => {
     }
   }
   await Promise.all(promises);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true });
 });
 
 // L\u1EA5y h\u00E0ng ch\u1EDD
@@ -1310,8 +1428,7 @@ app.post('/lythuyet/api/cancel-queue/:id', async (req, res) => {
       await session.stop();
     }
   }
-  updateQueue(queue);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, updateQueue(queue), { ok: true });
 });
 
 // =================== PRESETS API ===========================
@@ -1322,7 +1439,7 @@ app.get('/lythuyet/api/presets', (req, res) => {
 });
 
 // Tạo hoặc Cập nhật Mẫu Preset
-app.post('/lythuyet/api/presets', (req, res) => {
+app.post('/lythuyet/api/presets', async (req, res) => {
   const { name, boxes } = req.body;
   if (!name || !boxes || !Array.isArray(boxes) || boxes.length === 0) {
     return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách Box hợp lệ' });
@@ -1337,12 +1454,11 @@ app.post('/lythuyet/api/presets', (req, res) => {
   };
 
   presets.unshift(newPreset);
-  savePresets(presets);
-  res.json({ ok: true, preset: newPreset });
+  return respondAfterStateSync(res, savePresets(presets), { ok: true, preset: newPreset });
 });
 
 // Xóa Mẫu Preset
-app.delete('/lythuyet/api/presets/:id', (req, res) => {
+app.delete('/lythuyet/api/presets/:id', async (req, res) => {
   const { id } = req.params;
   let presets = loadPresets();
   const initialLen = presets.length;
@@ -1350,8 +1466,7 @@ app.delete('/lythuyet/api/presets/:id', (req, res) => {
   if (presets.length === initialLen) {
     return res.status(404).json({ error: 'Không tìm thấy Preset' });
   }
-  savePresets(presets);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, savePresets(presets), { ok: true });
 });
 
 // =================== AUTO-SCAN PRESETS API =================
@@ -1361,7 +1476,7 @@ app.get('/lythuyet/api/auto-presets', (req, res) => {
 });
 
 // Tạo Mẫu Preset Auto-Scan (lưu toàn bộ cấu hình form)
-app.post('/lythuyet/api/auto-presets', (req, res) => {
+app.post('/lythuyet/api/auto-presets', async (req, res) => {
   const { name, config } = req.body;
   if (!name || !config || !Array.isArray(config.courses) || config.courses.length === 0) {
     return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách khóa học hợp lệ' });
@@ -1376,12 +1491,11 @@ app.post('/lythuyet/api/auto-presets', (req, res) => {
   };
 
   presets.unshift(newPreset);
-  saveAutoPresets(presets);
-  res.json({ ok: true, preset: newPreset });
+  return respondAfterStateSync(res, saveAutoPresets(presets), { ok: true, preset: newPreset });
 });
 
 // Xóa Mẫu Preset Auto-Scan
-app.delete('/lythuyet/api/auto-presets/:id', (req, res) => {
+app.delete('/lythuyet/api/auto-presets/:id', async (req, res) => {
   const { id } = req.params;
   let presets = loadAutoPresets();
   const initialLen = presets.length;
@@ -1389,8 +1503,7 @@ app.delete('/lythuyet/api/auto-presets/:id', (req, res) => {
   if (presets.length === initialLen) {
     return res.status(404).json({ error: 'Không tìm thấy Preset' });
   }
-  saveAutoPresets(presets);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAutoPresets(presets), { ok: true });
 });
 
 // =================== DELETE QUEUES API =====================
@@ -1408,9 +1521,8 @@ app.delete('/lythuyet/api/queues/:id', async (req, res) => {
   }
 
   queues.delete(queueId);
-  saveQueueState();
   io.emit('queue-deleted', queueId);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true });
 });
 
 // Xóa tất cả hàng chờ đã hoàn thành / kết thúc / lỗi / hủy
@@ -1427,9 +1539,8 @@ app.post('/lythuyet/api/queues/clear-completed', async (req, res) => {
       clearedCount++;
     }
   }
-  saveQueueState();
   io.emit('queues-cleared');
-  res.json({ ok: true, count: clearedCount });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true, count: clearedCount });
 });
 
 // =================== AUTO-SCAN COURSES API =================
@@ -1437,6 +1548,13 @@ app.post('/lythuyet/api/queues/clear-completed', async (req, res) => {
 const autoScanSessions = new Map();
 const autoScanResumeTimers = new Map(); // sessionId -> timeout hẹn giờ chạy lại
 const AUTOSCAN_STATE_FILE = path.join(__dirname, 'autoscan-state.json');
+const autoScanFileState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
+const autoScanStateSync = new SerializedStateSync({
+  label: 'auto-scan', filePath: AUTOSCAN_STATE_FILE,
+  collection: 'system_autoscan', documentId: 'state',
+  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  initialRevision: autoScanFileState.revision,
+});
 
 // Lưu trạng thái Auto-Scan ra file + đồng bộ Firebase (giống Queue thủ công)
 function saveAutoScanState() {
@@ -1447,16 +1565,7 @@ function saveAutoScanState() {
         id: s.id,
         account: s.account,
         coursesConfig: s.coursesConfig,
-        options: {
-          dailyMaxMinutes: s.options.dailyMaxMinutes,
-          allowedDateRanges: s.options.allowedDateRanges,
-          newDayStartTime: s.options.newDayStartTime || '06:00',
-          refreshInterval: s.options.refreshInterval || 15,
-          stealthInterval: s.options.stealthInterval || 30,
-          stealth: s.options.stealth === true,
-          timeWindows: s.options.timeWindows || [],
-          customTimeRules: s.options.customTimeRules || [],
-        },
+        options: getPersistentAutoCourseOptions(s.options),
         status: s.status,
         pausedFromStatus: s.pausedFromStatus || null,
         currentCourseIndex: s.currentCourseIndex,
@@ -1468,15 +1577,14 @@ function saveAutoScanState() {
         completedAt: s.completedAt || null,
       });
     }
-    fs.writeFileSync(AUTOSCAN_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-
-    // Auto sync to Firebase if configured
-    const fbConfig = fbService.loadFirebaseConfig();
-    if (fbConfig && fbConfig.projectId) {
-      fbService.syncToFirebaseREST('system_autoscan', 'state', { autoScans: state, updatedAt: new Date().toISOString() }, fbConfig);
-    }
+    const pending = autoScanStateSync.persist({ autoScans: state });
+    pending.catch(e => console.error('[STATE] Auto-Scan Firebase sync failed:', e.message));
+    return pending;
   } catch (e) {
     console.error('[STATE] Không thể lưu auto-scan state:', e.message);
+    const failed = Promise.reject(e);
+    failed.catch(() => undefined);
+    return failed;
   }
 }
 
@@ -1524,7 +1632,7 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     io.emit('autoscan-status', { ...status, nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
     saveAutoScanState();
     // Chạm giới hạn ngày / ngày nghỉ / hết khung giờ học → tự hẹn giờ chạy lại (giống Queue thủ công)
-    if (status.status === 'date-limit' || status.status === 'daily-limit' || status.status === 'time-window') {
+    if (status.status === 'date-limit' || status.status === 'daily-limit' || status.status === 'time-window' || status.status === 'next-day') {
       scheduleAutoScanResume(autoSession);
     }
   });
@@ -1545,6 +1653,13 @@ function scheduleAutoScanResume(autoSession) {
   let resumeAt;
   if (autoSession.status === 'time-window' && (autoSession.options.timeWindows || []).length > 0) {
     resumeAt = new Date(Date.now() + calcNextWindowMs(autoSession.options.timeWindows));
+  } else if (autoSession.status === 'date-limit' && (autoSession.options.customTimeRules || []).length > 0) {
+    resumeAt = getNextShiftStart(
+      new Date(),
+      autoSession.options.customTimeRules,
+      autoSession.options.allowedDateRanges || [],
+      autoSession.options.newDayStartTime || '06:00'
+    );
   } else {
     resumeAt = getNextAllowedStudyDate(
       new Date(),
@@ -1568,21 +1683,11 @@ function scheduleAutoScanResume(autoSession) {
 function restartAutoScanSession(sessionId) {
   const old = autoScanSessions.get(sessionId);
   if (!old) return;
-  if (old.status !== 'date-limit' && old.status !== 'daily-limit' && old.status !== 'time-window') return;
+  if (old.status !== 'date-limit' && old.status !== 'daily-limit' && old.status !== 'time-window' && old.status !== 'next-day') return;
 
   const fresh = createAutoScanSession(sessionId, old.account, old.coursesConfig, {
     headless: true,
-    dailyMaxMinutes: old.options.dailyMaxMinutes,
-    allowedDateRanges: old.options.allowedDateRanges,
-    newDayStartTime: old.options.newDayStartTime || '06:00',
-    refreshInterval: old.options.refreshInterval || 15,
-    stealth: old.options.stealth === true,
-    stealthInterval: old.options.stealthInterval || 30,
-    timeWindows: old.options.timeWindows || [],
-    customTimeRules: old.options.customTimeRules || [],
-    initialDailyMinutesToggle: old.options.initialDailyMinutesToggle === true,
-    initialDailyMinutes: old.options.initialDailyMinutes || 0,
-    initialDailyDate: old.options.initialDailyDate || null,
+    ...getPersistentAutoCourseOptions(old.options),
   }, {
     createdAt: old.createdAt,
     dailyStudiedMinutes: old.dailyStudiedMinutes,
@@ -1603,7 +1708,9 @@ function restartAutoScanSession(sessionId) {
 // Khôi phục các phiên Auto-Scan từ lần chạy trước (nếu server bị restart hoặc từ Firebase)
 async function loadAndRestoreAutoScans() {
   let state = null;
-  if (fs.existsSync(AUTOSCAN_STATE_FILE)) {
+  const localState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
+  if (localState.available) state = localState.data;
+  if (!localState.available && fs.existsSync(AUTOSCAN_STATE_FILE)) {
     try {
       state = JSON.parse(fs.readFileSync(AUTOSCAN_STATE_FILE, 'utf8'));
     } catch (e) {
@@ -1611,13 +1718,14 @@ async function loadAndRestoreAutoScans() {
     }
   }
 
-  // Nếu file local rỗng/không có, thử đọc từ Firebase REST
-  if (!state || !Array.isArray(state) || state.length === 0) {
+  // Chỉ dùng Firebase để recovery khi file local không tồn tại hoặc bị lỗi định dạng.
+  if (!localState.available) {
     const fbConfig = fbService.loadFirebaseConfig();
     if (fbConfig && fbConfig.projectId) {
       try {
-        const fbData = await fbService.fetchFromFirebaseREST('system_autoscan', fbConfig);
+        const fbData = await fbService.fetchFromFirebaseREST('system_autoscan', fbConfig, 'state');
         if (fbData && fbData[0] && Array.isArray(fbData[0].autoScans)) {
+          autoScanStateSync.ensureRevisionAtLeast(fbData[0].revision);
           state = fbData[0].autoScans;
           console.log(`[FIREBASE] Đã lấy ${state.length} phiên Auto-Scan từ Firebase REST.`);
         }
@@ -1632,20 +1740,7 @@ async function loadAndRestoreAutoScans() {
   let active = 0;
   for (const saved of state) {
     if (!saved || !saved.id || !saved.account) continue;
-    const options = {
-      headless: true,
-      dailyMaxMinutes: (saved.options && saved.options.dailyMaxMinutes) || 480,
-      allowedDateRanges: (saved.options && saved.options.allowedDateRanges) || [],
-      newDayStartTime: (saved.options && saved.options.newDayStartTime) || '06:00',
-      refreshInterval: (saved.options && saved.options.refreshInterval) || 15,
-      stealth: !!(saved.options && saved.options.stealth),
-      stealthInterval: (saved.options && saved.options.stealthInterval) || 30,
-      timeWindows: (saved.options && saved.options.timeWindows) || [],
-      customTimeRules: (saved.options && saved.options.customTimeRules) || [],
-      initialDailyMinutesToggle: !!(saved.options && saved.options.initialDailyMinutesToggle),
-      initialDailyMinutes: (saved.options && saved.options.initialDailyMinutes) || 0,
-      initialDailyDate: (saved.options && saved.options.initialDailyDate) || null,
-    };
+    const options = { headless: true, ...getPersistentAutoCourseOptions(saved.options || {}) };
     const s = createAutoScanSession(saved.id, saved.account, saved.coursesConfig || [], options, {
       createdAt: saved.createdAt,
       dailyStudiedMinutes: saved.dailyStudiedMinutes || 0,
@@ -1688,7 +1783,7 @@ async function loadAndRestoreAutoScans() {
       s.nextRunTime = null;
       setTimeout(() => startAutoScanWhenFree(s), 5000);
       active++;
-    } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window') {
+    } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window' || saved.status === 'next-day') {
       const fireAt = saved.nextRunTime
         ? new Date(saved.nextRunTime)
         : (saved.status === 'time-window' && options.timeWindows.length > 0)
@@ -1706,6 +1801,7 @@ async function loadAndRestoreAutoScans() {
     }
   }
 
+  await saveAutoScanState();
   if (state.length > 0) {
     console.log(`[STATE] Khôi phục ${state.length} phiên Auto-Scan (${active} hoạt động/đang hẹn giờ).`);
   }
@@ -1719,7 +1815,7 @@ function findAccountConflict(email, excludeSessionId) {
   if (activeManual) return `phiên thủ công ${activeManual.id}`;
   const activeAuto = [...autoScanSessions.values()].find(
     s => s.id !== excludeSessionId && s.account.email === email
-      && (s.status === 'idle' || s.status === 'scanning' || s.status === 'studying' || s.status === 'logging-in')
+      && isAutoCourseAccountBlockingStatus(s.status)
   );
   if (activeAuto) return `phiên Auto-Scan ${activeAuto.id}`;
   return null;
@@ -1799,8 +1895,7 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
     started.push({ sessionId, account: acc.name });
   }
 
-  saveAutoScanState();
-  res.json({ ok: true, started });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true, started });
 });
 
 // Điều chỉnh thời gian đã học hôm nay cho phiên Auto-Scan
@@ -1810,8 +1905,7 @@ app.post('/lythuyet/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
 
   const { minutes } = req.body;
   const newMins = autoSession.setDailyStudiedMinutes(minutes);
-  saveAutoScanState();
-  res.json({ ok: true, dailyStudiedMinutes: newMins });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true, dailyStudiedMinutes: newMins });
 });
 
 // Tạm dừng 1 phiên Auto-Scan
@@ -1823,8 +1917,7 @@ app.post('/lythuyet/api/auto-scan/pause/:id', async (req, res) => {
   if (!paused) return res.status(400).json({ error: 'Không thể tạm dừng (phiên không đang hoạt động)' });
 
   io.emit('autoscan-status', autoSession.getStatus());
-  saveAutoScanState();
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
 });
 
 // Tiếp tục 1 phiên Auto-Scan
@@ -1844,13 +1937,7 @@ app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
     // → tạo lại phiên mới cùng ID từ tiến độ đã lưu (giống Queue thủ công resume sau restart)
     const fresh = createAutoScanSession(autoSession.id, autoSession.account, autoSession.coursesConfig, {
       headless: true,
-      dailyMaxMinutes: autoSession.options.dailyMaxMinutes,
-      allowedDateRanges: autoSession.options.allowedDateRanges,
-      newDayStartTime: autoSession.options.newDayStartTime || '06:00',
-      refreshInterval: autoSession.options.refreshInterval || 15,
-      stealth: autoSession.options.stealth === true,
-      stealthInterval: autoSession.options.stealthInterval || 30,
-      timeWindows: autoSession.options.timeWindows || [],
+      ...getPersistentAutoCourseOptions(autoSession.options),
     }, {
       createdAt: autoSession.createdAt,
       dailyStudiedMinutes: autoSession.dailyStudiedMinutes,
@@ -1866,8 +1953,7 @@ app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
     startAutoScanWhenFree(fresh);
   }
 
-  saveAutoScanState();
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
 });
 
 // Dừng 1 phiên Auto-Scan theo yêu cầu từ Dashboard (hủy cả lịch hẹn nếu có)
@@ -1887,8 +1973,7 @@ app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
     msg: '⏹ Đã dừng phiên Auto-Scan theo yêu cầu',
     level: 'warn',
   });
-  saveAutoScanState();
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
 });
 
 // Xóa tất cả phiên Auto-Scan đã kết thúc (hoàn thành / dừng / lỗi) khỏi Dashboard
@@ -1904,8 +1989,7 @@ app.post('/lythuyet/api/auto-scan/clear-completed', async (req, res) => {
       clearedCount++;
     }
   }
-  saveAutoScanState();
-  res.json({ ok: true, count: clearedCount });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true, count: clearedCount });
 });
 
 // Xóa thẻ phiên Auto-Scan khỏi Dashboard (hủy cả lịch hẹn nếu có)
@@ -1918,8 +2002,7 @@ app.delete('/lythuyet/api/auto-scan/sessions/:id', async (req, res) => {
   autoSession.removeAllListeners('status');
   autoScanSessions.delete(req.params.id);
   io.emit('autoscan-removed', req.params.id);
-  saveAutoScanState();
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
 });
 
 // Tạm dừng hàng chờ
@@ -1951,12 +2034,11 @@ app.post('/lythuyet/api/pause-queue/:id', async (req, res) => {
     msg: `⏸ Tạm dừng hàng chờ (box ${queue.currentPairIndex + 1}/${queue.pairs.length})`,
     level: 'info',
   });
-  updateQueue(queue);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, updateQueue(queue), { ok: true });
 });
 
 // Tiếp tục hàng chờ
-app.post('/treohoc/api/resume-queue/:id', requireAdmin, (req, res) => {
+app.post('/treohoc/api/resume-queue/:id', requireAdmin, async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (queue.status !== 'paused') {
@@ -2003,12 +2085,11 @@ app.post('/treohoc/api/resume-queue/:id', requireAdmin, (req, res) => {
     msg: `▶️ Tiếp tục hàng chờ (box ${queue.currentPairIndex + 1}/${queue.pairs.length})`,
     level: 'info',
   });
-  updateQueue(queue);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, updateQueue(queue), { ok: true });
 });
 
 // Đôn hàng chờ - chạy ngay box đang đợi
-app.post('/lythuyet/api/rush-queue/:id', (req, res) => {
+app.post('/lythuyet/api/rush-queue/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue kh\u00F4ng t\u00ECm th\u1EA5y' });
   if (queue.status !== 'waiting' && queue.status !== 'time-limit') return res.status(400).json({ error: 'Queue kh\u00F4ng \u0111ang ch\u1EDD' });
@@ -2026,11 +2107,11 @@ app.post('/lythuyet/api/rush-queue/:id', (req, res) => {
     delete queue.timeLimitData;
   }
   startPairForQueue(queue);
-  res.json({ ok: true });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true });
 });
 
 // Thêm box vào hàng chờ đang tồn tại
-app.post('/lythuyet/api/add-pairs/:id', (req, res) => {
+app.post('/lythuyet/api/add-pairs/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (queue.status === 'cancelled' || queue.status === 'completed') {
@@ -2076,12 +2157,11 @@ app.post('/lythuyet/api/add-pairs/:id', (req, res) => {
     msg: `➕ Thêm ${pairs.length} box mới (tổng: ${queue.pairs.length} box)${optNote}${schedNote}`,
     level: 'success',
   });
-  updateQueue(queue);
-  res.json({ ok: true, totalPairs: queue.pairs.length });
+  return respondAfterStateSync(res, updateQueue(queue), { ok: true, totalPairs: queue.pairs.length });
 });
 
 // Chạy lại queue (completed/error/cancelled)
-app.post('/lythuyet/api/retry-queue/:id', (req, res) => {
+app.post('/lythuyet/api/retry-queue/:id', async (req, res) => {
   const oldQueue = queues.get(req.params.id);
   if (!oldQueue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (oldQueue.status === 'running' || oldQueue.status === 'waiting') {
@@ -2113,11 +2193,11 @@ app.post('/lythuyet/api/retry-queue/:id', (req, res) => {
     level: 'info',
   });
   startPairForQueue(queue);
-  res.json({ ok: true, queueId });
+  return respondAfterStateSync(res, saveQueueState(), { ok: true, queueId });
 });
 
 // Sửa pairs trong queue (chỉ sửa được box chưa chạy)
-app.put('/lythuyet/api/edit-queue/:id', (req, res) => {
+app.put('/lythuyet/api/edit-queue/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
 
@@ -2188,19 +2268,149 @@ app.put('/lythuyet/api/edit-queue/:id', (req, res) => {
     });
   }
 
-  updateQueue(queue);
-  res.json({ ok: true, totalPairs: queue.pairs.length });
+  return respondAfterStateSync(res, updateQueue(queue), { ok: true, totalPairs: queue.pairs.length });
 });
 
-// Lấy log
+// Lấy danh sách các folder logs theo ngày (DD-MM-YYYY)
+app.get('/lythuyet/api/logs/folders', (req, res) => {
+  try {
+    ensureDailyLogsCurrent();
+    const today = vnDateDDMMYYYY();
+    const folderMap = new Map();
+
+    folderMap.set(today, {
+      date: today,
+      count: dailyLogs.allLogs ? dailyLogs.allLogs.length : 0,
+      isToday: true,
+    });
+
+    if (fs.existsSync(LOGS_DAILY_DIR)) {
+      const dirs = fs.readdirSync(LOGS_DAILY_DIR, { withFileTypes: true });
+      for (const d of dirs) {
+        if (d.isDirectory()) {
+          const folderName = formatToDDMMYYYY(d.name);
+          const logsFile = path.join(LOGS_DAILY_DIR, d.name, 'logs.json');
+          let count = 0;
+          if (folderName === today && dailyLogs.allLogs) {
+            count = dailyLogs.allLogs.length;
+          } else if (fs.existsSync(logsFile)) {
+            try {
+              const fileData = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
+              count = filterLogsForDate(fileData, folderName, true).length;
+            } catch { count = 0; }
+          }
+          folderMap.set(folderName, {
+            date: folderName,
+            count,
+            isToday: folderName === today,
+          });
+        }
+      }
+    }
+
+    const folders = Array.from(folderMap.values()).sort((a, b) => {
+      const [da, ma, ya] = a.date.split('-').map(Number);
+      const [db, mb, yb] = b.date.split('-').map(Number);
+      const ta = (ya || 0) * 10000 + (ma || 0) * 100 + (da || 0);
+      const tb = (yb || 0) * 10000 + (mb || 0) * 100 + (db || 0);
+      return tb - ta;
+    });
+
+    res.json(folders);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lấy toàn bộ logs theo ngày (date=DD-MM-YYYY hoặc YYYY-MM-DD)
+app.get('/lythuyet/api/logs/by-date', (req, res) => {
+  ensureDailyLogsCurrent();
+  const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
+  if (!reqDate) return res.status(400).json({ error: 'Ngày log không hợp lệ' });
+  const today = vnDateDDMMYYYY();
+
+  if (reqDate === today && dailyLogs.allLogs) {
+    return res.json({ date: today, logs: filterLogsForDate(dailyLogs.allLogs, today, true), isToday: true });
+  }
+
+  const targetDir = path.join(LOGS_DAILY_DIR, reqDate);
+  const targetFile = path.join(targetDir, 'logs.json');
+
+  if (fs.existsSync(targetFile)) {
+    try {
+      const logs = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
+      return res.json({ date: reqDate, logs: filterLogsForDate(logs, reqDate, true), isToday: false });
+    } catch (e) {
+      return res.status(500).json({ error: 'Lỗi đọc file log: ' + e.message });
+    }
+  }
+
+  res.json({ date: reqDate, logs: [], isToday: reqDate === today });
+});
+
+// Xóa folder / xóa logs của một ngày
+app.delete('/lythuyet/api/logs/by-date', async (req, res) => {
+  const reqDate = formatToDDMMYYYY(req.query.date);
+  if (!reqDate) return res.status(400).json({ error: 'Thiếu hoặc sai tham số date' });
+  const today = vnDateDDMMYYYY();
+
+  if (reqDate === today) {
+    dailyLogs.users = {};
+    dailyLogs.allLogs = [];
+    logHistory.length = 0;
+  }
+
+  const targetDir = path.join(LOGS_DAILY_DIR, reqDate);
+  if (fs.existsSync(targetDir)) {
+    try {
+      fs.rmSync(targetDir, { recursive: true, force: true });
+    } catch (e) {
+      return res.status(500).json({ error: 'Không thể xóa folder log: ' + e.message });
+    }
+  }
+
+  if (reqDate === today) {
+    try {
+      writeJsonAtomicSync(DAILY_LOGS_FILE, dailyLogs);
+    } catch (e) {
+      return res.status(500).json({ error: 'Không thể cập nhật daily logs local: ' + e.message });
+    }
+  }
+
+  const fbConfig = fbService.loadFirebaseConfig();
+  if (fbConfig && fbConfig.projectId) {
+    const deleted = await fbService.deleteDocumentsByPrefixREST('system_logs_daily', `${reqDate}_`, fbConfig);
+    if (!deleted) {
+      return res.status(503).json({
+        ok: false,
+        localApplied: true,
+        error: `Đã xóa logs local ngày ${reqDate} nhưng Firebase chưa xác nhận xóa`,
+      });
+    }
+  }
+
+  addLog({
+    timestamp: formatVN(new Date()),
+    account: 'system',
+    msg: `🗑️ Đã xóa logs ngày ${reqDate}`,
+    level: 'info',
+  });
+
+  res.json({ ok: true, date: reqDate });
+});
+
+// Lấy log gần nhất
 app.get('/lythuyet/api/logs', (req, res) => {
-  res.json(logHistory);
+  ensureDailyLogsCurrent();
+  const today = vnDateDDMMYYYY();
+  res.json(filterLogsForDate(logHistory, today, true));
 });
 
 // =================== SOCKET.IO =============================
 
 io.on('connection', (socket) => {
   console.log(`[WEB] Client connected: ${socket.id}`);
+  ensureDailyLogsCurrent();
 
   const sessionList = [];
   for (const [id, session] of sessions) {
@@ -2214,7 +2424,12 @@ io.on('connection', (socket) => {
   for (const [id, autoSession] of autoScanSessions) {
     autoScanList.push({ ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
   }
-  socket.emit('init', { sessions: sessionList, queues: queueList, autoScans: autoScanList, logs: logHistory.slice(-100) });
+  socket.emit('init', {
+    sessions: sessionList,
+    queues: queueList,
+    autoScans: autoScanList,
+    logs: filterLogsForDate(logHistory, vnDateDDMMYYYY(), true).slice(-100),
+  });
 
   socket.on('disconnect', () => {
     console.log(`[WEB] Client disconnected: ${socket.id}`);
@@ -2227,7 +2442,9 @@ io.on('connection', (socket) => {
 loadAndRestoreQueues();
 
 // Khôi phục các phiên Auto-Scan từ lần chạy trước
-loadAndRestoreAutoScans();
+const autoScanRestorePromise = loadAndRestoreAutoScans().catch(error => {
+  console.error('[STATE] Auto-Scan restore failed:', error.message);
+});
 
 // SPA fallback
 app.get('/treohoc/*', (req, res) => {
@@ -2237,11 +2454,11 @@ app.get('/treohoc', (req, res) => {
   res.redirect('/treohoc/');
 });
 
-server.listen(PORT, () => {
+autoScanRestorePromise.finally(() => server.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
 ║   TREO HỌC LÝ THUYẾT - Web Dashboard       ║
 ║   http://localhost:${PORT}                       ║
 ╚══════════════════════════════════════════════╝
   `);
-});
+}));
