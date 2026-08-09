@@ -4,6 +4,7 @@ const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, readDomT
 
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
+const SESSION_LOG_SEPARATOR = '---------------------------------------------------------';
 
 function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted = false) {
   const target = Math.max(0, Number(targetMinutes) || 0);
@@ -76,6 +77,7 @@ class AutoCourseSession extends EventEmitter {
     this._stealthTimer = null;
     this._pauseStartedAt = null;
     this._totalPausedMs = 0;
+    this._sessionSeparatorLogged = false;
   }
 
   _randomBetween(min, max) {
@@ -398,6 +400,12 @@ class AutoCourseSession extends EventEmitter {
     console.log(`[${timestamp}] [AUTO-COURSE: ${this.account.name}] ${msg}`);
   }
 
+  _logSessionSeparator() {
+    if (this._sessionSeparatorLogged) return;
+    this._sessionSeparatorLogged = true;
+    this.log(SESSION_LOG_SEPARATOR, 'separator');
+  }
+
   getStatus() {
     return {
       id: this.id,
@@ -514,6 +522,7 @@ class AutoCourseSession extends EventEmitter {
   }
 
   async start() {
+    this._logSessionSeparator();
     this.log(`🤖 Khởi động Auto-Scan khóa học cho ${this.account.name}`, 'info');
 
     // 1. Kiểm tra Lịch Ngày Học Được Phép

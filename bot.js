@@ -8,6 +8,7 @@ const EventEmitter = require('events');
 
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
+const SESSION_LOG_SEPARATOR = '---------------------------------------------------------';
 
 class BotSession extends EventEmitter {
   constructor(id, account, lessonUrls, options = {}) {
@@ -40,6 +41,7 @@ class BotSession extends EventEmitter {
     this.errorMsg = null;
     this.refreshCount = 0;
     this._stopped = false;
+    this._sessionSeparatorLogged = false;
   }
 
   // ======================== HELPERS ===========================
@@ -49,6 +51,12 @@ class BotSession extends EventEmitter {
     const entry = { timestamp, account: this.account.name, msg, level, sessionId: this.id };
     this.emit('log', entry);
     console.log(`[${timestamp}] [${this.account.name}] ${msg}`);
+  }
+
+  _logSessionSeparator() {
+    if (this._sessionSeparatorLogged) return;
+    this._sessionSeparatorLogged = true;
+    this.log(SESSION_LOG_SEPARATOR, 'separator');
   }
 
   formatTime(ms) {
@@ -475,6 +483,7 @@ class BotSession extends EventEmitter {
   // ===================== PUBLIC API ==========================
 
   async start() {
+    this._logSessionSeparator();
     this.log(`🚀 Khởi động bot cho ${this.account.name} - ${this.lessonUrls.length} bài`, 'info');
 
     try {
