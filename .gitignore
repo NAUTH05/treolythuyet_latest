@@ -14,3 +14,6 @@ firebase-config.json
 .DS_Store
 .claude/
 treohoclythuyet_correctUI/
+web.assets_frontend_lazy.min_odoo.js
+web.assets_frontend_minimal.min_odoo.js
+*.txt
