@@ -6,7 +6,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { BotSession } = require('./bot');
 const { AutoCourseSession } = require('./autoCourseEngine');
-const { isAllowedStudyDate, getNextAllowedStudyDate } = require('./courseScanner');
+const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
+const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
 
 const ADMIN_CONFIG_FILE = path.join(__dirname, 'admin-config.json');
@@ -151,26 +152,6 @@ if (!fs.existsSync(LOGS_DAILY_DIR)) {
   try { fs.mkdirSync(LOGS_DAILY_DIR, { recursive: true }); } catch { /* ignore */ }
 }
 
-function vnDateStr(d = new Date()) {
-  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
-}
-
-function vnDateDDMMYYYY(d = new Date()) {
-  const parts = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).split('-');
-  return `${parts[2]}-${parts[1]}-${parts[0]}`;
-}
-
-function formatToDDMMYYYY(str) {
-  if (!str) return vnDateDDMMYYYY();
-  const cleaned = String(str).trim();
-  if (/^\d{2}-\d{2}-\d{4}$/.test(cleaned)) return cleaned;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
-    const [y, m, d] = cleaned.split('-');
-    return `${d}-${m}-${y}`;
-  }
-  return cleaned;
-}
-
 function slugifyAccount(name) {
   return String(name || 'system')
     .normalize('NFD')
@@ -199,6 +180,7 @@ function initDailyLogsStore() {
       const legacy = JSON.parse(fs.readFileSync(DAILY_LOGS_FILE, 'utf8'));
       if (legacy && legacy.date && legacy.users) {
         const legacyDateFormatted = formatToDDMMYYYY(legacy.date);
+        if (!legacyDateFormatted) throw new Error(`Ngày log legacy không hợp lệ: ${legacy.date}`);
         const legacyDir = path.join(LOGS_DAILY_DIR, legacyDateFormatted);
         if (!fs.existsSync(legacyDir)) {
           fs.mkdirSync(legacyDir, { recursive: true });
@@ -224,7 +206,9 @@ function initDailyLogsStore() {
   let loadedEntries = [];
   if (fs.existsSync(todayFile)) {
     try {
-      loadedEntries = JSON.parse(fs.readFileSync(todayFile, 'utf8'));
+      const fileEntries = JSON.parse(fs.readFileSync(todayFile, 'utf8'));
+      loadedEntries = filterLogsForDate(fileEntries, today, true)
+        .map(entry => ({ ...entry, date: today }));
     } catch { loadedEntries = []; }
   }
 
@@ -243,6 +227,20 @@ function initDailyLogsStore() {
 }
 
 initDailyLogsStore();
+
+// API đọc log cũng phải tự xoay ngày. Trước đây store chỉ đổi ngày khi có log
+// mới, nên sau 0 giờ (chưa có dòng mới) mục "Hôm nay" vẫn trả log hôm qua.
+function ensureDailyLogsCurrent() {
+  const today = vnDateDDMMYYYY();
+  if (dailyLogs.date === today) return false;
+
+  const oldStore = dailyLogs;
+  dailyLogs = { date: today, users: {}, allLogs: [] };
+  dailyLogsDirtyUsers.clear();
+  logHistory.length = 0; // Không để live stream của ngày cũ bị ghép vào ngày mới.
+  try { flushDailyLogsFor(oldStore); } catch { /* ignore */ }
+  return true;
+}
 
 function flushDailyLogsFor(store) {
   if (!store || !store.date) return;
@@ -282,13 +280,7 @@ function recordDailyLog(entry) {
   const today = vnDateDDMMYYYY();
   const entryWithDate = { ...entry, date: today };
 
-  if (dailyLogs.date !== today) {
-    // Sang ngày mới (giờ VN): flush nốt ngày cũ rồi mở store mới
-    const oldStore = dailyLogs;
-    dailyLogs = { date: today, users: {}, allLogs: [] };
-    dailyLogsDirtyUsers.clear();
-    try { flushDailyLogsFor(oldStore); } catch { /* ignore */ }
-  }
+  ensureDailyLogsCurrent();
 
   const key = entry.account || 'system';
   if (!dailyLogs.users[key]) dailyLogs.users[key] = [];
@@ -320,10 +312,12 @@ setInterval(() => {
 }, 15 * 1000);
 
 function addLog(entry) {
-  logHistory.push(entry);
+  ensureDailyLogsCurrent();
+  const datedEntry = { ...entry, date: vnDateDDMMYYYY() };
+  logHistory.push(datedEntry);
   if (logHistory.length > MAX_LOG) logHistory.shift();
-  io.emit('log', entry);
-  recordDailyLog(entry);
+  io.emit('log', datedEntry);
+  recordDailyLog(datedEntry);
   latestLogsDirty = true;
 }
 
@@ -1608,7 +1602,7 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     io.emit('autoscan-status', { ...status, nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
     saveAutoScanState();
     // Chạm giới hạn ngày / ngày nghỉ / hết khung giờ học → tự hẹn giờ chạy lại (giống Queue thủ công)
-    if (status.status === 'date-limit' || status.status === 'daily-limit' || status.status === 'time-window') {
+    if (status.status === 'date-limit' || status.status === 'daily-limit' || status.status === 'time-window' || status.status === 'next-day') {
       scheduleAutoScanResume(autoSession);
     }
   });
@@ -1629,6 +1623,13 @@ function scheduleAutoScanResume(autoSession) {
   let resumeAt;
   if (autoSession.status === 'time-window' && (autoSession.options.timeWindows || []).length > 0) {
     resumeAt = new Date(Date.now() + calcNextWindowMs(autoSession.options.timeWindows));
+  } else if (autoSession.status === 'date-limit' && (autoSession.options.customTimeRules || []).length > 0) {
+    resumeAt = getNextShiftStart(
+      new Date(),
+      autoSession.options.customTimeRules,
+      autoSession.options.allowedDateRanges || [],
+      autoSession.options.newDayStartTime || '06:00'
+    );
   } else {
     resumeAt = getNextAllowedStudyDate(
       new Date(),
@@ -1652,7 +1653,7 @@ function scheduleAutoScanResume(autoSession) {
 function restartAutoScanSession(sessionId) {
   const old = autoScanSessions.get(sessionId);
   if (!old) return;
-  if (old.status !== 'date-limit' && old.status !== 'daily-limit' && old.status !== 'time-window') return;
+  if (old.status !== 'date-limit' && old.status !== 'daily-limit' && old.status !== 'time-window' && old.status !== 'next-day') return;
 
   const fresh = createAutoScanSession(sessionId, old.account, old.coursesConfig, {
     headless: true,
@@ -1772,7 +1773,7 @@ async function loadAndRestoreAutoScans() {
       s.nextRunTime = null;
       setTimeout(() => startAutoScanWhenFree(s), 5000);
       active++;
-    } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window') {
+    } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window' || saved.status === 'next-day') {
       const fireAt = saved.nextRunTime
         ? new Date(saved.nextRunTime)
         : (saved.status === 'time-window' && options.timeWindows.length > 0)
@@ -2279,6 +2280,7 @@ app.put('/lythuyet/api/edit-queue/:id', (req, res) => {
 // Lấy danh sách các folder logs theo ngày (DD-MM-YYYY)
 app.get('/lythuyet/api/logs/folders', (req, res) => {
   try {
+    ensureDailyLogsCurrent();
     const today = vnDateDDMMYYYY();
     const folderMap = new Map();
 
@@ -2300,7 +2302,7 @@ app.get('/lythuyet/api/logs/folders', (req, res) => {
           } else if (fs.existsSync(logsFile)) {
             try {
               const fileData = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
-              count = Array.isArray(fileData) ? fileData.length : 0;
+              count = filterLogsForDate(fileData, folderName, true).length;
             } catch { count = 0; }
           }
           folderMap.set(folderName, {
@@ -2328,11 +2330,13 @@ app.get('/lythuyet/api/logs/folders', (req, res) => {
 
 // Lấy toàn bộ logs theo ngày (date=DD-MM-YYYY hoặc YYYY-MM-DD)
 app.get('/lythuyet/api/logs/by-date', (req, res) => {
+  ensureDailyLogsCurrent();
   const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
+  if (!reqDate) return res.status(400).json({ error: 'Ngày log không hợp lệ' });
   const today = vnDateDDMMYYYY();
 
   if (reqDate === today && dailyLogs.allLogs) {
-    return res.json({ date: today, logs: dailyLogs.allLogs, isToday: true });
+    return res.json({ date: today, logs: filterLogsForDate(dailyLogs.allLogs, today, true), isToday: true });
   }
 
   const targetDir = path.join(LOGS_DAILY_DIR, reqDate);
@@ -2341,7 +2345,7 @@ app.get('/lythuyet/api/logs/by-date', (req, res) => {
   if (fs.existsSync(targetFile)) {
     try {
       const logs = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
-      return res.json({ date: reqDate, logs: Array.isArray(logs) ? logs : [], isToday: false });
+      return res.json({ date: reqDate, logs: filterLogsForDate(logs, reqDate, true), isToday: false });
     } catch (e) {
       return res.status(500).json({ error: 'Lỗi đọc file log: ' + e.message });
     }
@@ -2353,7 +2357,7 @@ app.get('/lythuyet/api/logs/by-date', (req, res) => {
 // Xóa folder / xóa logs của một ngày
 app.delete('/lythuyet/api/logs/by-date', (req, res) => {
   const reqDate = formatToDDMMYYYY(req.query.date);
-  if (!reqDate) return res.status(400).json({ error: 'Thiếu tham số date' });
+  if (!reqDate) return res.status(400).json({ error: 'Thiếu hoặc sai tham số date' });
   const today = vnDateDDMMYYYY();
 
   if (reqDate === today) {
@@ -2383,13 +2387,16 @@ app.delete('/lythuyet/api/logs/by-date', (req, res) => {
 
 // Lấy log gần nhất
 app.get('/lythuyet/api/logs', (req, res) => {
-  res.json(logHistory);
+  ensureDailyLogsCurrent();
+  const today = vnDateDDMMYYYY();
+  res.json(filterLogsForDate(logHistory, today, true));
 });
 
 // =================== SOCKET.IO =============================
 
 io.on('connection', (socket) => {
   console.log(`[WEB] Client connected: ${socket.id}`);
+  ensureDailyLogsCurrent();
 
   const sessionList = [];
   for (const [id, session] of sessions) {
@@ -2403,7 +2410,12 @@ io.on('connection', (socket) => {
   for (const [id, autoSession] of autoScanSessions) {
     autoScanList.push({ ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
   }
-  socket.emit('init', { sessions: sessionList, queues: queueList, autoScans: autoScanList, logs: logHistory.slice(-100) });
+  socket.emit('init', {
+    sessions: sessionList,
+    queues: queueList,
+    autoScans: autoScanList,
+    logs: filterLogsForDate(logHistory, vnDateDDMMYYYY(), true).slice(-100),
+  });
 
   socket.on('disconnect', () => {
     console.log(`[WEB] Client disconnected: ${socket.id}`);

@@ -16,8 +16,24 @@ const LEVEL_LABELS = {
 };
 
 function vnDateDDMMYYYY(d = new Date()) {
-  const parts = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).split('-');
-  return `${parts[2]}-${parts[1]}-${parts[0]}`;
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  }).formatToParts(d);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.day}-${values.month}-${values.year}`;
+}
+
+function normalizeLogDate(value) {
+  const text = String(value || '').trim();
+  if (/^\d{2}-\d{2}-\d{4}$/.test(text)) return text;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    const [year, month, day] = text.split('-');
+    return `${day}-${month}-${year}`;
+  }
+  return '';
 }
 
 export default function LogPanel({ logs: liveLogs = [], onClear }) {
@@ -33,7 +49,7 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
   const [filterLevel, setFilterLevel] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
-  const todayStr = useMemo(() => vnDateDDMMYYYY(), []);
+  const todayStr = vnDateDDMMYYYY();
   const isTodaySelected = selectedDate === todayStr;
 
   // Tải danh sách thư mục ngày từ backend
@@ -86,7 +102,11 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
       if (liveLogs.length > 0) {
         // Map theo unique key
         const map = new Map();
-        [...dateLogs, ...liveLogs].forEach(item => {
+        const todayLiveLogs = liveLogs.filter(item => {
+          const itemDate = normalizeLogDate(item.date);
+          return !itemDate || itemDate === todayStr;
+        });
+        [...dateLogs, ...todayLiveLogs].forEach(item => {
           const key = `${item.timestamp}_${item.account}_${item.msg}`;
           map.set(key, item);
         });
@@ -95,7 +115,7 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
       return dateLogs;
     }
     return dateLogs;
-  }, [isTodaySelected, liveLogs, dateLogs]);
+  }, [isTodaySelected, liveLogs, dateLogs, todayStr]);
 
   // Trích xuất danh sách tài khoản xuất hiện trong log hiện tại
   const accountList = useMemo(
