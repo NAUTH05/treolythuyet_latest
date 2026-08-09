@@ -207,6 +207,35 @@ class AutoCourseSession extends EventEmitter {
     }
   }
 
+  // Xác minh chéo tiến độ ngay trên trang khóa học bằng một tab dùng chung
+  // phiên đăng nhập. Chỉ progress 100% của đúng URL bài mới được coi là xong.
+  async _verifyLessonProgressFromCourse(courseUrl, lessonUrl) {
+    if (!this.context) return { completed: false, progressPercent: null };
+    let verifyPage = null;
+    try {
+      verifyPage = await this.context.newPage();
+      const result = await scanCourseDetails(verifyPage, courseUrl);
+      if (!result || !Array.isArray(result.allLessons)) {
+        return { completed: false, progressPercent: null };
+      }
+      const expectedPath = new URL(lessonUrl).pathname;
+      const matchedLesson = result.allLessons.find(item => {
+        try { return new URL(item.url).pathname === expectedPath; } catch { return false; }
+      });
+      return {
+        completed: matchedLesson?.progressPercent >= 100,
+        progressPercent: matchedLesson?.progressPercent ?? null,
+      };
+    } catch (err) {
+      this.log(`⚠️ Không thể xác minh tiến độ bài từ trang khóa học: ${String(err.message).split('\n')[0]}`, 'warn');
+      return { completed: false, progressPercent: null };
+    } finally {
+      if (verifyPage) {
+        try { await verifyPage.close(); } catch { /* ignore */ }
+      }
+    }
+  }
+
   // Chờ nếu phiên đang ở trạng thái Tạm dừng (paused)
   async _checkPaused() {
     while (this.status === 'paused' && !this._stopped) {
@@ -696,6 +725,7 @@ class AutoCourseSession extends EventEmitter {
 
           let durationMs = lessonMinutes * 60 * 1000;
           let elapsedMs = 0;
+          let lessonConfirmedCompleted = lessonMinutes === 0;
 
           while (elapsedMs < durationMs && !this._stopped) {
             await this._checkPaused();
@@ -762,10 +792,6 @@ class AutoCourseSession extends EventEmitter {
             this.log(`📊 Đang treo bài [${lesson.title}]: Đã treo ${Math.round(elapsedMs / 60000)}/${lessonMinutes} phút | Hôm nay: ${this._formatMinutes(this.dailyStudiedMinutes)} / ${this._formatMinutes(this.options.dailyMaxMinutes)} (Còn lại: ${this._formatMinutes(remainingDailyMins)})`, 'info');
             this.emit('status', this.getStatus());
 
-            if (courseReachedTarget(targetMinutes, courseStudiedMins, false)) {
-              this.courseProgress[cConfig.courseUrl].completed = true;
-            }
-
             // Ghi nhận phần vừa học trước, sau đó mới hẹn tiếp ca/ngày kế tiếp.
             if (!this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
               try { await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch { /* ignore */ }
@@ -803,7 +829,14 @@ class AutoCourseSession extends EventEmitter {
                       this.log(`⏱️ Thời gian đếm ngược trên web cập nhật còn lại: ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút)`, 'info');
                     }
                   } else if (checkTimer.hours === 0 && checkTimer.minutes === 0 && checkTimer.seconds === 0) {
-                    durationMs = elapsedMs; // Web báo đã xong 0s -> kết thúc treo bài ngay
+                    const completedOnSlide = await this._isCurrentLessonCompleted();
+                    if (completedOnSlide) {
+                      lessonConfirmedCompleted = true;
+                      durationMs = elapsedMs;
+                      this.log(`✅ Web Odoo xác nhận bài đã hoàn thành sau heartbeat`, 'success');
+                    } else {
+                      this.log(`⚠️ Timer heartbeat trả về 0:00 nhưng bài chưa được Web Odoo xác nhận — giữ nguyên thời lượng ${lessonMinutes} phút, không kết thúc sớm.`, 'warn');
+                    }
                   }
                 }
               }
@@ -825,13 +858,28 @@ class AutoCourseSession extends EventEmitter {
                 if (this._isOnUrl(lesson.url)) {
                   const isBadgeCompleted = await this._isCurrentLessonCompleted();
 
-                  if (!isBadgeCompleted) {
+                  if (isBadgeCompleted) {
+                    lessonConfirmedCompleted = true;
+                  } else {
                     const finalTimer = await readDomTimer(this.page);
                     if (finalTimer && finalTimer.totalMinutes > 0 && !isNaN(finalTimer.totalMinutes)) {
                       this.log(`⚠️ Đồng hồ local đã đếm hết nhưng Web Odoo vẫn còn ${finalTimer.hours}h ${finalTimer.minutes}m ${finalTimer.seconds}s (${finalTimer.totalMinutes} phút) ➔ Tự động gia hạn treo tiếp!`, 'warn');
-                      const extraMs = finalTimer.totalMinutes * 60 * 1000;
-                      lessonMinutes += finalTimer.totalMinutes;
-                      durationMs += extraMs;
+                      durationMs = elapsedMs + finalTimer.totalMinutes * 60 * 1000;
+                      lessonMinutes = Math.ceil(durationMs / 60000);
+                    } else {
+                      const courseVerification = await this._verifyLessonProgressFromCourse(cConfig.courseUrl, lesson.url);
+                      if (courseVerification.completed) {
+                        lessonConfirmedCompleted = true;
+                        this.log(`✅ Trang khóa học xác nhận bài [${lesson.title}] đã đạt 100%`, 'success');
+                      } else {
+                        const retryMinutes = Math.max(1, parseInt(this.options.refreshInterval, 10) || 15);
+                        durationMs = elapsedMs + retryMinutes * 60 * 1000;
+                        lessonMinutes = Math.ceil(durationMs / 60000);
+                        const progressText = courseVerification.progressPercent == null
+                          ? 'chưa đọc được tiến độ'
+                          : `mới ${courseVerification.progressPercent}%`;
+                        this.log(`⚠️ Timer đã về 0:00 nhưng trang khóa học ${progressText} — gia hạn thêm ${retryMinutes} phút và tiếp tục treo, không đánh dấu hoàn thành.`, 'warn');
+                      }
                     }
                   }
                 }
@@ -839,7 +887,7 @@ class AutoCourseSession extends EventEmitter {
             }
           }
 
-          if (!this._stopped && this.status !== 'paused') {
+          if (!this._stopped && this.status !== 'paused' && lessonConfirmedCompleted) {
             this.log(`✅ Hoàn thành treo bài [${lesson.title}] (${lessonMinutes} phút)!`, 'success');
             this.emit('progress-saved', {
               account: this.account.name,
@@ -848,6 +896,8 @@ class AutoCourseSession extends EventEmitter {
               studiedMinutes: lessonMinutes,
               courseRemainingMinutes: Math.max(0, targetMinutes - courseStudiedMins),
             });
+          } else if (!this._stopped && this.status !== 'paused') {
+            this.log(`⚠️ Bài [${lesson.title}] chưa được Web Odoo xác nhận hoàn thành — không ghi nhận là đã xong.`, 'warn');
           }
         }
 

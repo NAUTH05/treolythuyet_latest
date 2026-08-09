@@ -6,6 +6,19 @@
 // ── Chuẩn hóa múi giờ Việt Nam (Asia/Ho_Chi_Minh, UTC+7 cố định, không DST) ──
 const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
 
+// URL slide thường chứa nhiều cụm số trong slug (VD: /5-2-...-50987).
+// ID thật luôn là cụm số cuối pathname; không được lấy match số đầu tiên.
+function extractSlideIdFromUrl(url) {
+  try {
+    const pathname = new URL(url, 'https://placeholder.local').pathname.replace(/\/+$/, '');
+    const lastSegment = pathname.split('/').filter(Boolean).pop() || '';
+    const match = lastSegment.match(/-(\d+)$/);
+    return match ? parseInt(match[1], 10) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Lấy {year, month(0-11), day} theo lịch Việt Nam của một thời điểm bất kỳ
 // (không phụ thuộc múi giờ server — VPS chạy UTC vẫn ra đúng ngày VN)
 function vnDateParts(date = new Date()) {
@@ -300,7 +313,9 @@ async function readDomTimer(page) {
   try {
     await page.waitForTimeout(7000); // Chờ 7 giây cho Odoo JS & API /slide/countdown-start/ render xong hoàn toàn
 
-    const timer = await page.evaluate(async () => {
+    const expectedSlideId = extractSlideIdFromUrl(page.url());
+
+    const timer = await page.evaluate(async (slideIdFromUrl) => {
       const makeTimer = (h, m, s, source) => {
         const safeH = isNaN(h) ? 0 : Math.max(0, parseInt(h, 10) || 0);
         const safeM = isNaN(m) ? 0 : Math.max(0, parseInt(m, 10) || 0);
@@ -310,9 +325,10 @@ async function readDomTimer(page) {
 
       // 1. Gọi trực tiếp Odoo RPC Route /slide/countdown-start/ từ trong trang
       try {
-        const slideIdMatch = location.href.match(/-(\d+)\b/);
-        if (slideIdMatch) {
-          const slideId = parseInt(slideIdMatch[1], 10);
+        const lastSegment = location.pathname.replace(/\/+$/, '').split('/').filter(Boolean).pop() || '';
+        const fallbackMatch = lastSegment.match(/-(\d+)$/);
+        const slideId = slideIdFromUrl || (fallbackMatch ? parseInt(fallbackMatch[1], 10) : null);
+        if (slideId) {
           const response = await fetch('/slide/countdown-start/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -398,7 +414,7 @@ async function readDomTimer(page) {
       }
 
       return null;
-    });
+    }, expectedSlideId);
 
     return timer;
   } catch (err) {
@@ -416,4 +432,5 @@ module.exports = {
   getShiftsForDate,
   calcMsRemainingInShift,
   getNextShiftStart,
+  extractSlideIdFromUrl,
 };
