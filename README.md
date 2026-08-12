@@ -10,6 +10,9 @@ npm run setup
 
 # 2. Cấu hình tài khoản
 # Sửa file accounts.json với email + mật khẩu của bạn
+# 3. sudo install
+apt install npm
+npx playwright install-deps
 ```
 
 ## Cấu hình tài khoản
@@ -128,3 +131,15 @@ location /lythuyet {
     proxy_send_timeout 86400s;
 }
 ```
+
+## Cockpit
+IP:9090
+apt update && apt install -y cockpit
+systemctl enable --now cockpit.socket
+ufw allow 9090/tcp && ufw reload
+### permision FIX
+```
+echo "root" >> /etc/cockpit/disallowed-users
+sed -i '/root/d' /etc/cockpit/disallowed-users
+```
+systemctl restart cockpit
