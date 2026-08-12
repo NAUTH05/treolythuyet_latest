@@ -10,6 +10,9 @@ npm run setup
 
 # 2. Cấu hình tài khoản
 # Sửa file accounts.json với email + mật khẩu của bạn
+# 3. sudo install
+apt install npm
+npx playwright install-deps
 ```
 
 ## Cấu hình tài khoản
