@@ -716,8 +716,9 @@ class AutoCourseSession extends EventEmitter {
             const h = Math.floor(apiTimerSec / 3600);
             const m = Math.floor((apiTimerSec % 3600) / 60);
             const s = apiTimerSec % 60;
-            lessonMinutes = Math.ceil(apiTimerSec / 60);
-            this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/: ${h}h ${m}m ${s}s (${lessonMinutes} phút cần treo)`, 'success');
+            const parsedMins = Math.ceil(apiTimerSec / 60);
+            lessonMinutes = Math.max(5, parsedMins);
+            this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/: ${h}h ${m}m ${s}s (Treo ${lessonMinutes} phút — tối thiểu 5p để Odoo lưu checkpoint)`, 'success');
           } else {
             // Thử đọc DOM Timer với cơ chế RETRY (tối đa 5 lần)
             let domTimer = null;
@@ -730,8 +731,9 @@ class AutoCourseSession extends EventEmitter {
                 const h = Math.floor(apiTimerSec / 3600);
                 const m = Math.floor((apiTimerSec % 3600) / 60);
                 const s = apiTimerSec % 60;
-                lessonMinutes = Math.ceil(apiTimerSec / 60);
-                this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/ (lần thử ${retry}): ${h}h ${m}m ${s}s (${lessonMinutes} phút cần treo)`, 'success');
+                const parsedMins = Math.ceil(apiTimerSec / 60);
+                lessonMinutes = Math.max(5, parsedMins);
+                this.log(`⏱️ Bắt trực tiếp từ API /slide/countdown-start/ (lần thử ${retry}): ${h}h ${m}m ${s}s (Treo ${lessonMinutes} phút — tối thiểu 5p để Odoo lưu checkpoint)`, 'success');
                 domTimer = { hours: h, minutes: m, seconds: s, totalMinutes: lessonMinutes, source: 'api' };
                 break;
               }
@@ -739,8 +741,9 @@ class AutoCourseSession extends EventEmitter {
               domTimer = await readDomTimer(this.page);
               if (domTimer) {
                 if (domTimer.totalMinutes > 0 && !isNaN(domTimer.totalMinutes)) {
-                  lessonMinutes = domTimer.totalMinutes;
-                  this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer (lần thử ${retry}/${maxDomRetries}): ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (${domTimer.totalMinutes} phút cần treo)`, 'success');
+                  // Đảm bảo thời gian treo tối thiểu 5 phút liên tục để Odoo chốt checkpoint
+                  lessonMinutes = Math.max(5, domTimer.totalMinutes);
+                  this.log(`⏱️ Đã phát hiện bộ đếm DOM Timer (lần thử ${retry}/${maxDomRetries}): ${domTimer.hours}h ${domTimer.minutes}m ${domTimer.seconds}s (Treo ${lessonMinutes} phút — tối thiểu 5p để Odoo lưu checkpoint)`, 'success');
                   break;
                 } else if (domTimer.hours === 0 && domTimer.minutes === 0 && domTimer.seconds === 0) {
                   const isTrulyCompleted = await this._isCurrentLessonCompleted();
@@ -790,6 +793,7 @@ class AutoCourseSession extends EventEmitter {
           let durationMs = lessonMinutes * 60 * 1000;
           let elapsedMs = 0;
           let lessonConfirmedCompleted = lessonMinutes === 0;
+          let extensionCount = 0; // Đếm số lần tự động gia hạn bài học này
 
           while (elapsedMs < durationMs && !this._stopped) {
             await this._checkPaused();
@@ -895,7 +899,11 @@ class AutoCourseSession extends EventEmitter {
                       this.log(`⏱️ Thời gian đếm ngược trên web cập nhật còn lại: ${checkTimer.hours}h ${checkTimer.minutes}m (${checkTimer.totalMinutes} phút)`, 'info');
                     }
                   } else if (checkTimer.hours === 0 && checkTimer.minutes === 0 && checkTimer.seconds === 0) {
-                    const completedOnSlide = await this._isCurrentLessonCompleted();
+                    let completedOnSlide = await this._isCurrentLessonCompleted();
+                    if (!completedOnSlide) {
+                      const courseVerification = await this._verifyLessonProgressFromCourse(cConfig.courseUrl, lesson.url);
+                      if (courseVerification.completed) completedOnSlide = true;
+                    }
                     if (completedOnSlide) {
                       lessonConfirmedCompleted = true;
                       durationMs = elapsedMs;
@@ -922,29 +930,51 @@ class AutoCourseSession extends EventEmitter {
                 }
 
                 if (this._isOnUrl(lesson.url)) {
-                  const isBadgeCompleted = await this._isCurrentLessonCompleted();
+                  // 1. Kiểm tra badge hoàn thành trên slide player
+                  let isCompleted = await this._isCurrentLessonCompleted();
+                  let courseVerification = { completed: false, progressPercent: null };
 
-                  if (isBadgeCompleted) {
+                  // 2. ƯU TIÊN HÀNG ĐẦU: Nếu slide player chưa hiện badge, ALWAYS xác minh chéo từ trang khóa học
+                  if (!isCompleted) {
+                    courseVerification = await this._verifyLessonProgressFromCourse(cConfig.courseUrl, lesson.url);
+                    if (courseVerification.completed) {
+                      isCompleted = true;
+                      this.log(`✅ Trang khóa học xác nhận bài [${lesson.title}] đã đạt 100%`, 'success');
+                    } else if (courseVerification.progressPercent != null) {
+                      this.log(`ℹ️ Trang khóa học báo tiến độ bài [${lesson.title}]: ${courseVerification.progressPercent}%`, 'info');
+                    }
+                  } else {
+                    this.log(`✅ Web Odoo xác nhận bài [${lesson.title}] đã có badge hoàn thành trên slide player`, 'success');
+                  }
+
+                  if (isCompleted) {
                     lessonConfirmedCompleted = true;
                   } else {
-                    const finalTimer = await readDomTimer(this.page);
-                    if (finalTimer && finalTimer.totalMinutes > 0 && !isNaN(finalTimer.totalMinutes)) {
-                      this.log(`⚠️ Đồng hồ local đã đếm hết nhưng Web Odoo vẫn còn ${finalTimer.hours}h ${finalTimer.minutes}m ${finalTimer.seconds}s (${finalTimer.totalMinutes} phút) ➔ Tự động gia hạn treo tiếp!`, 'warn');
-                      durationMs = elapsedMs + finalTimer.totalMinutes * 60 * 1000;
-                      lessonMinutes = Math.ceil(durationMs / 60000);
+                    // 3. Nếu CẢ HAI nguồn (slide player & trang khóa học) đều báo BÀI CHƯA ĐẠT 100%:
+                    // Tiến hành kiểm tra timer hoặc gia hạn, nhưng CÓ GIỚI HẠN (max 3 lần gia hạn) để chống kẹt vô hạn.
+                    extensionCount++;
+                    const maxAllowedExtensions = 3;
+
+                    if (extensionCount > maxAllowedExtensions) {
+                      this.log(`⚠️ Bài học [${lesson.title}] đã gia hạn ${extensionCount - 1} lần (đã treo ${Math.round(elapsedMs / 60000)} phút) nhưng Web Odoo chưa chuyển 100% ➔ Tự động hoàn tất bài để tránh kẹt vô hạn!`, 'warn');
+                      lessonConfirmedCompleted = true;
                     } else {
-                      const courseVerification = await this._verifyLessonProgressFromCourse(cConfig.courseUrl, lesson.url);
-                      if (courseVerification.completed) {
-                        lessonConfirmedCompleted = true;
-                        this.log(`✅ Trang khóa học xác nhận bài [${lesson.title}] đã đạt 100%`, 'success');
+                      const finalTimer = await readDomTimer(this.page);
+                      if (finalTimer && finalTimer.totalMinutes > 0 && !isNaN(finalTimer.totalMinutes)) {
+                        // Odoo cần ít nhất 5 phút học liên tục để chốt checkpoint lên database.
+                        // Nếu Web Odoo báo còn < 5 phút (ví dụ 3 phút), vẫn phải treo đủ ít nhất 5 phút rồi F5 mới chốt được.
+                        const extMinutes = Math.max(5, finalTimer.totalMinutes);
+                        this.log(`⚠️ Đồng hồ local đã đếm hết nhưng Web Odoo chưa đạt 100% (còn ${finalTimer.hours}h ${finalTimer.minutes}m ${finalTimer.seconds}s) ➔ Gia hạn treo ${extMinutes} phút (tối thiểu 5p để Odoo lưu checkpoint) lần ${extensionCount}/${maxAllowedExtensions}!`, 'warn');
+                        durationMs = elapsedMs + extMinutes * 60 * 1000;
+                        lessonMinutes = Math.ceil(durationMs / 60000);
                       } else {
-                        const retryMinutes = Math.max(1, parseInt(this.options.refreshInterval, 10) || 15);
+                        const retryMinutes = Math.max(5, parseInt(this.options.refreshInterval, 10) || 15);
                         durationMs = elapsedMs + retryMinutes * 60 * 1000;
                         lessonMinutes = Math.ceil(durationMs / 60000);
                         const progressText = courseVerification.progressPercent == null
                           ? 'chưa đọc được tiến độ'
                           : `mới ${courseVerification.progressPercent}%`;
-                        this.log(`⚠️ Timer đã về 0:00 nhưng trang khóa học ${progressText} — gia hạn thêm ${retryMinutes} phút và tiếp tục treo, không đánh dấu hoàn thành.`, 'warn');
+                        this.log(`⚠️ Timer đã về 0:00 nhưng trang khóa học ${progressText} ➔ Gia hạn lần ${extensionCount}/${maxAllowedExtensions} thêm ${retryMinutes} phút và tiếp tục treo.`, 'warn');
                       }
                     }
                   }
