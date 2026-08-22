@@ -17,7 +17,6 @@ export default function SettingsPanel({ toast }) {
     storageBucket: '',
     messagingSenderId: '',
     appId: '',
-    databaseURL: '',
   });
   const [fbLoading, setFbLoading] = useState(false);
   const [fbConnected, setFbConnected] = useState(false);
@@ -205,16 +204,6 @@ export default function SettingsPanel({ toast }) {
                   required
                 />
               </div>
-            </div>
-
-            <div className="form-group">
-              <label>Database URL (tùy chọn - nếu dùng Realtime DB)</label>
-              <input
-                type="url"
-                placeholder="https://project-id-default-rtdb.firebaseio.com"
-                value={firebaseConfig.databaseURL}
-                onChange={e => setFirebaseConfig({ ...firebaseConfig, databaseURL: e.target.value })}
-              />
             </div>
 
             <button type="submit" className="btn btn-primary" disabled={fbLoading}>

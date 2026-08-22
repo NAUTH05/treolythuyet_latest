@@ -5,6 +5,13 @@ const FIREBASE_STATE_FILE = path.join(__dirname, 'firebase-config.json');
 const firebaseWriteTails = new Map();
 const firebaseCollectionBarriers = new Map();
 
+// Firestore từ chối document lớn hơn 1 MiB. Giữ ngân sách thấp hơn hạn cứng để
+// còn chỗ cho tên document và overhead nội bộ Firestore tính thêm.
+const FIRESTORE_DOC_BUDGET_BYTES = 950 * 1024;
+// Firestore không cho mảng chứa trực tiếp mảng khác → bọc một lớp map với khóa
+// này để dữ liệu vẫn ghi được và đọc ra vẫn đúng hình dạng ban đầu.
+const NESTED_ARRAY_KEY = '__wrappedArray';
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -15,17 +22,127 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
-function decodeFirestoreDocument(doc) {
-  const obj = {};
-  const fields = (doc && doc.fields) || {};
-  for (const [k, v] of Object.entries(fields)) {
-    if (v.stringValue !== undefined) {
-      try { obj[k] = JSON.parse(v.stringValue); } catch { obj[k] = v.stringValue; }
-    } else if (v.doubleValue !== undefined) obj[k] = v.doubleValue;
-    else if (v.integerValue !== undefined) obj[k] = Number(v.integerValue);
-    else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
+// =============== FIRESTORE VALUE CODEC ===============
+// Giữ nguyên hình dạng dữ liệu: object lồng → mapValue, mảng → arrayValue,
+// null → nullValue. Không stringify nữa, để Firestore Console xem/query được
+// và để vòng ghi–đọc không làm biến dạng kiểu dữ liệu.
+
+function encodeFirestoreValue(val, insideArray = false) {
+  if (val === null || val === undefined) return { nullValue: null };
+  if (val instanceof Date) return { timestampValue: val.toISOString() };
+
+  switch (typeof val) {
+    case 'string': return { stringValue: val };
+    case 'boolean': return { booleanValue: val };
+    case 'bigint': return { integerValue: val.toString() };
+    case 'number':
+      if (Number.isNaN(val)) return { doubleValue: 'NaN' };
+      if (!Number.isFinite(val)) return { doubleValue: val > 0 ? 'Infinity' : '-Infinity' };
+      return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
+    default: break;
   }
+
+  if (Array.isArray(val)) {
+    const arrayValue = { values: val.map(item => encodeFirestoreValue(item, true)) };
+    return insideArray
+      ? { mapValue: { fields: { [NESTED_ARRAY_KEY]: { arrayValue } } } }
+      : { arrayValue };
+  }
+
+  if (typeof val === 'object') return { mapValue: { fields: encodeFirestoreFields(val) } };
+  return { stringValue: String(val) };
+}
+
+function encodeFirestoreFields(obj) {
+  const fields = {};
+  for (const [key, val] of Object.entries(obj || {})) {
+    if (typeof val === 'function' || typeof val === 'symbol') continue;
+    fields[key] = encodeFirestoreValue(val);
+  }
+  return fields;
+}
+
+// Tương thích ngược: document do bản cũ ghi đang lưu object/array dưới dạng chuỗi
+// JSON. Chỉ thử parse khi chuỗi có hình dạng object/array, để "123" hay "true"
+// không bị biến thành số/boolean như bug của bản cũ.
+function decodeLegacyString(str) {
+  const trimmed = str.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return str;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return str;
+  }
+}
+
+function decodeFirestoreValue(value) {
+  if (!value || typeof value !== 'object') return null;
+  if ('nullValue' in value) return null;
+  if (value.stringValue !== undefined) return decodeLegacyString(value.stringValue);
+  if (value.booleanValue !== undefined) return value.booleanValue;
+  if (value.integerValue !== undefined) return Number(value.integerValue);
+  if (value.doubleValue !== undefined) return Number(value.doubleValue);
+  if (value.timestampValue !== undefined) return value.timestampValue;
+  if (value.bytesValue !== undefined) return value.bytesValue;
+  if (value.referenceValue !== undefined) return value.referenceValue;
+  if (value.geoPointValue !== undefined) return { ...value.geoPointValue };
+  if (value.arrayValue !== undefined) return (value.arrayValue.values || []).map(v => decodeFirestoreValue(v));
+  if (value.mapValue !== undefined) {
+    const fields = value.mapValue.fields || {};
+    const keys = Object.keys(fields);
+    if (keys.length === 1 && keys[0] === NESTED_ARRAY_KEY) return decodeFirestoreValue(fields[NESTED_ARRAY_KEY]);
+    return decodeFirestoreFields(fields);
+  }
+  return null;
+}
+
+function decodeFirestoreFields(fields) {
+  const obj = {};
+  for (const [key, value] of Object.entries(fields || {})) obj[key] = decodeFirestoreValue(value);
   return obj;
+}
+
+function decodeFirestoreDocument(doc) {
+  return decodeFirestoreFields(doc && doc.fields);
+}
+
+function jsonByteLength(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+}
+
+// Lưu nested thật tốn nhiều byte hơn chuỗi JSON, nên document log dễ chạm hạn
+// 1 MiB hơn trước. Khi vượt ngân sách, cắt dần phần tử cũ nhất của mảng đang
+// chiếm nhiều byte nhất rồi ghi rõ đã bỏ bao nhiêu bản ghi — thay vì để Firestore
+// từ chối và mất trắng cả lần ghi. File local vẫn là nguồn đầy đủ.
+function fitFieldsWithinBudget(fields, label) {
+  if (jsonByteLength(fields) <= FIRESTORE_DOC_BUDGET_BYTES) return fields;
+
+  const trimmed = { ...fields };
+  let omitted = 0;
+
+  while (jsonByteLength(trimmed) > FIRESTORE_DOC_BUDGET_BYTES) {
+    let target = null;
+    let targetSize = 0;
+    for (const [key, value] of Object.entries(trimmed)) {
+      const values = value && value.arrayValue && value.arrayValue.values;
+      if (!values || values.length === 0) continue;
+      const size = jsonByteLength(value);
+      if (size > targetSize) { target = key; targetSize = size; }
+    }
+    if (!target) break;
+
+    const values = trimmed[target].arrayValue.values;
+    const dropCount = Math.max(1, Math.floor(values.length * 0.05));
+    trimmed[target] = { arrayValue: { values: values.slice(dropCount) } };
+    omitted += dropCount;
+  }
+
+  if (omitted > 0) {
+    trimmed.truncated = { booleanValue: true };
+    trimmed.omittedOldestCount = { integerValue: String(omitted) };
+    console.warn(`[FIREBASE] ⚠️ ${label} vượt ngân sách document — đã bỏ ${omitted} bản ghi cũ nhất (file local vẫn giữ đủ).`);
+  }
+  return trimmed;
 }
 
 function loadFirebaseConfig() {
@@ -46,23 +163,15 @@ function saveFirebaseConfig(config) {
   }
 }
 
-// Lightweight REST-based Firestore/RealtimeDB sync helper (zero heavy native binary dependency issues)
+// Firestore REST sync helper (không kéo theo native binary như Admin SDK)
 async function performFirebaseWrite(collection, id, data, config) {
   if (!config || !config.projectId) return false;
   try {
     const projectId = config.projectId;
-    // Firestore REST API
-    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collection}/${id}?key=${config.apiKey}`;
-    
-    // Convert object to Firestore document fields structure
-    const fields = {};
-    for (const [key, val] of Object.entries(data)) {
-      if (val === null || val === undefined) continue;
-      if (typeof val === 'string') fields[key] = { stringValue: val };
-      else if (typeof val === 'number') fields[key] = { doubleValue: val };
-      else if (typeof val === 'boolean') fields[key] = { booleanValue: val };
-      else fields[key] = { stringValue: JSON.stringify(val) };
-    }
+    const docPath = `${collection}/${encodeURIComponent(id)}`;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${docPath}?key=${config.apiKey}`;
+
+    const fields = fitFieldsWithinBudget(encodeFirestoreFields(data), `${collection}/${id}`);
 
     const res = await fetchWithTimeout(url, {
       method: 'PATCH',
@@ -168,4 +277,7 @@ module.exports = {
   syncToFirebaseREST,
   fetchFromFirebaseREST,
   deleteDocumentsByPrefixREST,
+  encodeFirestoreFields,
+  decodeFirestoreDocument,
+  decodeFirestoreValue,
 };
