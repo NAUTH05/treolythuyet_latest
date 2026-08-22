@@ -6,6 +6,28 @@ const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
 const SESSION_LOG_SEPARATOR = '---------------------------------------------------------';
 
+// Danh sách CHÍNH THỨC mọi trạng thái một phiên Auto-Scan có thể mang.
+// Dashboard phải hiểu được toàn bộ danh sách này (xem test frontendStatusContract).
+const AUTO_COURSE_STATUSES = [
+  'idle', 'logging-in', 'scanning', 'studying', 'paused',
+  'date-limit', 'daily-limit', 'time-window', 'next-day',
+  'completed', 'stopped', 'error',
+];
+
+// Trạng thái phiên đã kết thúc — không bao giờ được quay lại chạy tiếp.
+const TERMINAL_STATUSES = new Set(['completed', 'stopped', 'error']);
+
+// Trạng thái server sẽ tự hẹn giờ chạy lại.
+const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window', 'next-day']);
+
+// Giai đoạn vòng đời của đối tượng phiên (khác với `status` hiển thị):
+//   new      → chưa từng gọi start(), chưa chiếm tài khoản Odoo
+//   running  → start() đang chạy, đang/sắp giữ browser
+//   finished → đã dọn dẹp xong, KHÔNG được chạy lại (phải tạo phiên mới)
+const PHASE_NEW = 'new';
+const PHASE_RUNNING = 'running';
+const PHASE_FINISHED = 'finished';
+
 function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted = false) {
   const target = Math.max(0, Number(targetMinutes) || 0);
   const studied = Math.max(0, Number(studiedMinutes) || 0);
@@ -74,10 +96,49 @@ class AutoCourseSession extends EventEmitter {
 
     this.courseProgress = {}; // courseUrl -> { studiedMinutes, targetMinutes, completed }
     this._stopped = false;
+    this._phase = PHASE_NEW;
     this._stealthTimer = null;
     this._pauseStartedAt = null;
     this._totalPausedMs = 0;
     this._sessionSeparatorLogged = false;
+  }
+
+  // Đối tượng phiên này đã chạy (hoặc đang chạy) chưa?
+  isRunning() {
+    return this._phase === PHASE_RUNNING;
+  }
+
+  isFinished() {
+    return this._phase === PHASE_FINISHED;
+  }
+
+  // Chốt vòng đời đối tượng phiên mà KHÔNG coi là bị người dùng hủy (`_stopped`
+  // giữ nguyên false). Dùng cho các nhánh thoát sớm trước khi mở browser (ngày
+  // nghỉ / ngoài ca / ngoài khung giờ): đối tượng này sẽ không chạy tiếp nữa —
+  // đến giờ hẹn server tạo phiên MỚI cùng ID để chạy lại.
+  _finishPhase() {
+    this._phase = PHASE_FINISHED;
+    this._clearStealthLoop();
+  }
+
+  // Phiên có đang thực sự chiếm phiên đăng nhập Odoo của tài khoản không?
+  // Phiên vừa tạo mà chưa start() thì KHÔNG chiếm gì cả — nếu coi là chiếm,
+  // hai phiên cùng chờ khởi động sẽ chặn lẫn nhau vĩnh viễn.
+  ownsAccountSession() {
+    return this._phase === PHASE_RUNNING || this.status === 'paused';
+  }
+
+  // Chuyển trạng thái làm việc (logging-in / scanning / studying).
+  // Không được ghi đè 'paused': người dùng đã bấm Tạm dừng thì phiên phải ở
+  // 'paused' cho tới khi resume(), chỉ cập nhật trạng thái sẽ quay về sau đó.
+  _setStatus(next) {
+    if (this.status === 'paused') {
+      this.pausedFromStatus = next;
+      return false;
+    }
+    if (TERMINAL_STATUSES.has(this.status)) return false;
+    this.status = next;
+    return true;
   }
 
   _randomBetween(min, max) {
@@ -164,7 +225,7 @@ class AutoCourseSession extends EventEmitter {
   // Trả về true nếu đã kích hoạt time-window (caller phải return/thoát).
   _hitTimeWindowLimit() {
     if (this._msRemainingInWindow() !== -2) return false;
-    this.status = 'time-window';
+    this._setStatus('time-window');
     this.log(`⏰ Ngoài khung giờ học cho phép — tạm nghỉ, hẹn giờ tự chạy lại vào khung giờ tiếp theo`, 'warn');
     this.emit('status', this.getStatus());
     return true;
@@ -195,7 +256,7 @@ class AutoCourseSession extends EventEmitter {
   _hitDailyLimit() {
     this._rolloverDailyCounter();
     if (this.dailyStudiedMinutes < this.options.dailyMaxMinutes) return false;
-    this.status = 'daily-limit';
+    this._setStatus('daily-limit');
     this.log(`🛑 Đã đạt giới hạn học tối đa trong ngày (${this._formatMinutes(this.options.dailyMaxMinutes)}) → Hẹn ${this.options.newDayStartTime || '06:00'} sáng ngày học tiếp theo tiếp tục!`, 'warn');
     this.emit('status', this.getStatus());
     return true;
@@ -424,7 +485,7 @@ class AutoCourseSession extends EventEmitter {
   }
 
   async login() {
-    this.status = 'logging-in';
+    this._setStatus('logging-in');
     this.emit('status', this.getStatus());
 
     // Retry vô hạn khi mạng chưa sẵn sàng (giống Queue thủ công)
@@ -502,7 +563,7 @@ class AutoCourseSession extends EventEmitter {
 
     if (!shiftStatus.inShift) {
       const nextRun = getNextShiftStart(now, customRules, this.options.allowedDateRanges || [], this.options.newDayStartTime || '06:00');
-      this.status = 'date-limit';
+      this._setStatus('date-limit');
       const vnTimeStr = now.toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
       const vnNextStr = nextRun.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
 
@@ -522,6 +583,16 @@ class AutoCourseSession extends EventEmitter {
   }
 
   async start() {
+    // Một đối tượng phiên chỉ được chạy ĐÚNG MỘT LẦN. Gọi start() lần thứ hai
+    // (double-click, hai tab, timer trùng, restore chồng lệnh) sẽ mở browser thứ
+    // hai cho cùng tài khoản Odoo và làm phiên trước bị văng đăng nhập.
+    // Muốn chạy lại thì phải tạo phiên mới — server làm việc đó ở restartAutoScanSession().
+    if (this._phase !== PHASE_NEW) {
+      this.log(`⚠️ Bỏ qua yêu cầu khởi động trùng lặp (phiên đã ở giai đoạn "${this._phase}")`, 'warn');
+      return;
+    }
+    this._phase = PHASE_RUNNING;
+
     this._logSessionSeparator();
     this.log(`🤖 Khởi động Auto-Scan khóa học cho ${this.account.name}`, 'info');
 
@@ -529,17 +600,18 @@ class AutoCourseSession extends EventEmitter {
     const now = new Date();
     if (!isAllowedStudyDate(now, this.options.allowedDateRanges)) {
       const nextDate = getNextAllowedStudyDate(now, this.options.allowedDateRanges, this.options.newDayStartTime);
-      this.status = 'date-limit';
+      this._setStatus('date-limit');
       this.log(`⏰ Hôm nay (${now.toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}) là ngày nghỉ — Hẹn lịch tiếp tục lúc ${this.options.newDayStartTime || '06:00'} ngày ${nextDate.toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}`, 'warn');
       this.emit('status', this.getStatus());
+      this._finishPhase();
       return;
     }
 
     // 2. Kiểm tra Khung Giờ Ca Học (nếu có quy tắc riêng)
-    if (this._hitTimeShiftLimit()) return;
+    if (this._hitTimeShiftLimit()) { this._finishPhase(); return; }
 
     // 3. Kiểm tra Khung Giờ Học Tổng Quát (nếu được cấu hình) trước khi mở browser
-    if (this._hitTimeWindowLimit()) return;
+    if (this._hitTimeWindowLimit()) { this._finishPhase(); return; }
 
     try {
       this.browser = await chromium.launch({
@@ -582,7 +654,7 @@ class AutoCourseSession extends EventEmitter {
         this.currentCourseIndex = cIdx;
 
         const targetMinutes = (cConfig.targetHours || 0) * 60 + (cConfig.targetMinutes || 0);
-        this.status = 'scanning';
+        this._setStatus('scanning');
         this.emit('status', this.getStatus());
         this.log(`🔍 Bắt đầu quét Khóa học ${cIdx + 1}/${this.coursesConfig.length}: ${cConfig.courseUrl} (Mục tiêu: ${cConfig.targetHours || 0}h ${cConfig.targetMinutes || 0}m)`, 'info');
 
@@ -787,7 +859,7 @@ class AutoCourseSession extends EventEmitter {
           if (this._stopped) break;
           if (this._hitSchedulingLimit()) return;
 
-          this.status = 'studying';
+          this._setStatus('studying');
           this.emit('status', this.getStatus());
 
           let durationMs = lessonMinutes * 60 * 1000;
@@ -1002,7 +1074,6 @@ class AutoCourseSession extends EventEmitter {
         }
       }
 
-      const SCHEDULED_STATUSES = new Set(['daily-limit', 'date-limit', 'time-window', 'next-day']);
       if (this._stopped) {
         this.status = 'stopped';
         this.emit('status', this.getStatus());
@@ -1015,10 +1086,10 @@ class AutoCourseSession extends EventEmitter {
           // Bắt lại đúng loại lịch hẹn nếu ca/khung/ngân sách ngày vừa kết thúc
           // trong lúc xử lý bài cuối cùng của lượt quét.
           if (this._hitSchedulingLimit()) return;
-          this.status = 'next-day';
+          this._setStatus('next-day');
           this.log(`⏭️ Đã quét hết lượt hôm nay nhưng còn ${incompleteCourses.length}/${this.coursesConfig.length} khóa chưa đạt mục tiêu thời gian → Hẹn ${this.options.newDayStartTime || '06:00'} ngày học tiếp theo quét và treo tiếp!`, 'warn');
         } else {
-          this.status = 'completed';
+          this._setStatus('completed');
           this.log(`🎉 Tất cả các khóa học đã đạt mục tiêu và treo xong!`, 'success');
         }
         this.emit('status', this.getStatus());
@@ -1037,7 +1108,22 @@ class AutoCourseSession extends EventEmitter {
     }
   }
 
+  // Người dùng bấm Dừng trên Dashboard: hủy hẳn phiên.
+  // Đây là chuyển trạng thái kết thúc DUY NHẤT do người dùng chủ động — sau khi
+  // gọi, phiên ở 'stopped' + giai đoạn finished nên mọi emit muộn của vòng lặp
+  // start() (đang chạy dở) sẽ bị _setStatus() từ chối, không thể "sống lại".
+  async cancel() {
+    await this.stop();
+    this.status = 'stopped';
+    this.pausedFromStatus = null;
+    return this;
+  }
+
   async stop() {
+    // Dù chỉ được dọn dẹp một lần, giai đoạn vẫn phải chốt lại: một phiên đã gọi
+    // stop() (do người dùng bấm Dừng hoặc do khối finally của start()) là phiên
+    // đã chết — không bao giờ được start() lại.
+    this._phase = PHASE_FINISHED;
     if (this._stopped) return;
     this._stopped = true;
     this._clearStealthLoop();
@@ -1053,4 +1139,10 @@ module.exports = {
   courseReachedTarget,
   isAutoCourseAccountBlockingStatus,
   getPersistentAutoCourseOptions,
+  AUTO_COURSE_STATUSES,
+  TERMINAL_STATUSES,
+  SCHEDULED_STATUSES,
+  PHASE_NEW,
+  PHASE_RUNNING,
+  PHASE_FINISHED,
 };

@@ -10,13 +10,14 @@ const AUTO_STATUS = {
   'date-limit': { text: 'Ngày nghỉ — đã hẹn lịch', badge: 'badge-logging-in' },
   'daily-limit':{ text: 'Đủ giờ hôm nay — đã hẹn lịch', badge: 'badge-logging-in' },
   'time-window':{ text: 'Ngoài khung giờ — đã hẹn lịch', badge: 'badge-logging-in' },
+  'next-day':   { text: 'Còn khóa chưa xong — đã hẹn ngày sau', badge: 'badge-logging-in' },
   completed:    { text: 'Hoàn thành', badge: 'badge-completed' },
   stopped:      { text: 'Đã dừng', badge: 'badge-idle' },
   error:        { text: 'Lỗi', badge: 'badge-error' },
 };
 
 const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying']);
-const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window']);
+const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window', 'next-day']);
 const DONE_STATUSES = new Set(['completed', 'stopped', 'error']);
 
 function formatVNDateTime(iso) {
