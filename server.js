@@ -5,7 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { BotSession } = require('./bot');
-const { AutoCourseSession, isAutoCourseAccountBlockingStatus, getPersistentAutoCourseOptions } = require('./autoCourseEngine');
+const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES } = require('./autoCourseEngine');
+const { AutoCourseRegistry } = require('./autoCourseRegistry');
 const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
@@ -1545,8 +1546,18 @@ app.post('/lythuyet/api/queues/clear-completed', async (req, res) => {
 
 // =================== AUTO-SCAN COURSES API =================
 
-const autoScanSessions = new Map();
-const autoScanResumeTimers = new Map(); // sessionId -> timeout hẹn giờ chạy lại
+// Registry giữ MỌI quyền sở hữu của Auto-Scan: phiên theo ID, timer theo ID và
+// khóa theo tài khoản. Mọi chỗ trong file này phải đi qua nó — không được tự giữ
+// Map riêng, vì đó chính là nguyên nhân sinh phiên mồ côi/timer trùng trước đây.
+const autoScanRegistry = new AutoCourseRegistry({
+  log: msg => addLog({ timestamp: formatVN(new Date()), account: 'SYSTEM', msg, level: 'warn' }),
+});
+// Tài khoản đang bị phiên khác chiếm → chờ rồi thử lại (giống Queue thủ công)
+const ACCOUNT_BUSY_RETRY_MS = 5 * 60 * 1000;
+// Sau server restart, chờ một nhịp ngắn cho cấu hình/Firebase sẵn sàng rồi mới
+// chạy lại các phiên đang dở. Timer này được registry quản lý nên bấm Dừng/Xóa
+// trong lúc chờ sẽ hủy được (trước đây là setTimeout trần, không thể hủy).
+const RESTORE_START_DELAY_MS = 5000;
 const AUTOSCAN_STATE_FILE = path.join(__dirname, 'autoscan-state.json');
 const autoScanFileState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
 const autoScanStateSync = new SerializedStateSync({
@@ -1560,7 +1571,7 @@ const autoScanStateSync = new SerializedStateSync({
 function saveAutoScanState() {
   try {
     const state = [];
-    for (const [id, s] of autoScanSessions) {
+    for (const [id, s] of autoScanRegistry.entries()) {
       state.push({
         id: s.id,
         account: s.account,
@@ -1588,25 +1599,11 @@ function saveAutoScanState() {
   }
 }
 
-function clearAutoScanTimer(sessionId) {
-  const t = autoScanResumeTimers.get(sessionId);
-  if (t) { clearTimeout(t); autoScanResumeTimers.delete(sessionId); }
-}
-
-// Hẹn giờ an toàn với delay dài (chia bước 12h tránh tràn int32 của setTimeout)
-function scheduleAutoScanTimer(sessionId, fireAt, fn) {
-  clearAutoScanTimer(sessionId);
-  const MAX_STEP = 12 * 60 * 60 * 1000;
-  const delay = Math.max(1000, fireAt.getTime() - Date.now());
-  const t = setTimeout(() => {
-    autoScanResumeTimers.delete(sessionId);
-    if (fireAt.getTime() - Date.now() > 1000) {
-      scheduleAutoScanTimer(sessionId, fireAt, fn); // còn xa → hẹn bước tiếp theo
-    } else {
-      fn();
-    }
-  }, Math.min(delay, MAX_STEP));
-  autoScanResumeTimers.set(sessionId, t);
+// Hẹn giờ an toàn với delay dài (registry tự chia bước 12h tránh tràn int32),
+// và bảo đảm mỗi sessionId chỉ có duy nhất 1 timer đang chờ.
+function scheduleAutoScanTimer(sessionId, fireAt, fn, reason = 'timer') {
+  console.log(`[AUTOSCAN] timer ${reason} | session=${sessionId} | fireAt=${new Date(fireAt).toISOString()}`);
+  autoScanRegistry.setTimer(sessionId, fireAt, fn);
 }
 
 // Tạo + wire một phiên Auto-Scan (dùng chung cho start / restore / resume)
@@ -1623,16 +1620,22 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
 
   autoSession.on('log', (entry) => addLog(entry));
   autoSession.on('status', (status) => {
-    // Bỏ qua emit muộn của phiên đã bị xóa khỏi Dashboard để không hồi sinh thẻ
-    if (!autoScanSessions.has(status.id)) return;
+    // Chỉ phiên ĐANG là chủ của ID này được phép cập nhật Dashboard/state.
+    // So sánh theo danh tính đối tượng, không theo ID: một phiên đã bị thay thế
+    // (hoặc đã xóa) vẫn có thể emit muộn và ghi đè trạng thái thật nếu chỉ so ID.
+    if (!autoScanRegistry.isCurrent(autoSession)) return;
+    if (autoSession._reportedStatus !== status.status) {
+      console.log(`[AUTOSCAN] session=${sessionId} | account=${account.name} | ${autoSession._reportedStatus || 'new'} → ${status.status} | khóa ${(status.currentCourseIndex || 0) + 1}/${status.totalCourses || 0}`);
+      autoSession._reportedStatus = status.status;
+    }
     // Ghi nhận thời điểm kết thúc phiên (hoàn thành / dừng / lỗi)
-    if ((status.status === 'completed' || status.status === 'stopped' || status.status === 'error') && !autoSession.completedAt) {
+    if (AUTO_TERMINAL_STATUSES.has(status.status) && !autoSession.completedAt) {
       autoSession.completedAt = new Date().toISOString();
     }
     io.emit('autoscan-status', { ...status, nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
     saveAutoScanState();
     // Chạm giới hạn ngày / ngày nghỉ / hết khung giờ học → tự hẹn giờ chạy lại (giống Queue thủ công)
-    if (status.status === 'date-limit' || status.status === 'daily-limit' || status.status === 'time-window' || status.status === 'next-day') {
+    if (AUTO_SCHEDULED_STATUSES.has(status.status)) {
       scheduleAutoScanResume(autoSession);
     }
   });
@@ -1643,13 +1646,19 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     }
   });
 
-  autoScanSessions.set(sessionId, autoSession);
+  // adopt() thu hồi phiên cũ cùng ID (ngắt listener, nhả khóa tài khoản, đóng
+  // browser) nên không còn phiên mồ côi chạy nền ngoài tầm điều khiển.
+  autoScanRegistry.adopt(autoSession);
   return autoSession;
 }
 
 // Hẹn giờ chạy lại phiên Auto-Scan vào giờ ngày học hợp lệ tiếp theo
 // (hoặc đầu khung giờ học tiếp theo nếu đang ngoài khung giờ)
 function scheduleAutoScanResume(autoSession) {
+  // Phiên đã bị thay thế/xóa thì không được hẹn giờ (nếu không, timer sẽ hồi
+  // sinh một thẻ đã bị người dùng xóa khỏi Dashboard).
+  if (!autoScanRegistry.isCurrent(autoSession)) return;
+
   let resumeAt;
   if (autoSession.status === 'time-window' && (autoSession.options.timeWindows || []).length > 0) {
     resumeAt = new Date(Date.now() + calcNextWindowMs(autoSession.options.timeWindows));
@@ -1676,14 +1685,19 @@ function scheduleAutoScanResume(autoSession) {
   });
   io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime });
   saveAutoScanState();
-  scheduleAutoScanTimer(autoSession.id, resumeAt, () => restartAutoScanSession(autoSession.id));
+  scheduleAutoScanTimer(autoSession.id, resumeAt, () => restartAutoScanSession(autoSession.id), 'resume');
 }
 
 // Đến giờ hẹn → tạo lại phiên mới cùng ID và khởi động (phiên cũ đã đóng browser)
 function restartAutoScanSession(sessionId) {
-  const old = autoScanSessions.get(sessionId);
+  const old = autoScanRegistry.get(sessionId);
   if (!old) return;
-  if (old.status !== 'date-limit' && old.status !== 'daily-limit' && old.status !== 'time-window' && old.status !== 'next-day') return;
+  // Chỉ được restart từ một trạng thái đang hẹn giờ. 'stopped'/'completed'/'error'
+  // là kết thúc: không bao giờ tự chạy lại (chống "chạy tiếp sau khi đã Dừng").
+  if (!AUTO_SCHEDULED_STATUSES.has(old.status)) {
+    console.log(`[AUTOSCAN] bỏ qua restart | session=${sessionId} | status=${old.status} (không phải trạng thái hẹn giờ)`);
+    return;
+  }
 
   const fresh = createAutoScanSession(sessionId, old.account, old.coursesConfig, {
     headless: true,
@@ -1701,7 +1715,7 @@ function restartAutoScanSession(sessionId) {
     msg: `▶️ Đến giờ hẹn — khởi động lại Auto-Scan cho ${old.account.name}`,
     level: 'info',
   });
-  startAutoScanWhenFree(fresh);
+  startAutoScanWhenFree(fresh, 'hẹn-giờ');
   saveAutoScanState();
 }
 
@@ -1769,7 +1783,7 @@ async function loadAndRestoreAutoScans() {
         level: 'warn',
       });
       s.status = 'idle';
-      setTimeout(() => startAutoScanWhenFree(s), 5000);
+      scheduleAutoScanTimer(saved.id, Date.now() + RESTORE_START_DELAY_MS, () => startAutoScanWhenFree(s, 'khôi-phục'), 'restore');
       active++;
     } else if (saved.status === 'date-limit' && isAllowedStudyDate(new Date(), options.allowedDateRanges)) {
       // Hôm nay (giờ VN) đã là ngày học hợp lệ — bỏ qua lịch hẹn cũ (có thể sai do lệch múi giờ) → chạy lại ngay
@@ -1781,7 +1795,7 @@ async function loadAndRestoreAutoScans() {
       });
       s.status = 'idle';
       s.nextRunTime = null;
-      setTimeout(() => startAutoScanWhenFree(s), 5000);
+      scheduleAutoScanTimer(saved.id, Date.now() + RESTORE_START_DELAY_MS, () => startAutoScanWhenFree(s, 'khôi-phục-ngày-hợp-lệ'), 'restore');
       active++;
     } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window' || saved.status === 'next-day') {
       const fireAt = saved.nextRunTime
@@ -1796,7 +1810,7 @@ async function loadAndRestoreAutoScans() {
         level: 'info',
       });
       s.nextRunTime = fireAt.toISOString();
-      scheduleAutoScanTimer(saved.id, fireAt, () => restartAutoScanSession(saved.id));
+      scheduleAutoScanTimer(saved.id, fireAt, () => restartAutoScanSession(saved.id), 'restore-resume');
       active++;
     }
   }
@@ -1808,27 +1822,33 @@ async function loadAndRestoreAutoScans() {
 }
 
 // Tài khoản đang có phiên browser khác chạy (Queue thủ công hoặc Auto-Scan khác)?
-function findAccountConflict(email, excludeSessionId) {
+// `requester` là ĐỐI TƯỢNG phiên đang xin chạy (không phải ID) để so sánh danh tính.
+function findAccountConflict(email, requester = null) {
   const activeManual = [...sessions.values()].find(
     s => s.account.email === email && (s.status === 'running' || s.status === 'logging-in')
   );
   if (activeManual) return `phiên thủ công ${activeManual.id}`;
-  const activeAuto = [...autoScanSessions.values()].find(
-    s => s.id !== excludeSessionId && s.account.email === email
-      && isAutoCourseAccountBlockingStatus(s.status)
-  );
-  if (activeAuto) return `phiên Auto-Scan ${activeAuto.id}`;
+  const blocker = autoScanRegistry.whoBlocks(email, requester);
+  if (blocker) return `phiên Auto-Scan ${blocker.id}`;
   return null;
 }
 
 // Khởi động phiên Auto-Scan khi tài khoản rảnh — nếu đang bận thì chờ 5 phút thử lại (giống Queue thủ công)
-function startAutoScanWhenFree(autoSession) {
-  if (!autoScanSessions.has(autoSession.id)) return; // đã bị xóa
+function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
+  // Chỉ phiên đang là chủ của ID mới được chạy (chống phiên đã bị xóa/thay thế
+  // hồi sinh qua một timer cũ).
+  if (!autoScanRegistry.isCurrent(autoSession)) return;
   if (autoSession.status === 'stopped' || autoSession._stopped) return;
+  // Đối tượng phiên chỉ chạy đúng một lần — hai request/timer cùng gọi thì chỉ
+  // lần đầu mở browser (engine cũng có chốt riêng, đây là chốt sớm cho log rõ).
+  if (autoSession.isRunning() || autoSession.isFinished()) {
+    console.log(`[AUTOSCAN] bỏ qua start trùng | session=${autoSession.id} | trigger=${trigger} | phase=${autoSession._phase}`);
+    return;
+  }
 
-  const conflict = findAccountConflict(autoSession.account.email, autoSession.id);
+  const conflict = findAccountConflict(autoSession.account.email, autoSession);
   if (conflict) {
-    const retryAt = new Date(Date.now() + 5 * 60 * 1000);
+    const retryAt = new Date(Date.now() + ACCOUNT_BUSY_RETRY_MS);
     autoSession.nextRunTime = retryAt.toISOString();
     addLog({
       timestamp: formatVN(new Date()),
@@ -1838,14 +1858,22 @@ function startAutoScanWhenFree(autoSession) {
     });
     io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime });
     saveAutoScanState();
-    scheduleAutoScanTimer(autoSession.id, retryAt, () => startAutoScanWhenFree(autoSession));
+    scheduleAutoScanTimer(autoSession.id, retryAt, () => startAutoScanWhenFree(autoSession, 'thử-lại'), 'retry');
     return;
   }
 
+  // Giành khóa tài khoản NGAY tại đây (đồng bộ, không await giữa kiểm tra và
+  // ghi nhận) → hai request/timer đồng thời chỉ có một phiên mở browser.
+  autoScanRegistry.claimAccount(autoSession.account.email, autoSession);
   autoSession.nextRunTime = null;
-  autoSession.start().catch(err => {
-    addLog({ timestamp: formatVN(new Date()), account: autoSession.account.name, msg: `❌ Lỗi Auto-Scan: ${err.message}`, level: 'error' });
-  });
+  console.log(`[AUTOSCAN] start | session=${autoSession.id} | account=${autoSession.account.name} | trigger=${trigger} | khóa=${autoSession.coursesConfig.length}`);
+  autoSession.start()
+    .catch(err => {
+      addLog({ timestamp: formatVN(new Date()), account: autoSession.account.name, msg: `❌ Lỗi Auto-Scan: ${err.message}`, level: 'error' });
+    })
+    // Nhả khóa tài khoản ngay khi phiên kết thúc (dù thành công, lỗi hay hẹn
+    // giờ) để phiên khác của cùng tài khoản không phải chờ vô ích.
+    .finally(() => autoScanRegistry.releaseAccount(autoSession));
 }
 
 app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
@@ -1855,7 +1883,13 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
   }
 
   const allAccounts = loadAccounts();
-  const targetAccounts = accountIndices.map(idx => allAccounts[idx - 1]).filter(Boolean);
+  const requestedIndices = Array.isArray(accountIndices) ? accountIndices : [];
+  if (requestedIndices.length === 0) {
+    return res.status(400).json({ error: 'Cần chọn ít nhất 1 tài khoản' });
+  }
+  // Bỏ index trùng: chọn trùng một tài khoản (hoặc double-click) trước đây sinh
+  // 2 phiên cho cùng tài khoản → 2 browser tranh nhau 1 phiên đăng nhập Odoo.
+  const targetAccounts = [...new Set(requestedIndices)].map(idx => allAccounts[idx - 1]).filter(Boolean);
   if (targetAccounts.length === 0) {
     return res.status(400).json({ error: 'Không tìm thấy tài khoản hợp lệ' });
   }
@@ -1872,10 +1906,28 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
     : [];
 
   const started = [];
+  const skipped = [];
   const vnTodayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
 
   for (const acc of targetAccounts) {
-    const sessionId = `autoscan_${acc.name}_${Date.now()}`;
+    // Tài khoản đã có phiên Auto-Scan đang sống (chạy / tạm dừng / đang hẹn giờ)
+    // thì KHÔNG tạo thẻ thứ hai — bấm Bắt đầu lần nữa là thao tác vô ý, thẻ mới
+    // chỉ quay vòng trong vòng chờ 5 phút và làm Dashboard rối.
+    const existing = autoScanRegistry.values().find(
+      s => s.account.email === acc.email && !AUTO_TERMINAL_STATUSES.has(s.status)
+    );
+    if (existing) {
+      skipped.push({ sessionId: existing.id, account: acc.name, reason: `đã có phiên Auto-Scan ${existing.status}` });
+      addLog({
+        timestamp: formatVN(new Date()),
+        account: acc.name,
+        msg: `⚠️ Bỏ qua yêu cầu Bắt đầu trùng — tài khoản đã có phiên Auto-Scan (${existing.status})`,
+        level: 'warn',
+      });
+      continue;
+    }
+
+    const sessionId = autoScanRegistry.nextSessionId(acc.name);
     const autoSession = createAutoScanSession(sessionId, acc, courses, {
       headless: true,
       dailyMaxMinutes: dailyMaxMinutes || 480,
@@ -1891,16 +1943,16 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
       initialDailyDate: vnTodayStr,
     });
 
-    startAutoScanWhenFree(autoSession);
+    startAutoScanWhenFree(autoSession, 'api-start');
     started.push({ sessionId, account: acc.name });
   }
 
-  return respondAfterStateSync(res, saveAutoScanState(), { ok: true, started });
+  return respondAfterStateSync(res, saveAutoScanState(), { ok: true, started, skipped });
 });
 
 // Điều chỉnh thời gian đã học hôm nay cho phiên Auto-Scan
 app.post('/lythuyet/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
-  const autoSession = autoScanSessions.get(req.params.id);
+  const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
 
   const { minutes } = req.body;
@@ -1910,7 +1962,7 @@ app.post('/lythuyet/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
 
 // Tạm dừng 1 phiên Auto-Scan
 app.post('/lythuyet/api/auto-scan/pause/:id', async (req, res) => {
-  const autoSession = autoScanSessions.get(req.params.id);
+  const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
 
   const paused = autoSession.pause();
@@ -1922,18 +1974,21 @@ app.post('/lythuyet/api/auto-scan/pause/:id', async (req, res) => {
 
 // Tiếp tục 1 phiên Auto-Scan
 app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
-  const autoSession = autoScanSessions.get(req.params.id);
+  const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
   if (autoSession.status !== 'paused') {
     return res.status(400).json({ error: 'Không thể tiếp tục (phiên không đang tạm dừng)' });
   }
 
-  if (autoSession.browser) {
-    // Phiên còn browser đang mở → tiếp tục ngay tại chỗ
+  // Điều kiện đúng là "vòng lặp start() còn đang chạy", KHÔNG phải "còn browser":
+  // trong lúc đang mở Chromium/đăng nhập thì `browser` vẫn null, nếu xét theo
+  // browser sẽ tạo thêm một phiên mới song song với phiên đang khởi động.
+  if (autoSession.isRunning()) {
+    // Phiên còn đang chạy → tiếp tục ngay tại chỗ
     autoSession.resume();
     io.emit('autoscan-status', autoSession.getStatus());
   } else {
-    // Phiên tạm dừng được khôi phục sau server restart (không còn browser)
+    // Phiên tạm dừng được khôi phục sau server restart (vòng lặp đã chết)
     // → tạo lại phiên mới cùng ID từ tiến độ đã lưu (giống Queue thủ công resume sau restart)
     const fresh = createAutoScanSession(autoSession.id, autoSession.account, autoSession.coursesConfig, {
       headless: true,
@@ -1950,7 +2005,7 @@ app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
       msg: '▶️ Tiếp tục Auto-Scan sau khi server khởi động lại — chạy lại từ tiến độ đã lưu',
       level: 'info',
     });
-    startAutoScanWhenFree(fresh);
+    startAutoScanWhenFree(fresh, 'resume-sau-restart');
   }
 
   return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
@@ -1958,12 +2013,12 @@ app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
 
 // Dừng 1 phiên Auto-Scan theo yêu cầu từ Dashboard (hủy cả lịch hẹn nếu có)
 app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
-  const autoSession = autoScanSessions.get(req.params.id);
+  const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
 
-  clearAutoScanTimer(req.params.id);
-  await autoSession.stop();
-  autoSession.status = 'stopped';
+  autoScanRegistry.clearTimer(req.params.id);
+  await autoSession.cancel(); // đóng browser + chốt trạng thái 'stopped' (không thể chạy lại)
+  autoScanRegistry.releaseAccount(autoSession);
   autoSession.nextRunTime = null;
   if (!autoSession.completedAt) autoSession.completedAt = new Date().toISOString();
   io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: null, completedAt: autoSession.completedAt });
@@ -1979,12 +2034,11 @@ app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
 // Xóa tất cả phiên Auto-Scan đã kết thúc (hoàn thành / dừng / lỗi) khỏi Dashboard
 app.post('/lythuyet/api/auto-scan/clear-completed', async (req, res) => {
   let clearedCount = 0;
-  for (const [id, autoSession] of autoScanSessions) {
-    if (autoSession.status === 'completed' || autoSession.status === 'stopped' || autoSession.status === 'error') {
-      clearAutoScanTimer(id);
-      await autoSession.stop();
-      autoSession.removeAllListeners('status');
-      autoScanSessions.delete(id);
+  for (const [id, autoSession] of autoScanRegistry.entries()) {
+    if (AUTO_TERMINAL_STATUSES.has(autoSession.status)) {
+      // forget() hủy timer, ngắt TẤT CẢ listener (log/status/progress-saved),
+      // nhả khóa tài khoản rồi mới đóng browser.
+      await autoScanRegistry.forget(id);
       io.emit('autoscan-removed', id);
       clearedCount++;
     }
@@ -1994,13 +2048,12 @@ app.post('/lythuyet/api/auto-scan/clear-completed', async (req, res) => {
 
 // Xóa thẻ phiên Auto-Scan khỏi Dashboard (hủy cả lịch hẹn nếu có)
 app.delete('/lythuyet/api/auto-scan/sessions/:id', async (req, res) => {
-  const autoSession = autoScanSessions.get(req.params.id);
-  if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
+  if (!autoScanRegistry.has(req.params.id)) {
+    return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
+  }
 
-  clearAutoScanTimer(req.params.id);
-  await autoSession.stop();
-  autoSession.removeAllListeners('status');
-  autoScanSessions.delete(req.params.id);
+  // forget() = hủy timer + ngắt mọi listener + nhả khóa tài khoản + đóng browser.
+  await autoScanRegistry.forget(req.params.id);
   io.emit('autoscan-removed', req.params.id);
   return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
 });
@@ -2421,7 +2474,7 @@ io.on('connection', (socket) => {
     queueList.push(getQueueStatus(queue));
   }
   const autoScanList = [];
-  for (const [id, autoSession] of autoScanSessions) {
+  for (const [id, autoSession] of autoScanRegistry.entries()) {
     autoScanList.push({ ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
   }
   socket.emit('init', {

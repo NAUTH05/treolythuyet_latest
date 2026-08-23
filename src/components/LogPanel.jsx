@@ -49,6 +49,7 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
   const [filterLevel, setFilterLevel] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Không memo hóa: ngày VN phải tự đổi khi qua nửa đêm mà không cần F5 lại trang.
   const todayStr = vnDateDDMMYYYY();
   const isTodaySelected = selectedDate === todayStr;
 
@@ -181,7 +182,9 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
       ext = 'json';
     } else {
       content = filteredLogs
-        .map(l => `[${l.timestamp}] [${l.account || 'system'}] [${(l.level || 'info').toUpperCase()}] ${l.msg}`)
+        .map(l => l.level === 'separator'
+          ? l.msg
+          : `[${l.timestamp}] [${l.account || 'system'}] [${(l.level || 'info').toUpperCase()}] ${l.msg}`)
         .join('\n');
     }
 
@@ -373,7 +376,11 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
                   Chưa có log phù hợp bộ lọc ngày {selectedDate}
                 </div>
               ) : (
-                filteredLogs.map((entry, i) => (
+                filteredLogs.map((entry, i) => entry.level === 'separator' ? (
+                  <div key={i} className="log-session-separator" aria-label={`Bắt đầu session ${entry.account || ''}`}>
+                    {entry.msg}
+                  </div>
+                ) : (
                   <div key={i} className="log-line">
                     <span className="log-time">{entry.timestamp}</span>{' '}
                     <span className="log-account">[{entry.account || 'system'}]</span>{' '}

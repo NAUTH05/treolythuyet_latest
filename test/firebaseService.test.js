@@ -12,7 +12,7 @@ test('all writes to the same Firebase document are globally serialized', async t
     concurrent++;
     maxConcurrent = Math.max(maxConcurrent, concurrent);
     const body = JSON.parse(options.body);
-    const revision = body.fields.revision.doubleValue;
+    const revision = Number(body.fields.revision.integerValue);
     await new Promise(resolve => setTimeout(resolve, revision === 1 ? 20 : 1));
     revisions.push(revision);
     concurrent--;
@@ -37,7 +37,7 @@ test('collection deletion waits for older writes and blocks newer writes until d
     const method = options.method || 'GET';
     if (method === 'PATCH') {
       const body = JSON.parse(options.body);
-      const revision = body.fields.revision.doubleValue;
+      const revision = Number(body.fields.revision.integerValue);
       if (revision === 1) await new Promise(resolve => setTimeout(resolve, 20));
       operations.push(`PATCH:${revision}`);
       return { ok: true, status: 200 };

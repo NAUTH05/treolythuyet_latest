@@ -5,6 +5,9 @@ const {
   courseReachedTarget,
   isAutoCourseAccountBlockingStatus,
   getPersistentAutoCourseOptions,
+  AUTO_COURSE_STATUSES,
+  TERMINAL_STATUSES,
+  SCHEDULED_STATUSES,
 } = require('../autoCourseEngine');
 const { extractSlideIdFromUrl, getNextShiftStart } = require('../courseScanner');
 
@@ -150,4 +153,111 @@ test('restart/resume persistence keeps custom date shifts and all scheduling opt
   assert.deepEqual(options.allowedDateRanges, ['10/08/2026']);
   assert.deepEqual(options.timeWindows, [{ start: '06:30', end: '18:00' }]);
   assert.equal(options.initialDailyMinutes, 25);
+});
+
+// ============ VÒNG ĐỜI PHIÊN: chống chạy trùng & trạng thái sai ============
+
+// Hôm nay chắc chắn KHÔNG nằm trong danh sách ngày học → start() thoát sớm ở
+// nhánh 'date-limit' và không mở Chromium, nên test chạy được offline.
+function offDaySession(id = 'test') {
+  return new AutoCourseSession(
+    id,
+    { name: 'Test', email: 't@x.vn' },
+    [{ courseUrl: 'https://x/slides/course-1', targetMinutes: 60 }],
+    { allowedDateRanges: ['01/01/2000'] }
+  );
+}
+
+test('một đối tượng phiên chỉ được chạy đúng một lần', async () => {
+  const session = offDaySession();
+  const warns = [];
+  session.on('log', entry => { if (entry.level === 'warn') warns.push(entry.msg); });
+
+  await session.start();
+  assert.equal(session.status, 'date-limit');
+  assert.equal(session.isFinished(), true);
+  assert.equal(session.isRunning(), false);
+
+  await session.start(); // double-click / timer trùng / restore chồng lệnh
+  assert.equal(session.status, 'date-limit', 'lần gọi thứ hai không được chạy lại');
+  assert.equal(warns.some(msg => msg.includes('trùng lặp')), true, 'phải ghi log từ chối rõ ràng');
+});
+
+test('start() bị từ chối khi phiên đang chạy (hai request đồng thời)', async () => {
+  const session = offDaySession();
+  session._phase = 'running'; // giả lập vòng lặp start() đang chạy dở
+  const warns = [];
+  session.on('log', entry => { if (entry.level === 'warn') warns.push(entry.msg); });
+
+  await session.start();
+  assert.equal(session.status, 'idle', 'không được bắt đầu lần thứ hai');
+  assert.equal(warns.some(msg => msg.includes('trùng lặp')), true);
+});
+
+test('phiên chưa khởi động không chiếm tài khoản; đang chạy hoặc tạm dừng thì có', () => {
+  const session = offDaySession();
+  assert.equal(session.ownsAccountSession(), false, 'phiên vừa tạo không chiếm gì cả');
+
+  session._phase = 'running';
+  assert.equal(session.ownsAccountSession(), true);
+
+  session.status = 'studying';
+  assert.equal(session.pause(), true);
+  session._phase = 'finished'; // vòng lặp chết sau server restart, vẫn đang paused
+  assert.equal(session.ownsAccountSession(), true, 'phiên tạm dừng vẫn giữ tài khoản');
+});
+
+test('tạm dừng trong lúc đang khởi động không bị ghi đè bởi bước đăng nhập', () => {
+  const session = offDaySession();
+  session._phase = 'running';
+  assert.equal(session.pause(), true);
+  assert.equal(session.status, 'paused');
+
+  // Engine đi tiếp tới bước đăng nhập / quét khóa trong lúc người dùng đã bấm Tạm dừng
+  session._setStatus('logging-in');
+  session._setStatus('scanning');
+  assert.equal(session.status, 'paused', 'phải giữ nguyên Tạm dừng');
+  assert.equal(session.pausedFromStatus, 'scanning', 'ghi nhớ trạng thái sẽ quay lại');
+
+  assert.equal(session.resume(), true);
+  assert.equal(session.status, 'scanning');
+});
+
+test('phiên đã bị Dừng không thể quay lại chạy hay tự nhận hoàn thành', async () => {
+  const session = offDaySession();
+  await session.cancel();
+
+  assert.equal(session.status, 'stopped');
+  assert.equal(session.isFinished(), true);
+
+  assert.equal(session._setStatus('studying'), false);
+  assert.equal(session._setStatus('completed'), false);
+  assert.equal(session.status, 'stopped', 'trạng thái kết thúc là chốt cuối');
+
+  // Giới hạn ngày cũng không được hồi sinh phiên đã hủy thành trạng thái hẹn giờ
+  session.dailyStudiedMinutes = session.options.dailyMaxMinutes;
+  assert.equal(session._hitDailyLimit(), true);
+  assert.equal(session.status, 'stopped');
+  assert.equal(SCHEDULED_STATUSES.has(session.status), false, 'server không được hẹn giờ chạy lại');
+});
+
+test('phiên hết ngày học chỉ hẹn giờ, không tự đánh dấu hoàn thành', async () => {
+  const session = offDaySession();
+  const statuses = [];
+  session.on('status', s => statuses.push(s.status));
+
+  await session.start();
+
+  assert.deepEqual(statuses, ['date-limit']);
+  assert.equal(SCHEDULED_STATUSES.has(session.status), true);
+  assert.equal(TERMINAL_STATUSES.has(session.status), false);
+});
+
+test('danh sách trạng thái chính thức đủ và không chồng lấn', () => {
+  for (const status of [...TERMINAL_STATUSES, ...SCHEDULED_STATUSES]) {
+    assert.equal(AUTO_COURSE_STATUSES.includes(status), true, `thiếu ${status} trong danh sách chính thức`);
+  }
+  for (const status of SCHEDULED_STATUSES) {
+    assert.equal(TERMINAL_STATUSES.has(status), false, `${status} vừa là hẹn giờ vừa là kết thúc`);
+  }
 });
