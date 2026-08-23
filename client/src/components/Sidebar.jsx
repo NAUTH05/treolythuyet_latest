@@ -44,14 +44,20 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
     document.removeEventListener('mouseup', handleMouseUp);
   };
 
-  const navItems = [
-    { id: 'dashboard', label: 'Tổng quan', icon: '◈' },
-    { id: 'autoscan', label: 'Auto Scan Khóa Học', icon: '⟳', badge: activeAutoScansCount },
-    { id: 'control', label: 'Điều khiển Box', icon: '▶' },
-    { id: 'accounts', label: 'Tài khoản', icon: '○' },
-    { id: 'queues', label: 'Hàng chờ & Phiên', icon: '≡', badge: activeQueuesCount + activeSessionsCount },
-    { id: 'logs', label: 'Logs', icon: '∷' },
-    { id: 'settings', label: 'Cài đặt & Firebase', icon: '◎' },
+  const navGroups = [
+    { label: 'Workspace', items: [
+      { id: 'dashboard', label: 'Tổng quan', icon: '◈' },
+      { id: 'control', label: 'Treo Box bài học', icon: '▶' },
+      { id: 'autoscan', label: 'Auto Scan khóa học', icon: '⟳', badge: activeAutoScansCount },
+    ] },
+    { label: 'Theo dõi', items: [
+      { id: 'queues', label: 'Hàng chờ & phiên', icon: '≡', badge: activeQueuesCount + activeSessionsCount },
+      { id: 'logs', label: 'Logs', icon: '∷' },
+    ] },
+    { label: 'Quản trị', items: [
+      { id: 'accounts', label: 'Tài khoản', icon: '○' },
+      { id: 'settings', label: 'Cài đặt hệ thống', icon: '◎' },
+    ] },
   ];
 
   const sidebarWidth = collapsed ? 70 : width;
@@ -88,7 +94,10 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
 
       {/* Nav Menu */}
       <nav className="sidebar-nav">
-        {navItems.map((item) => {
+        {navGroups.map(group => (
+          <div className="nav-group" key={group.label}>
+            {!collapsed && <div className="nav-group-label">{group.label}</div>}
+            {group.items.map((item) => {
           const isActive = activeTab === item.id;
           return (
             <button
@@ -104,7 +113,9 @@ export default function Sidebar({ activeTab, onTabChange, connected, onStopAll, 
               )}
             </button>
           );
-        })}
+            })}
+          </div>
+        ))}
       </nav>
 
       {/* Bottom Actions */}

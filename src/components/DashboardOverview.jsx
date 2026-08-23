@@ -20,8 +20,15 @@ export default function DashboardOverview({ accounts, sessions, queues, autoScan
   return (
     <div className="overview-container">
       <div className="overview-welcome">
-        <h2>Tổng quan hệ thống</h2>
-        <p>Theo dõi nhanh tiến độ treo bài học, các phiên đang hoạt động và danh sách tài khoản.</p>
+        <div>
+          <span className="eyebrow">TRUNG TÂM ĐIỀU HÀNH</span>
+          <h2>Tổng quan hệ thống</h2>
+          <p>Theo dõi nhanh tiến độ treo bài học, các phiên đang hoạt động và danh sách tài khoản.</p>
+        </div>
+        <div className="overview-primary-actions">
+          <button className="btn btn-primary" onClick={() => onNavigate('control')}>+ Treo Box mới</button>
+          <button className="btn btn-outline" onClick={() => onNavigate('autoscan')}>Auto Scan</button>
+        </div>
       </div>
 
       <div className="overview-grid">
@@ -79,28 +86,22 @@ export default function DashboardOverview({ accounts, sessions, queues, autoScan
         </div>
       </div>
 
-      {/* Quick Action Grid */}
-      <div className="card">
-        <div className="card-header">Thao tác nhanh</div>
-        <div className="card-body" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-          <button className="btn btn-primary" onClick={() => onNavigate('control')}>
-            Bắt đầu treo Box bài mới
-          </button>
-          <button className="btn btn-outline" onClick={() => onNavigate('autoscan')}>
-            Auto-Scan khóa học
-          </button>
-          <button className="btn btn-outline" onClick={() => onNavigate('accounts')}>
-            Thêm tài khoản mới
-          </button>
-          <button className="btn btn-outline" onClick={() => onNavigate('queues')}>
-            Xem tiến độ hàng chờ
-          </button>
-          <button className="btn btn-outline" onClick={() => onNavigate('logs')}>
-            Xem Logs
-          </button>
-          <button className="btn btn-outline" onClick={() => onNavigate('settings')}>
-            Cấu hình Firebase & Mật khẩu
-          </button>
+      <div className="overview-lower-grid">
+        <div className="card">
+          <div className="card-header">Bắt đầu nhanh</div>
+          <div className="card-body quick-actions">
+            <button className="quick-action" onClick={() => onNavigate('control')}><span className="quick-action-icon">▶</span><span><strong>Treo Box bài học</strong><small>Tạo phiên chạy thủ công</small></span><span className="quick-action-arrow">→</span></button>
+            <button className="quick-action" onClick={() => onNavigate('autoscan')}><span className="quick-action-icon">⟳</span><span><strong>Auto Scan khóa học</strong><small>Quét và học theo lịch</small></span><span className="quick-action-arrow">→</span></button>
+            <button className="quick-action" onClick={() => onNavigate('accounts')}><span className="quick-action-icon">○</span><span><strong>Thêm tài khoản</strong><small>Mở danh sách tài khoản</small></span><span className="quick-action-arrow">→</span></button>
+          </div>
+        </div>
+        <div className="card overview-health-card">
+          <div className="card-header">Tình trạng hệ thống</div>
+          <div className="card-body">
+            <div className="health-row"><span className="health-dot health-dot-success" /><span>Phiên đang chạy</span><strong>{activeSessionsList.length}</strong></div>
+            <div className="health-row"><span className="health-dot health-dot-warning" /><span>Đang chờ xử lý</span><strong>{activeQueuesList.length}</strong></div>
+            <div className="health-row"><span className="health-dot health-dot-info" /><span>Auto Scan hoạt động</span><strong>{activeAutoScansList.length}</strong></div>
+            <button className="btn btn-ghost btn-block overview-secondary-action" onClick={() => onNavigate('queues')}>Xem tất cả tiến độ →</button>
         </div>
       </div>
     </div>
