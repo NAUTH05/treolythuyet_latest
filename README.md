@@ -39,27 +39,83 @@ Thêm bao nhiêu tài khoản tùy ý.
 
 Ứng dụng chỉ truy cập Firestore từ Node.js bằng Firebase Admin SDK. Không nhập hoặc gửi service-account JSON qua Dashboard.
 
-### Cấu hình khuyến nghị trên VPS
+### Cấu hình đầy đủ trên VPS
 
-1. Firebase Console -> Project settings -> Service accounts -> Generate new private key.
-2. Chép file lên VPS, ngoài thư mục Git:
+1. Mở Firebase Console của đúng project đang chứa dữ liệu:
 
-```bash
-sudo install -d -m 700 /etc/treohoc
-sudo install -m 600 service-account.json /etc/treohoc/firebase-service-account.json
+```text
+Project settings -> Service accounts -> Firebase Admin SDK -> Generate new private key
 ```
 
-3. Cấu hình đường dẫn credential cho tiến trình Node/PM2:
+File tải xuống là service-account JSON. Đây không phải Firebase Web Config có `apiKey`.
+
+2. Trên VPS, tạo thư mục credential ngoài repository:
 
 ```bash
-export FIREBASE_SERVICE_ACCOUNT_FILE=/etc/treohoc/firebase-service-account.json
+mkdir -p "$HOME/.config/treoweb"
+chmod 700 "$HOME/.config/treoweb"
+```
+
+3. Từ máy đang giữ file JSON, upload file lên VPS. Thay `VPS_HOST` bằng hostname hoặc IP thật:
+
+```bash
+scp service-account.json \
+  dpdns-mrnauthdev@VPS_HOST:/home/dpdns-mrnauthdev/.config/treoweb/firebase-service-account.json
+```
+
+Cũng có thể upload bằng trình quản lý file của VPS vào đúng đường dẫn trên.
+
+4. Trên VPS, giới hạn quyền đọc file:
+
+```bash
+chmod 600 "$HOME/.config/treoweb/firebase-service-account.json"
+```
+
+5. Kiểm tra `project_id` và email của service account mà không in private key:
+
+```bash
+node -e "const c=require(process.env.HOME+'/.config/treoweb/firebase-service-account.json'); console.log(c.project_id, c.client_email)"
+```
+
+6. Cài dependency và chạy xác minh Admin SDK:
+
+```bash
+cd "$HOME/htdocs/mrnauthdev.dpdns.org/treolythuyet_latest"
+npm ci --omit=dev
+
+export FIREBASE_SERVICE_ACCOUNT_FILE="$HOME/.config/treoweb/firebase-service-account.json"
 npm run verify:firebase-admin
 ```
 
-Với PM2, thêm biến sau vào phần `env` của cấu hình triển khai rồi restart tiến trình:
+Lệnh xác minh phải kết thúc với:
+
+```text
+[VERIFY] Firebase Admin SDK read/write verification passed
+[VERIFY] Server-side Firestore access is ready for deny-all client rules
+```
+
+7. `ecosystem.config.js` đã cấu hình credential cho tiến trình `treoweb`:
 
 ```js
-FIREBASE_SERVICE_ACCOUNT_FILE: '/etc/treohoc/firebase-service-account.json'
+FIREBASE_SERVICE_ACCOUNT_FILE: '/home/dpdns-mrnauthdev/.config/treoweb/firebase-service-account.json'
+```
+
+Nếu deploy bằng user khác, cập nhật đường dẫn này cho đúng home directory. Không đặt nội dung JSON hoặc private key trong `ecosystem.config.js`.
+
+8. Reload PM2 và lưu cấu hình cho lần reboot tiếp theo:
+
+```bash
+pm2 startOrReload ecosystem.config.js --update-env
+pm2 save
+pm2 logs treoweb --lines 100
+```
+
+Log khởi động thành công phải có:
+
+```text
+[FIREBASE] Admin SDK initialized
+[FIREBASE] Using server-side Admin SDK authentication
+[FIREBASE] Firestore connection verified
 ```
 
 Các nguồn credential khác được hỗ trợ:
@@ -74,7 +130,7 @@ Không commit service-account JSON, private key hoặc `.env` vào Git.
 
 ### Chuyển Firestore Rules sang deny-all
 
-Chỉ publish rules dưới đây sau khi `npm run verify:firebase-admin` báo thành công và log server có:
+Chỉ publish rules dưới đây sau khi `npm run verify:firebase-admin` báo thành công, PM2 khởi động bình thường và dữ liệu Accounts/Presets/Queue/Auto-Scan đã được kiểm tra:
 
 ```text
 [FIREBASE] Admin SDK initialized
@@ -95,6 +151,13 @@ service cloud.firestore {
 ```
 
 Firebase Admin SDK chạy trên server không phụ thuộc Firestore client Security Rules. Dashboard chỉ gọi API Node.js và không chứa Firebase browser SDK.
+
+Sau khi publish deny-all rules, chạy lại để xác nhận server vẫn đọc và ghi được Firestore:
+
+```bash
+export FIREBASE_SERVICE_ACCOUNT_FILE="$HOME/.config/treoweb/firebase-service-account.json"
+npm run verify:firebase-admin
+```
 
 ### Web Dashboard (Mặc định)
 

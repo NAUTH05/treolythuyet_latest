@@ -14,6 +14,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production',
         PORT: 3000,
+        FIREBASE_SERVICE_ACCOUNT_FILE: '/home/dpdns-mrnauthdev/.config/treoweb/firebase-service-account.json',
       },
     },
   ],
