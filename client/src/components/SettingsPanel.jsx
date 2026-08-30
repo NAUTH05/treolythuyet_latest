@@ -1,43 +1,22 @@
 import { useEffect, useState } from 'react';
 import * as api from '../api';
-import { initFirebaseClient } from '../firebaseClient';
 
 export default function SettingsPanel({ toast }) {
-  // Password state
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [passLoading, setPassLoading] = useState(false);
-
-  // Firebase state
-  const [firebaseConfig, setFirebaseConfig] = useState({
-    apiKey: '',
-    authDomain: '',
-    projectId: '',
-    storageBucket: '',
-    messagingSenderId: '',
-    appId: '',
-  });
   const [fbLoading, setFbLoading] = useState(false);
-  const [fbConnected, setFbConnected] = useState(false);
+  const [firebaseStatus, setFirebaseStatus] = useState({ connected: false, admin: {} });
 
-  // Load existing Firebase config
-  useEffect(() => {
-    api.fetchFirebaseConfig()
-      .then(data => {
-        if (data && data.config) {
-          setFirebaseConfig(data.config);
-          setFbConnected(!!data.connected);
-          if (data.config.projectId && data.config.apiKey) {
-            initFirebaseClient(data.config);
-          }
-        }
-      })
-      .catch(() => {});
-  }, []);
+  const loadFirebaseStatus = () => api.fetchFirebaseConfig()
+    .then(data => setFirebaseStatus(data || { connected: false, admin: {} }))
+    .catch(() => setFirebaseStatus({ connected: false, admin: {} }));
 
-  const handleChangePassword = async (e) => {
-    e.preventDefault();
+  useEffect(() => { loadFirebaseStatus(); }, []);
+
+  const handleChangePassword = async (event) => {
+    event.preventDefault();
     if (newPassword !== confirmPassword) {
       toast('Mật khẩu mới xác nhận không khớp', 'error');
       return;
@@ -46,8 +25,7 @@ export default function SettingsPanel({ toast }) {
     try {
       const data = await api.changePassword(oldPassword, newPassword);
       if (data.ok) {
-        // Server đã thu hồi mọi token → buộc đăng nhập lại bằng mật khẩu mới
-        toast('Đã đổi mật khẩu — vui lòng đăng nhập lại', 'success');
+        toast('Đã đổi mật khẩu - vui lòng đăng nhập lại', 'success');
         sessionStorage.removeItem('treohoc_admin_token');
         setTimeout(() => window.location.reload(), 800);
       } else {
@@ -60,75 +38,46 @@ export default function SettingsPanel({ toast }) {
     }
   };
 
-  const handleSaveFirebase = async (e) => {
-    e.preventDefault();
+  const handleVerifyFirebase = async () => {
     setFbLoading(true);
     try {
-      const data = await api.saveFirebaseConfig(firebaseConfig);
+      const data = await api.saveFirebaseConfig();
+      setFirebaseStatus(data || { connected: false, admin: {} });
       if (data.ok) {
-        initFirebaseClient(firebaseConfig);
-        setFbConnected(!!data.connected);
-        toast(
-          data.restartRequired
-            ? 'Đã lưu Firebase; cần khởi động lại máy chủ để khôi phục Queue và Auto-Scan an toàn'
-            : data.synchronization?.synchronized
-            ? 'Đã lưu cấu hình và xác nhận đồng bộ Firebase'
-            : 'Đã kết nối Firebase; dữ liệu đang tiếp tục đồng bộ nền',
-          'success'
-        );
+        toast(data.restartRequired
+          ? 'Admin SDK đã xác minh; cần khởi động lại máy chủ để khôi phục Queue và Auto-Scan an toàn'
+          : 'Firebase Admin SDK đã kết nối và đồng bộ', 'success');
       } else {
-        setFbConnected(false);
-        toast(
-          data.restartRequired
-            ? `${data.error || 'Firebase chưa đồng bộ đầy đủ'}; cần khởi động lại máy chủ`
-            : data.error || 'Lỗi kết nối Firebase',
-          'error'
-        );
+        toast(data.error || 'Không thể xác minh Firebase Admin SDK', 'error');
       }
     } catch (error) {
-      setFbConnected(false);
-      toast(error.message || 'Lỗi lưu Firebase', 'error');
+      toast(error.message || 'Không thể xác minh Firebase Admin SDK', 'error');
     } finally {
       setFbLoading(false);
+      loadFirebaseStatus();
     }
   };
 
+  const admin = firebaseStatus.admin || {};
+  const connected = Boolean(firebaseStatus.connected);
+
   return (
     <div className="two-col-grid">
-      {/* Admin Password Management */}
       <div className="card">
         <div className="card-header">Bảo mật mật khẩu Admin</div>
         <div className="card-body">
           <form onSubmit={handleChangePassword}>
             <div className="form-group">
               <label>Mật khẩu Admin hiện tại</label>
-              <input
-                type="password"
-                placeholder="Nhập mật khẩu cũ..."
-                value={oldPassword}
-                onChange={e => setOldPassword(e.target.value)}
-                required
-              />
+              <input type="password" value={oldPassword} onChange={e => setOldPassword(e.target.value)} required />
             </div>
             <div className="form-group">
               <label>Mật khẩu Admin mới</label>
-              <input
-                type="password"
-                placeholder="Nhập mật khẩu mới..."
-                value={newPassword}
-                onChange={e => setNewPassword(e.target.value)}
-                required
-              />
+              <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} required />
             </div>
             <div className="form-group">
               <label>Xác nhận mật khẩu mới</label>
-              <input
-                type="password"
-                placeholder="Nhập lại mật khẩu mới..."
-                value={confirmPassword}
-                onChange={e => setConfirmPassword(e.target.value)}
-                required
-              />
+              <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} required />
             </div>
             <button type="submit" className="btn btn-primary" disabled={passLoading}>
               {passLoading ? 'Đang lưu...' : 'Đổi mật khẩu Admin'}
@@ -137,97 +86,29 @@ export default function SettingsPanel({ toast }) {
         </div>
       </div>
 
-      {/* Firebase Configuration & Tutorial */}
       <div className="card">
         <div className="card-header" style={{ justifyContent: 'space-between' }}>
-          <span>Cấu hình Firebase Database</span>
-          <span className={`session-badge ${fbConnected ? 'badge-completed' : 'badge-idle'}`}>
-            {fbConnected ? 'Đã kết nối' : 'Chưa kết nối'}
+          <span>Firebase Admin SDK</span>
+          <span className={`session-badge ${connected ? 'badge-completed' : 'badge-idle'}`}>
+            {connected ? 'Đã xác minh' : 'Chưa kết nối'}
           </span>
         </div>
         <div className="card-body">
-          <form onSubmit={handleSaveFirebase}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-              <div className="form-group">
-                <label>API Key (apiKey)</label>
-                <input
-                  type="text"
-                  placeholder="AIzaSy..."
-                  value={firebaseConfig.apiKey}
-                  onChange={e => setFirebaseConfig({ ...firebaseConfig, apiKey: e.target.value })}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Auth Domain (authDomain)</label>
-                <input
-                  type="text"
-                  placeholder="project-id.firebaseapp.com"
-                  value={firebaseConfig.authDomain}
-                  onChange={e => setFirebaseConfig({ ...firebaseConfig, authDomain: e.target.value })}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Project ID (projectId)</label>
-                <input
-                  type="text"
-                  placeholder="project-id"
-                  value={firebaseConfig.projectId}
-                  onChange={e => setFirebaseConfig({ ...firebaseConfig, projectId: e.target.value })}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Storage Bucket (storageBucket)</label>
-                <input
-                  type="text"
-                  placeholder="project-id.appspot.com"
-                  value={firebaseConfig.storageBucket}
-                  onChange={e => setFirebaseConfig({ ...firebaseConfig, storageBucket: e.target.value })}
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Messaging Sender ID</label>
-                <input
-                  type="text"
-                  placeholder="1234567890..."
-                  value={firebaseConfig.messagingSenderId}
-                  onChange={e => setFirebaseConfig({ ...firebaseConfig, messagingSenderId: e.target.value })}
-                />
-              </div>
-
-              <div className="form-group">
-                <label>App ID (appId)</label>
-                <input
-                  type="text"
-                  placeholder="1:123456:web:abcd..."
-                  value={firebaseConfig.appId}
-                  onChange={e => setFirebaseConfig({ ...firebaseConfig, appId: e.target.value })}
-                  required
-                />
-              </div>
-            </div>
-
-            <button type="submit" className="btn btn-primary" disabled={fbLoading}>
-              {fbLoading ? 'Đang lưu & test...' : 'Lưu cấu hình Firebase'}
-            </button>
-          </form>
-
-          {/* Tutorial step by step */}
-          <div className="tutorial">
-            <h4>Hướng dẫn lấy tham số & mở quyền Firestore Database</h4>
-            <ol>
-              <li>Truy cập <b>console.firebase.google.com</b> → bấm <b>Add Project</b> tạo project mới.</li>
-              <li>Tại trang chủ dự án, bấm biểu tượng Web <b>&lt;/&gt;</b> (Add app) để lấy mã Config.</li>
-              <li>Vào menu <b>Build</b> → <b>Firestore Database</b> → bấm <b>Create Database</b>.</li>
-              <li><b>Rất quan trọng</b>: Vào tab <b>Rules</b> của Firestore Database, sửa <code>allow read, write: if false;</code> thành <code>allow read, write: if true;</code> rồi bấm <b>Publish</b> thì mới cho phép tạo Data Collections!</li>
-            </ol>
+          <div className="form-group">
+            <label>Project ID</label>
+            <input type="text" value={admin.projectId || 'Chưa cấu hình'} readOnly />
           </div>
+          <div className="form-group">
+            <label>Nguồn xác thực</label>
+            <input type="text" value={admin.credentialSource || 'Chưa cấu hình trên máy chủ'} readOnly />
+          </div>
+          <div className="form-group">
+            <label>Trạng thái</label>
+            <input type="text" value={admin.lastError || admin.configurationStatus || 'unknown'} readOnly />
+          </div>
+          <button type="button" className="btn btn-primary" disabled={fbLoading} onClick={handleVerifyFirebase}>
+            {fbLoading ? 'Đang kiểm tra...' : 'Kiểm tra và đồng bộ Admin SDK'}
+          </button>
         </div>
       </div>
     </div>

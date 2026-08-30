@@ -35,6 +35,67 @@ Thêm bao nhiêu tài khoản tùy ý.
 
 ## Sử dụng
 
+## Firebase Admin SDK
+
+Ứng dụng chỉ truy cập Firestore từ Node.js bằng Firebase Admin SDK. Không nhập hoặc gửi service-account JSON qua Dashboard.
+
+### Cấu hình khuyến nghị trên VPS
+
+1. Firebase Console -> Project settings -> Service accounts -> Generate new private key.
+2. Chép file lên VPS, ngoài thư mục Git:
+
+```bash
+sudo install -d -m 700 /etc/treohoc
+sudo install -m 600 service-account.json /etc/treohoc/firebase-service-account.json
+```
+
+3. Cấu hình đường dẫn credential cho tiến trình Node/PM2:
+
+```bash
+export FIREBASE_SERVICE_ACCOUNT_FILE=/etc/treohoc/firebase-service-account.json
+npm run verify:firebase-admin
+```
+
+Với PM2, thêm biến sau vào phần `env` của cấu hình triển khai rồi restart tiến trình:
+
+```js
+FIREBASE_SERVICE_ACCOUNT_FILE: '/etc/treohoc/firebase-service-account.json'
+```
+
+Các nguồn credential khác được hỗ trợ:
+
+- `GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/service-account.json`
+- `FIREBASE_SERVICE_ACCOUNT_JSON` chứa JSON đầy đủ
+- `FIREBASE_SERVICE_ACCOUNT_BASE64` chứa JSON mã hóa base64
+- `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`
+- File local `firebase-service-account.json` trong thư mục ứng dụng (đã được `.gitignore`, nhưng file ngoài repository vẫn an toàn hơn)
+
+Không commit service-account JSON, private key hoặc `.env` vào Git.
+
+### Chuyển Firestore Rules sang deny-all
+
+Chỉ publish rules dưới đây sau khi `npm run verify:firebase-admin` báo thành công và log server có:
+
+```text
+[FIREBASE] Admin SDK initialized
+[FIREBASE] Firestore connection verified
+[FIREBASE] Using server-side Admin SDK authentication
+```
+
+```firestore
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+```
+
+Firebase Admin SDK chạy trên server không phụ thuộc Firestore client Security Rules. Dashboard chỉ gọi API Node.js và không chứa Firebase browser SDK.
+
 ### Web Dashboard (Mặc định)
 
 ```bash

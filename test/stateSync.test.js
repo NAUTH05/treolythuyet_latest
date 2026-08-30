@@ -41,7 +41,7 @@ function makeWriter(t, file, remote, extra = {}) {
     arrayKey: 'items',
     collection: 'states',
     documentId: 'state',
-    loadConfig: () => ({ projectId: 'test', apiKey: 'key' }),
+    loadConfig: () => ({ enabled: true, status: 'configured', projectId: 'test' }),
     fetchRemote: remote.fetch,
     syncRemote: remote.sync,
     retryDelays: [1, 2, 3],

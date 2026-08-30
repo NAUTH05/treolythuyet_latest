@@ -55,6 +55,10 @@ function sameState(left, right, arrayKey) {
   return JSON.stringify(left && left[arrayKey]) === JSON.stringify(right && right[arrayKey]);
 }
 
+function isRemoteConfigured(config) {
+  return Boolean(config && config.enabled && config.status === 'configured');
+}
+
 class SerializedStateSync {
   constructor({ label, filePath, arrayKey, collection, documentId, loadConfig, syncRemote, fetchRemote,
     initialRevision = 0, retryDelays = DEFAULT_RETRY_DELAYS, logger = console }) {
@@ -104,18 +108,20 @@ class SerializedStateSync {
       this.lastSyncError = local.sync.lastSyncError || this.lastSyncError;
       this.nextRetryAt = local.sync.nextRetryAt || this.nextRetryAt;
     }
-    if (!config || !config.projectId || !config.apiKey) {
-      this.logger.log(`[FIREBASE] ${this.label}: configuration unavailable - using local cache`);
-      return { label: this.label, action: 'local-only', remoteStatus: 'disabled', count: local.data.length };
+    if (!isRemoteConfigured(config)) {
+      const remoteStatus = config && config.status || 'disabled';
+      const error = config && config.error || null;
+      this.logger.log(`[FIREBASE] ${this.label}: Admin SDK ${remoteStatus} - using local cache`);
+      return { label: this.label, action: 'local-only', remoteStatus, count: local.data.length, error };
     }
     if (typeof this.fetchRemote !== 'function') throw new Error(`No Firebase reader configured for ${this.label}`);
 
     const remoteResult = await this.fetchRemote(this.collection, this.documentId, config);
-    if (remoteResult.status === 'unavailable') {
+    if (remoteResult.status !== 'ok' && remoteResult.status !== 'missing') {
       this.lastSyncError = remoteResult.error ? remoteResult.error.message : 'Firebase unavailable';
-      this.logger.warn(`[FIREBASE] ${this.label}: Firebase unavailable - using local cache`);
+      this.logger.warn(`[FIREBASE] ${this.label}: Firebase ${remoteResult.status} - using local cache`);
       if (local.available && local.sync && local.sync.dirty) this._adoptLocalAsPending(local);
-      return { label: this.label, action: local.available ? 'local-cache' : 'unavailable-no-cache', remoteStatus: 'unavailable', count: local.data.length, error: this.lastSyncError };
+      return { label: this.label, action: local.available ? 'local-cache' : 'unavailable-no-cache', remoteStatus: remoteResult.status, count: local.data.length, error: this.lastSyncError };
     }
     if (remoteResult.status === 'missing') {
       if (!local.available) {
@@ -181,6 +187,13 @@ class SerializedStateSync {
     });
   }
 
+  async flushPending(timeoutMs = 15000) {
+    this.paused = false;
+    this._clearRetryTimer();
+    this._kickWorker();
+    return this.waitForIdle(timeoutMs);
+  }
+
   stop() {
     this._clearRetryTimer();
   }
@@ -196,8 +209,7 @@ class SerializedStateSync {
   }
 
   _firebaseEnabled() {
-    const config = this.loadConfig();
-    return Boolean(config && config.projectId && config.apiKey);
+    return isRemoteConfigured(this.loadConfig());
   }
 
   _syncMetadata(dirty, extra = {}) {
@@ -267,10 +279,10 @@ class SerializedStateSync {
 
   async _syncOne(document) {
     const config = this.loadConfig();
-    if (!config || !config.projectId || !config.apiKey) return 'retry';
+    if (!isRemoteConfigured(config)) return 'retry';
     const before = await this.fetchRemote(this.collection, this.documentId, config);
     if (!this.pendingDocument || this.pendingDocument.revision !== document.revision) return 'superseded';
-    if (before.status === 'unavailable' || before.status === 'disabled') {
+    if (before.status !== 'ok' && before.status !== 'missing') {
       this._handleFailure(before.error || new Error('Firebase unavailable'));
       return 'retry';
     }
@@ -357,4 +369,4 @@ class SerializedStateSync {
   }
 }
 
-module.exports = { DEFAULT_RETRY_DELAYS, SerializedStateSync, readStateDocument, writeJsonAtomicSync, withoutSyncMetadata };
+module.exports = { DEFAULT_RETRY_DELAYS, SerializedStateSync, readStateDocument, writeJsonAtomicSync, withoutSyncMetadata, isRemoteConfigured };

@@ -10,6 +10,9 @@ daily-logs.json
 presets.json
 admin-config.json
 firebase-config.json
+firebase-service-account.json
+*service-account*.json
+.firebase-credentials/
 .env
 .DS_Store
 .claude/

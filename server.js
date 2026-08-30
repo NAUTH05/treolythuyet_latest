@@ -76,8 +76,8 @@ const PRESETS_FILE = path.join(__dirname, 'presets.json');
 const presetsState = readStateDocument(PRESETS_FILE, 'presets');
 const presetsSync = new SerializedStateSync({
   label: 'presets', filePath: PRESETS_FILE, arrayKey: 'presets', collection: 'system_presets', documentId: 'list',
-  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
-  fetchRemote: fbService.fetchFirebaseDocumentREST,
+  loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
+  fetchRemote: fbService.fetchFirebaseDocument,
   initialRevision: presetsState.revision,
 });
 
@@ -110,8 +110,8 @@ const autoPresetsState = readStateDocument(AUTO_PRESETS_FILE, 'presets');
 const autoPresetsSync = new SerializedStateSync({
   label: 'auto-scan presets', filePath: AUTO_PRESETS_FILE, arrayKey: 'presets',
   collection: 'system_autoscan_presets', documentId: 'list',
-  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
-  fetchRemote: fbService.fetchFirebaseDocumentREST,
+  loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
+  fetchRemote: fbService.fetchFirebaseDocument,
   initialRevision: autoPresetsState.revision,
 });
 
@@ -291,20 +291,20 @@ function flushDailyLogsFor(store) {
     console.error('[LOGS] Không thể lưu daily-logs local:', e.message);
   }
 
-  const fbConfig = fbService.loadFirebaseConfig();
-  if (!fbConfig || !fbConfig.projectId) return;
+  const fbConfig = fbService.getFirebaseAdminConfiguration();
+  if (!fbConfig.enabled) return;
   const users = store.users ? Object.keys(store.users) : [];
   for (const account of users) {
     const userEntries = store.users[account];
     if (!userEntries || userEntries.length === 0) continue;
     const docId = `${folderName}_${slugifyAccount(account)}`;
-    fbService.syncToFirebaseREST('system_logs_daily', docId, {
+    fbService.syncToFirebase('system_logs_daily', docId, {
       date: folderName,
       account,
       count: userEntries.length,
       logs: userEntries,
       updatedAt: new Date().toISOString(),
-    }, fbConfig);
+    });
   }
 }
 
@@ -337,9 +337,9 @@ setInterval(() => {
 setInterval(() => {
   if (!latestLogsDirty) return;
   latestLogsDirty = false;
-  const fbConfig = fbService.loadFirebaseConfig();
-  if (fbConfig && fbConfig.projectId) {
-    fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, fbConfig);
+  const fbConfig = fbService.getFirebaseAdminConfiguration();
+  if (fbConfig.enabled) {
+    fbService.syncToFirebase('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() });
   }
 }, 15 * 1000);
 
@@ -374,8 +374,8 @@ const QUEUE_STATE_FILE = path.join(__dirname, 'queue-state.json');
 const queueFileState = readStateDocument(QUEUE_STATE_FILE, 'queues');
 const queueStateSync = new SerializedStateSync({
   label: 'queues', filePath: QUEUE_STATE_FILE, arrayKey: 'queues', collection: 'system_queues', documentId: 'state',
-  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
-  fetchRemote: fbService.fetchFirebaseDocumentREST,
+  loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
+  fetchRemote: fbService.fetchFirebaseDocument,
   initialRevision: queueFileState.revision,
 });
 
@@ -1033,8 +1033,8 @@ const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
 const accountsFileState = readStateDocument(ACCOUNTS_FILE, 'accounts');
 const accountsStateSync = new SerializedStateSync({
   label: 'accounts', filePath: ACCOUNTS_FILE, arrayKey: 'accounts', collection: 'system_accounts', documentId: 'list',
-  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
-  fetchRemote: fbService.fetchFirebaseDocumentREST,
+  loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
+  fetchRemote: fbService.fetchFirebaseDocument,
   initialRevision: accountsFileState.revision,
 });
 
@@ -1070,10 +1070,13 @@ function getPersistentStateSyncs() {
 }
 
 async function synchronizeAllPersistentStates(reason = 'startup', syncs = getPersistentStateSyncs()) {
-  const config = fbService.loadFirebaseConfig();
+  const config = fbService.getFirebaseAdminConfiguration();
   console.log(`[FIREBASE] ${reason === 'startup' ? 'Startup synchronization started' : 'Synchronization started after configuration update'}`);
-  if (!config || !config.projectId || !config.apiKey) {
-    console.warn('[FIREBASE] Firebase configuration unavailable - local cache mode is active');
+  if (!config.enabled) {
+    console.warn(`[FIREBASE] Admin SDK ${config.status} - local cache mode is active${config.error ? `: ${config.error}` : ''}`);
+  } else {
+    const verification = await fbService.verifyFirebaseConnection();
+    if (!verification.connected) console.warn(`[FIREBASE] Firestore connection verification failed (${verification.status})`);
   }
 
   const results = await Promise.all(syncs.map(async sync => {
@@ -1084,8 +1087,9 @@ async function synchronizeAllPersistentStates(reason = 'startup', syncs = getPer
       return { label: sync.label, action: 'error', remoteStatus: 'unavailable', error: error.message };
     }
   }));
-  const connected = Boolean(config && config.projectId && config.apiKey)
-    && results.every(result => result.remoteStatus !== 'unavailable' && result.remoteStatus !== 'disabled');
+  const adminStatus = fbService.getFirebaseAdminStatus();
+  const connected = adminStatus.connected
+    && results.every(result => !['unavailable', 'project-unavailable', 'disabled', 'invalid-credentials', 'authentication-failed', 'permission-denied'].includes(result.remoteStatus));
   const states = getPersistentStateSyncs().map(sync => sync.getStatus());
   firebaseSyncSummary = {
     connected,
@@ -1094,6 +1098,7 @@ async function synchronizeAllPersistentStates(reason = 'startup', syncs = getPer
     checkedAt: new Date().toISOString(),
     results,
     states,
+    admin: adminStatus,
   };
   return firebaseSyncSummary;
 }
@@ -1136,13 +1141,9 @@ app.post('/lythuyet/api/admin/change-password', (req, res) => {
 
 // Lấy Firebase config & status
 app.get('/lythuyet/api/admin/firebase-config', async (req, res) => {
-  const config = fbService.loadFirebaseConfig();
-  if (config && config.projectId && config.apiKey) {
-    const probe = await fbService.fetchFirebaseDocumentREST('system_accounts', 'list', config);
-    firebaseSyncSummary.connected = probe.status === 'ok' || probe.status === 'missing';
-  } else {
-    firebaseSyncSummary.connected = false;
-  }
+  const verification = await fbService.verifyFirebaseConnection();
+  firebaseSyncSummary.connected = Boolean(verification.connected);
+  const admin = fbService.getFirebaseAdminStatus();
   const states = getPersistentStateSyncs().map(sync => sync.getStatus());
   const synchronization = {
     ...firebaseSyncSummary,
@@ -1150,18 +1151,21 @@ app.get('/lythuyet/api/admin/firebase-config', async (req, res) => {
     states,
   };
   res.json({
-    config: config || {},
+    admin,
     connected: firebaseSyncSummary.connected,
     synchronization,
     states,
   });
 });
 
-// Lưu Firebase config
+// Reload credentials already installed on the server. Credential material is never accepted here.
 app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
-  const { config } = req.body;
-  if (!config || !config.projectId || !config.apiKey) {
-    return res.status(400).json({ error: 'Cần nhập ít nhất apiKey và projectId' });
+  const submitted = req.body && (req.body.config || req.body.serviceAccount || req.body.credentials);
+  if (submitted && Object.keys(submitted).length > 0) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Firebase Admin credentials must be installed directly on the server. Credentials are never accepted through this API.',
+    });
   }
   const runtimeStateLoaded = queues.size > 0 || autoScanRegistry.size > 0;
   if (runtimeStateLoaded) {
@@ -1170,62 +1174,64 @@ app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
     queueStateSync.pause();
     autoScanStateSync.pause();
   }
-  const saved = fbService.saveFirebaseConfig(config);
-  if (saved) {
-    try {
-      const syncs = runtimeStateLoaded
-        ? [accountsStateSync, presetsSync, autoPresetsSync]
-        : getPersistentStateSyncs();
-      const synchronization = await synchronizeAllPersistentStates('configuration', syncs);
-      if (queues.size === 0) {
-        const queueResult = synchronization.results.find(result => result.label === 'queues');
-        if (queueResult && queueResult.action === 'restore-remote') loadAndRestoreQueues();
-      }
-      if (autoScanRegistry.size === 0) {
-        const autoScanResult = synchronization.results.find(result => result.label === 'auto-scan');
-        if (autoScanResult && autoScanResult.action === 'restore-remote') await loadAndRestoreAutoScans();
-      }
-
-      if (!synchronization.connected) {
-        return res.status(503).json({
-          ok: false,
-          connected: false,
-          configurationSaved: true,
-          restartRequired: runtimeStateLoaded,
-          synchronization,
-          error: 'Firebase configuration was saved, but Firebase is currently unavailable. Local cache mode remains active.',
-        });
-      }
-
-      const directResults = await Promise.all([
-        fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, config),
-        fbService.syncToFirebaseREST('system_settings', 'config_info', { updatedAt: new Date().toISOString(), status: 'connected' }, config),
-      ]);
-      if (directResults.some(ok => !ok)) throw new Error('Firebase rejected initial connection data');
-      return res.status(runtimeStateLoaded ? 202 : 200).json({
-        ok: true,
-        connected: true,
-        synchronization,
+  try {
+    await fbService.resetFirebaseAdmin();
+    const config = fbService.getFirebaseAdminConfiguration();
+    if (!config.enabled) {
+      return res.status(config.status === 'invalid-credentials' ? 400 : 503).json({
+        ok: false,
+        connected: false,
         restartRequired: runtimeStateLoaded,
-        message: runtimeStateLoaded
-          ? 'Firebase configuration saved. Restart the server to reconcile Queue and Auto-Scan state safely.'
-          : 'Firebase configuration saved and persistent state reconciliation started.',
+        admin: fbService.getFirebaseAdminStatus(),
+        error: config.error || 'Firebase Admin SDK credentials are not configured on this server.',
       });
-    } catch (error) {
+    }
+    const syncs = runtimeStateLoaded
+      ? [accountsStateSync, presetsSync, autoPresetsSync]
+      : getPersistentStateSyncs();
+    const synchronization = await synchronizeAllPersistentStates('configuration', syncs);
+    if (queues.size === 0) {
+      const queueResult = synchronization.results.find(result => result.label === 'queues');
+      if (queueResult && queueResult.action === 'restore-remote') loadAndRestoreQueues();
+    }
+    if (autoScanRegistry.size === 0) {
+      const autoScanResult = synchronization.results.find(result => result.label === 'auto-scan');
+      if (autoScanResult && autoScanResult.action === 'restore-remote') await loadAndRestoreAutoScans();
+    }
+    if (!synchronization.connected) {
       return res.status(503).json({
         ok: false,
         connected: false,
-        configurationSaved: true,
         restartRequired: runtimeStateLoaded,
-        error: `Không thể đồng bộ đầy đủ Firebase: ${error.message}`,
+        synchronization,
+        admin: fbService.getFirebaseAdminStatus(),
+        error: 'Firebase Admin SDK is configured, but Firestore synchronization could not be verified.',
       });
     }
+    const directResults = await Promise.all([
+      fbService.syncToFirebase('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }),
+      fbService.syncToFirebase('system_settings', 'config_info', { updatedAt: new Date().toISOString(), status: 'connected', authentication: 'admin-sdk' }),
+    ]);
+    if (directResults.some(ok => !ok)) throw new Error('Firestore rejected initial Admin SDK connection data');
+    return res.status(runtimeStateLoaded ? 202 : 200).json({
+      ok: true,
+      connected: true,
+      synchronization,
+      admin: fbService.getFirebaseAdminStatus(),
+      restartRequired: runtimeStateLoaded,
+      message: runtimeStateLoaded
+        ? 'Admin SDK verified. Restart the server to reconcile Queue and Auto-Scan state safely.'
+        : 'Admin SDK verified and persistent state reconciliation completed.',
+    });
+  } catch (error) {
+    return res.status(503).json({
+      ok: false,
+      connected: false,
+      restartRequired: runtimeStateLoaded,
+      admin: fbService.getFirebaseAdminStatus(),
+      error: `Firebase Admin synchronization failed: ${error.message}`,
+    });
   }
-  if (runtimeStateLoaded) {
-    queueStateSync.resume();
-    autoScanStateSync.resume();
-  }
-  res.status(500).json({ error: 'Không thể lưu file cấu hình Firebase' });
 });
 
 // ===================== API ROUTES ==========================
@@ -1670,8 +1676,8 @@ const autoScanFileState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
 const autoScanStateSync = new SerializedStateSync({
   label: 'auto-scan', filePath: AUTOSCAN_STATE_FILE, arrayKey: 'autoScans',
   collection: 'system_autoscan', documentId: 'state',
-  loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
-  fetchRemote: fbService.fetchFirebaseDocumentREST,
+  loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
+  fetchRemote: fbService.fetchFirebaseDocument,
   initialRevision: autoScanFileState.revision,
 });
 
@@ -1748,9 +1754,9 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     }
   });
   autoSession.on('progress-saved', (data) => {
-    const fbConfig = fbService.loadFirebaseConfig();
-    if (fbConfig && fbConfig.projectId) {
-      fbService.syncToFirebaseREST('system_course_progress', `${account.name}_${Date.now()}`, data, fbConfig);
+    const fbConfig = fbService.getFirebaseAdminConfiguration();
+    if (fbConfig.enabled) {
+      fbService.syncToFirebase('system_course_progress', `${account.name}_${Date.now()}`, data);
     }
   });
 
@@ -2521,9 +2527,9 @@ app.delete('/lythuyet/api/logs/by-date', async (req, res) => {
     }
   }
 
-  const fbConfig = fbService.loadFirebaseConfig();
-  if (fbConfig && fbConfig.projectId) {
-    const deleted = await fbService.deleteDocumentsByPrefixREST('system_logs_daily', `${reqDate}_`, fbConfig);
+  const fbConfig = fbService.getFirebaseAdminConfiguration();
+  if (fbConfig.enabled) {
+    const deleted = await fbService.deleteDocumentsByPrefix('system_logs_daily', `${reqDate}_`);
     if (!deleted) {
       return res.status(503).json({
         ok: false,
@@ -2607,3 +2613,42 @@ initializePersistentState().catch(error => {
 ╚══════════════════════════════════════════════╝
   `);
 }));
+
+let shutdownStarted = false;
+
+async function gracefulShutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  console.log(`[STATE] ${signal} received - saving runtime state before shutdown`);
+
+  io.disconnectSockets(true);
+  await new Promise(resolve => server.close(() => resolve()));
+  try { flushDailyLogsFor(dailyLogs); } catch (error) {
+    console.error('[STATE] Daily log shutdown flush failed:', error.message);
+  }
+  await Promise.allSettled([saveQueueState(), saveAutoScanState()]);
+
+  const results = await Promise.allSettled(
+    getPersistentStateSyncs().map(sync => sync.flushPending(15000))
+  );
+  const failed = results.filter(result => result.status === 'rejected');
+  if (failed.length > 0) {
+    console.warn(`[FIREBASE] Shutdown completed with ${failed.length} state document(s) still dirty; local cache is preserved for the next startup.`);
+  } else {
+    console.log('[FIREBASE] Graceful shutdown synchronization confirmed');
+  }
+  await fbService.shutdownFirebaseAdmin();
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    const forceExit = setTimeout(() => process.exit(1), 25000);
+    if (typeof forceExit.unref === 'function') forceExit.unref();
+    gracefulShutdown(signal)
+      .then(() => process.exit(0))
+      .catch(error => {
+        console.error('[STATE] Graceful shutdown failed:', error.message);
+        process.exit(1);
+      });
+  });
+}

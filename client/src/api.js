@@ -72,7 +72,7 @@ export const deletePreset = (id) => apiSend(`/api/presets/${id}`, 'DELETE');
 export const changePassword = (oldPassword, newPassword) =>
   apiSend('/api/admin/change-password', 'POST', { oldPassword, newPassword });
 export const fetchFirebaseConfig = () => apiGet('/api/admin/firebase-config');
-export const saveFirebaseConfig = (config) => apiSend('/api/admin/firebase-config', 'POST', { config });
+export const saveFirebaseConfig = () => apiSend('/api/admin/firebase-config', 'POST');
 
 // ── Logs ──
 export const fetchLogFolders = () => apiGet('/api/logs/folders');
