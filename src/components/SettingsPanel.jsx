@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import * as api from '../api';
-import { initFirebaseClient, syncDocClient } from '../firebaseClient';
+import { initFirebaseClient } from '../firebaseClient';
 
 export default function SettingsPanel({ toast }) {
   // Password state
@@ -64,23 +64,30 @@ export default function SettingsPanel({ toast }) {
     e.preventDefault();
     setFbLoading(true);
     try {
-      // 1. Initialize client-side Firebase
-      initFirebaseClient(firebaseConfig);
-      await syncDocClient('system_settings', 'config_info', {
-        status: 'connected',
-        updatedBy: 'client',
-      });
-
-      // 2. Save on server & trigger server-side sync
       const data = await api.saveFirebaseConfig(firebaseConfig);
       if (data.ok) {
+        initFirebaseClient(firebaseConfig);
         setFbConnected(!!data.connected);
-        toast('Đã lưu cấu hình và đồng bộ Firebase thành công', 'success');
+        toast(
+          data.restartRequired
+            ? 'Đã lưu Firebase; cần khởi động lại máy chủ để khôi phục Queue và Auto-Scan an toàn'
+            : data.synchronization?.synchronized
+            ? 'Đã lưu cấu hình và xác nhận đồng bộ Firebase'
+            : 'Đã kết nối Firebase; dữ liệu đang tiếp tục đồng bộ nền',
+          'success'
+        );
       } else {
-        toast(data.error || 'Lỗi kết nối Firebase', 'error');
+        setFbConnected(false);
+        toast(
+          data.restartRequired
+            ? `${data.error || 'Firebase chưa đồng bộ đầy đủ'}; cần khởi động lại máy chủ`
+            : data.error || 'Lỗi kết nối Firebase',
+          'error'
+        );
       }
-    } catch {
-      toast('Lỗi lưu Firebase', 'error');
+    } catch (error) {
+      setFbConnected(false);
+      toast(error.message || 'Lỗi lưu Firebase', 'error');
     } finally {
       setFbLoading(false);
     }

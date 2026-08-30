@@ -3,6 +3,8 @@ const chalk = require('chalk');
 const fs = require('fs');
 const path = require('path');
 const { BotSession } = require('./bot');
+const fbService = require('./firebase-service');
+const { SerializedStateSync, readStateDocument } = require('./stateSync');
 
 // ============================================================
 //  CLI MODE - Chay tu command line
@@ -53,13 +55,31 @@ const argv = yargs
   .alias('h', 'help')
   .argv;
 
-function loadAccounts() {
+async function loadAccounts() {
   const p = path.join(__dirname, 'accounts.json');
+  const local = readStateDocument(p, 'accounts');
+  const accountsSync = new SerializedStateSync({
+    label: 'accounts',
+    filePath: p,
+    arrayKey: 'accounts',
+    collection: 'system_accounts',
+    documentId: 'list',
+    loadConfig: fbService.loadFirebaseConfig,
+    syncRemote: fbService.syncToFirebaseREST,
+    fetchRemote: fbService.fetchFirebaseDocumentREST,
+    initialRevision: local.revision,
+  });
+  await accountsSync.reconcile();
   if (!fs.existsSync(p)) {
-    console.error(chalk.red('Khong tim thay file accounts.json!'));
+    console.error(chalk.red('Khong tim thay accounts.json va khong the khoi phuc tu Firebase!'));
     process.exit(1);
   }
-  return JSON.parse(fs.readFileSync(p, 'utf8')).accounts;
+  const restored = readStateDocument(p, 'accounts');
+  if (!restored.available) {
+    console.error(chalk.red('accounts.json khong hop le va Firebase khong co ban khoi phuc!'));
+    process.exit(1);
+  }
+  return restored.data;
 }
 
 function getSelectedAccounts(accounts, selector) {
@@ -83,7 +103,7 @@ function getSelectedAccounts(accounts, selector) {
 async function main() {
   console.log(chalk.bold.cyan('\n=== TREO HOC LY THUYET LAI XE - CLI Mode ===\n'));
 
-  const accounts = loadAccounts();
+  const accounts = await loadAccounts();
   const selectedAccounts = getSelectedAccounts(accounts, argv.account);
 
   console.log(chalk.white('Cau hinh:'));

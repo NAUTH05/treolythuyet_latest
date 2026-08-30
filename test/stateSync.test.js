@@ -11,77 +11,206 @@ function makeTempStateFile(t) {
   return path.join(dir, 'state.json');
 }
 
-test('an empty local array remains an authoritative state instead of missing data', t => {
+function makeRemote(initial = null, options = {}) {
+  let document = initial;
+  let attempts = 0;
+  const writes = [];
+  return {
+    fetch: async () => options.unavailable
+      ? { status: 'unavailable', data: null, error: new Error('offline') }
+      : document
+        ? { status: 'ok', data: structuredClone(document) }
+        : { status: 'missing', data: null },
+    sync: async (_collection, _id, next) => {
+      attempts++;
+      if (attempts <= (options.failWrites || 0)) return false;
+      document = structuredClone(next);
+      writes.push(document.revision);
+      return true;
+    },
+    get document() { return document; },
+    get attempts() { return attempts; },
+    get writes() { return writes; },
+  };
+}
+
+function makeWriter(t, file, remote, extra = {}) {
+  const writer = new SerializedStateSync({
+    label: 'test state',
+    filePath: file,
+    arrayKey: 'items',
+    collection: 'states',
+    documentId: 'state',
+    loadConfig: () => ({ projectId: 'test', apiKey: 'key' }),
+    fetchRemote: remote.fetch,
+    syncRemote: remote.sync,
+    retryDelays: [1, 2, 3],
+    logger: { log() {}, warn() {}, error() {} },
+    ...extra,
+  });
+  t.after(() => writer.stop());
+  return writer;
+}
+
+test('an empty local array remains readable as a legacy local state', t => {
   const file = makeTempStateFile(t);
   fs.writeFileSync(file, '[]', 'utf8');
-  const state = readStateDocument(file, 'autoScans');
+  const state = readStateDocument(file, 'items');
   assert.equal(state.available, true);
   assert.deepEqual(state.data, []);
 });
 
-test('local snapshots are atomic/versioned and Firebase writes stay serialized', async t => {
+test('rapid updates commit locally and only the latest revision becomes authoritative', async t => {
   const file = makeTempStateFile(t);
-  const remoteRevisions = [];
-  let concurrent = 0;
-  let maxConcurrent = 0;
-  const writer = new SerializedStateSync({
-    label: 'test',
-    filePath: file,
-    collection: 'states',
-    documentId: 'state',
-    loadConfig: () => ({ projectId: 'test' }),
-    syncRemote: async (_collection, _id, document) => {
-      concurrent++;
-      maxConcurrent = Math.max(maxConcurrent, concurrent);
-      await new Promise(resolve => setTimeout(resolve, document.revision === 1 ? 25 : 1));
-      remoteRevisions.push(document.revision);
-      concurrent--;
+  const remote = makeRemote();
+  const writer = makeWriter(t, file, remote);
+
+  await Promise.all([
+    writer.persist({ items: ['A'] }),
+    writer.persist({ items: ['B'] }),
+    writer.persist({ items: ['C'] }),
+    writer.persist({ items: ['D'] }),
+  ]);
+  await writer.waitForIdle();
+
+  assert.deepEqual(remote.document.items, ['D']);
+  assert.equal(remote.document.revision, 4);
+  assert.deepEqual(remote.writes, [4]);
+  const local = readStateDocument(file, 'items');
+  assert.deepEqual(local.data, ['D']);
+  assert.equal(local.sync.dirty, false);
+});
+
+test('a stale in-flight callback cannot replace or upload over a newer local revision', async t => {
+  const file = makeTempStateFile(t);
+  let releaseFirstFetch;
+  let fetchCount = 0;
+  let remoteDocument = null;
+  const writer = makeWriter(t, file, {
+    fetch: async () => {
+      fetchCount++;
+      if (fetchCount === 1) await new Promise(resolve => { releaseFirstFetch = resolve; });
+      return remoteDocument ? { status: 'ok', data: structuredClone(remoteDocument) } : { status: 'missing', data: null };
+    },
+    sync: async (_collection, _id, document) => {
+      remoteDocument = structuredClone(document);
       return true;
     },
   });
 
-  const first = writer.persist({ autoScans: [{ id: 'old' }] });
-  const second = writer.persist({ autoScans: [] });
-  await Promise.all([first, second]);
+  await writer.persist({ items: ['old'] });
+  await new Promise(resolve => setImmediate(resolve));
+  await writer.persist({ items: ['latest'] });
+  releaseFirstFetch();
+  await writer.waitForIdle();
 
-  assert.deepEqual(remoteRevisions, [1, 2]);
-  assert.equal(maxConcurrent, 1);
-  assert.deepEqual(readStateDocument(file, 'autoScans').data, []);
-  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).revision, 2);
+  assert.deepEqual(remoteDocument.items, ['latest']);
+  assert.equal(remoteDocument.revision, 2);
+  assert.deepEqual(readStateDocument(file, 'items').data, ['latest']);
 });
 
-test('Firebase transient failures are retried before the mutation is rejected', async t => {
+test('Firebase failures remain dirty and retry until read-after-write verification succeeds', async t => {
   const file = makeTempStateFile(t);
-  let attempts = 0;
-  const writer = new SerializedStateSync({
-    label: 'test',
-    filePath: file,
-    collection: 'states',
-    documentId: 'state',
-    loadConfig: () => ({ projectId: 'test' }),
-    syncRemote: async () => ++attempts >= 3,
-  });
+  const remote = makeRemote(null, { failWrites: 3 });
+  const writer = makeWriter(t, file, remote);
 
-  const result = await writer.persist({ queues: [] });
-  assert.equal(attempts, 3);
-  assert.equal(result.firebase, 'synced');
+  const result = await writer.persist({ items: ['latest'] });
+  assert.equal(result.firebase, 'pending');
+  assert.equal(readStateDocument(file, 'items').sync.dirty, true);
+
+  await writer.waitForIdle(1000);
+  assert.equal(remote.attempts, 4);
+  assert.deepEqual(remote.document.items, ['latest']);
+  assert.equal(readStateDocument(file, 'items').sync.dirty, false);
+  assert.ok(writer.getStatus().lastSuccessfulSyncAt);
+});
+
+test('paused synchronization keeps runtime changes local until a safe resume', async t => {
+  const file = makeTempStateFile(t);
+  const remote = makeRemote();
+  const writer = makeWriter(t, file, remote);
+
+  writer.pause();
+  await writer.persist({ items: ['runtime'] });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(remote.document, null);
+  assert.equal(readStateDocument(file, 'items').sync.dirty, true);
+
+  writer.resume();
+  await writer.waitForIdle();
+  assert.deepEqual(remote.document.items, ['runtime']);
 });
 
 test('Firebase recovery continues from the recovered revision instead of moving backwards', async t => {
   const file = makeTempStateFile(t);
-  let remoteRevision = null;
-  const writer = new SerializedStateSync({
-    label: 'test',
-    filePath: file,
-    collection: 'states',
-    documentId: 'state',
-    loadConfig: () => ({ projectId: 'test' }),
-    syncRemote: async (_collection, _id, document) => {
-      remoteRevision = document.revision;
-      return true;
-    },
-  });
-  writer.ensureRevisionAtLeast(41);
-  await writer.persist({ autoScans: [] });
-  assert.equal(remoteRevision, 42);
+  const remote = makeRemote({ items: ['remote'], revision: 41, updatedAt: '2026-08-30T00:00:00.000Z' });
+  const writer = makeWriter(t, file, remote);
+
+  const result = await writer.reconcile();
+  assert.equal(result.action, 'restore-remote');
+  await writer.persist({ items: ['new'] });
+  await writer.waitForIdle();
+  assert.equal(remote.document.revision, 42);
+  assert.deepEqual(remote.document.items, ['new']);
+});
+
+test('new VPS restores a populated Firebase document when the local file is missing', async t => {
+  const file = makeTempStateFile(t);
+  const remote = makeRemote({ items: ['A', 'B'], revision: 7, updatedAt: '2026-08-30T00:00:00.000Z' });
+  const writer = makeWriter(t, file, remote);
+
+  const result = await writer.reconcile();
+  assert.equal(result.action, 'restore-remote');
+  assert.deepEqual(readStateDocument(file, 'items').data, ['A', 'B']);
+  assert.equal(readStateDocument(file, 'items').sync.dirty, false);
+  assert.deepEqual(remote.writes, []);
+});
+
+test('populated Firebase is protected from an empty untrusted local cache', async t => {
+  const file = makeTempStateFile(t);
+  fs.writeFileSync(file, JSON.stringify({ items: [], revision: 99, updatedAt: '2026-08-30T01:00:00.000Z' }));
+  const remote = makeRemote({ items: ['protected'], revision: 3, updatedAt: '2026-08-30T00:00:00.000Z' });
+  const writer = makeWriter(t, file, remote, { initialRevision: 99 });
+
+  const result = await writer.reconcile();
+  assert.equal(result.action, 'restore-remote');
+  assert.deepEqual(readStateDocument(file, 'items').data, ['protected']);
+  assert.deepEqual(remote.writes, []);
+});
+
+test('Firebase unavailable at startup preserves local cache without publishing it', async t => {
+  const file = makeTempStateFile(t);
+  fs.writeFileSync(file, JSON.stringify({ items: ['local'], revision: 2, updatedAt: '2026-08-30T00:00:00.000Z' }));
+  const remote = makeRemote(null, { unavailable: true });
+  const writer = makeWriter(t, file, remote, { initialRevision: 2 });
+
+  const result = await writer.reconcile();
+  assert.equal(result.action, 'local-cache');
+  assert.deepEqual(readStateDocument(file, 'items').data, ['local']);
+  assert.deepEqual(remote.writes, []);
+});
+
+test('missing Firebase document queues an existing local cache for verified upload', async t => {
+  const file = makeTempStateFile(t);
+  fs.writeFileSync(file, JSON.stringify({ items: ['local'], revision: 5, updatedAt: '2026-08-30T00:00:00.000Z' }));
+  const remote = makeRemote();
+  const writer = makeWriter(t, file, remote, { initialRevision: 5 });
+
+  const result = await writer.reconcile();
+  assert.equal(result.action, 'upload-local');
+  await writer.waitForIdle();
+  assert.deepEqual(remote.document.items, ['local']);
+  assert.equal(remote.document.revision, 5);
+});
+
+test('newer remote revision wins and is not overwritten by stale local state', async t => {
+  const file = makeTempStateFile(t);
+  fs.writeFileSync(file, JSON.stringify({ items: ['stale'], revision: 4, updatedAt: '2026-08-29T00:00:00.000Z' }));
+  const remote = makeRemote({ items: ['newer'], revision: 8, updatedAt: '2026-08-30T00:00:00.000Z' });
+  const writer = makeWriter(t, file, remote, { initialRevision: 4 });
+
+  const result = await writer.reconcile();
+  assert.equal(result.action, 'restore-remote');
+  assert.deepEqual(readStateDocument(file, 'items').data, ['newer']);
+  assert.deepEqual(remote.writes, []);
 });

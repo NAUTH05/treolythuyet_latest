@@ -75,8 +75,9 @@ function requireAdmin(req, res, next) {
 const PRESETS_FILE = path.join(__dirname, 'presets.json');
 const presetsState = readStateDocument(PRESETS_FILE, 'presets');
 const presetsSync = new SerializedStateSync({
-  label: 'presets', filePath: PRESETS_FILE, collection: 'system_presets', documentId: 'list',
+  label: 'presets', filePath: PRESETS_FILE, arrayKey: 'presets', collection: 'system_presets', documentId: 'list',
   loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  fetchRemote: fbService.fetchFirebaseDocumentREST,
   initialRevision: presetsState.revision,
 });
 
@@ -107,9 +108,10 @@ function savePresets(presets) {
 const AUTO_PRESETS_FILE = path.join(__dirname, 'autoscan-presets.json');
 const autoPresetsState = readStateDocument(AUTO_PRESETS_FILE, 'presets');
 const autoPresetsSync = new SerializedStateSync({
-  label: 'auto-scan presets', filePath: AUTO_PRESETS_FILE,
+  label: 'auto-scan presets', filePath: AUTO_PRESETS_FILE, arrayKey: 'presets',
   collection: 'system_autoscan_presets', documentId: 'list',
   loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  fetchRemote: fbService.fetchFirebaseDocumentREST,
   initialRevision: autoPresetsState.revision,
 });
 
@@ -371,8 +373,9 @@ const queues = new Map();   // queueId -> queue data
 const QUEUE_STATE_FILE = path.join(__dirname, 'queue-state.json');
 const queueFileState = readStateDocument(QUEUE_STATE_FILE, 'queues');
 const queueStateSync = new SerializedStateSync({
-  label: 'queues', filePath: QUEUE_STATE_FILE, collection: 'system_queues', documentId: 'state',
+  label: 'queues', filePath: QUEUE_STATE_FILE, arrayKey: 'queues', collection: 'system_queues', documentId: 'state',
   loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  fetchRemote: fbService.fetchFirebaseDocumentREST,
   initialRevision: queueFileState.revision,
 });
 
@@ -1029,14 +1032,20 @@ function scheduleNextPair(queue) {
 const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
 const accountsFileState = readStateDocument(ACCOUNTS_FILE, 'accounts');
 const accountsStateSync = new SerializedStateSync({
-  label: 'accounts', filePath: ACCOUNTS_FILE, collection: 'system_accounts', documentId: 'list',
+  label: 'accounts', filePath: ACCOUNTS_FILE, arrayKey: 'accounts', collection: 'system_accounts', documentId: 'list',
   loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  fetchRemote: fbService.fetchFirebaseDocumentREST,
   initialRevision: accountsFileState.revision,
 });
 
 function loadAccounts() {
   if (!fs.existsSync(ACCOUNTS_FILE)) return [];
-  return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')).accounts || [];
+  try {
+    return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')).accounts || [];
+  } catch (error) {
+    console.error('[ACCOUNTS] Invalid local accounts cache:', error.message);
+    return [];
+  }
 }
 
 function saveAccounts(accounts) {
@@ -1046,6 +1055,48 @@ function saveAccounts(accounts) {
 }
 
 // ===================== ADMIN & FIREBASE API ==================
+
+let firebaseSyncSummary = {
+  connected: false,
+  synchronized: false,
+  restartRequired: false,
+  checkedAt: null,
+  results: [],
+  states: [],
+};
+
+function getPersistentStateSyncs() {
+  return [accountsStateSync, presetsSync, autoPresetsSync, queueStateSync, autoScanStateSync];
+}
+
+async function synchronizeAllPersistentStates(reason = 'startup', syncs = getPersistentStateSyncs()) {
+  const config = fbService.loadFirebaseConfig();
+  console.log(`[FIREBASE] ${reason === 'startup' ? 'Startup synchronization started' : 'Synchronization started after configuration update'}`);
+  if (!config || !config.projectId || !config.apiKey) {
+    console.warn('[FIREBASE] Firebase configuration unavailable - local cache mode is active');
+  }
+
+  const results = await Promise.all(syncs.map(async sync => {
+    try {
+      return await sync.reconcile();
+    } catch (error) {
+      console.error(`[FIREBASE] ${sync.label}: reconciliation failed:`, error.message);
+      return { label: sync.label, action: 'error', remoteStatus: 'unavailable', error: error.message };
+    }
+  }));
+  const connected = Boolean(config && config.projectId && config.apiKey)
+    && results.every(result => result.remoteStatus !== 'unavailable' && result.remoteStatus !== 'disabled');
+  const states = getPersistentStateSyncs().map(sync => sync.getStatus());
+  firebaseSyncSummary = {
+    connected,
+    synchronized: connected && syncs.length === getPersistentStateSyncs().length && states.every(state => !state.dirty),
+    restartRequired: syncs.length !== getPersistentStateSyncs().length,
+    checkedAt: new Date().toISOString(),
+    results,
+    states,
+  };
+  return firebaseSyncSummary;
+}
 
 // Xác thực Admin password
 app.post('/lythuyet/api/admin/verify', (req, res) => {
@@ -1084,11 +1135,25 @@ app.post('/lythuyet/api/admin/change-password', (req, res) => {
 });
 
 // Lấy Firebase config & status
-app.get('/lythuyet/api/admin/firebase-config', (req, res) => {
+app.get('/lythuyet/api/admin/firebase-config', async (req, res) => {
   const config = fbService.loadFirebaseConfig();
+  if (config && config.projectId && config.apiKey) {
+    const probe = await fbService.fetchFirebaseDocumentREST('system_accounts', 'list', config);
+    firebaseSyncSummary.connected = probe.status === 'ok' || probe.status === 'missing';
+  } else {
+    firebaseSyncSummary.connected = false;
+  }
+  const states = getPersistentStateSyncs().map(sync => sync.getStatus());
+  const synchronization = {
+    ...firebaseSyncSummary,
+    synchronized: firebaseSyncSummary.connected && !firebaseSyncSummary.restartRequired && states.every(state => !state.dirty),
+    states,
+  };
   res.json({
     config: config || {},
-    connected: !!(config && config.projectId && config.apiKey),
+    connected: firebaseSyncSummary.connected,
+    synchronization,
+    states,
   });
 });
 
@@ -1098,25 +1163,67 @@ app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
   if (!config || !config.projectId || !config.apiKey) {
     return res.status(400).json({ error: 'Cần nhập ít nhất apiKey và projectId' });
   }
+  const runtimeStateLoaded = queues.size > 0 || autoScanRegistry.size > 0;
+  if (runtimeStateLoaded) {
+    // Keep runtime changes local until restart. Startup reconciliation will then
+    // choose the authoritative queue/Auto-Scan snapshot before recreating timers.
+    queueStateSync.pause();
+    autoScanStateSync.pause();
+  }
   const saved = fbService.saveFirebaseConfig(config);
   if (saved) {
     try {
+      const syncs = runtimeStateLoaded
+        ? [accountsStateSync, presetsSync, autoPresetsSync]
+        : getPersistentStateSyncs();
+      const synchronization = await synchronizeAllPersistentStates('configuration', syncs);
+      if (queues.size === 0) {
+        const queueResult = synchronization.results.find(result => result.label === 'queues');
+        if (queueResult && queueResult.action === 'restore-remote') loadAndRestoreQueues();
+      }
+      if (autoScanRegistry.size === 0) {
+        const autoScanResult = synchronization.results.find(result => result.label === 'auto-scan');
+        if (autoScanResult && autoScanResult.action === 'restore-remote') await loadAndRestoreAutoScans();
+      }
+
+      if (!synchronization.connected) {
+        return res.status(503).json({
+          ok: false,
+          connected: false,
+          configurationSaved: true,
+          restartRequired: runtimeStateLoaded,
+          synchronization,
+          error: 'Firebase configuration was saved, but Firebase is currently unavailable. Local cache mode remains active.',
+        });
+      }
+
       const directResults = await Promise.all([
         fbService.syncToFirebaseREST('system_logs', 'latest', { logs: logHistory.slice(-100), updatedAt: new Date().toISOString() }, config),
         fbService.syncToFirebaseREST('system_settings', 'config_info', { updatedAt: new Date().toISOString(), status: 'connected' }, config),
       ]);
       if (directResults.some(ok => !ok)) throw new Error('Firebase rejected initial connection data');
-      await Promise.all([
-        saveAccounts(loadAccounts()),
-        savePresets(loadPresets()),
-        saveAutoPresets(loadAutoPresets()),
-        saveQueueState(),
-        saveAutoScanState(),
-      ]);
-      return res.json({ ok: true, connected: true });
+      return res.status(runtimeStateLoaded ? 202 : 200).json({
+        ok: true,
+        connected: true,
+        synchronization,
+        restartRequired: runtimeStateLoaded,
+        message: runtimeStateLoaded
+          ? 'Firebase configuration saved. Restart the server to reconcile Queue and Auto-Scan state safely.'
+          : 'Firebase configuration saved and persistent state reconciliation started.',
+      });
     } catch (error) {
-      return res.status(503).json({ ok: false, connected: false, error: `Không thể đồng bộ đầy đủ Firebase: ${error.message}` });
+      return res.status(503).json({
+        ok: false,
+        connected: false,
+        configurationSaved: true,
+        restartRequired: runtimeStateLoaded,
+        error: `Không thể đồng bộ đầy đủ Firebase: ${error.message}`,
+      });
     }
+  }
+  if (runtimeStateLoaded) {
+    queueStateSync.resume();
+    autoScanStateSync.resume();
   }
   res.status(500).json({ error: 'Không thể lưu file cấu hình Firebase' });
 });
@@ -1561,9 +1668,10 @@ const RESTORE_START_DELAY_MS = 5000;
 const AUTOSCAN_STATE_FILE = path.join(__dirname, 'autoscan-state.json');
 const autoScanFileState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
 const autoScanStateSync = new SerializedStateSync({
-  label: 'auto-scan', filePath: AUTOSCAN_STATE_FILE,
+  label: 'auto-scan', filePath: AUTOSCAN_STATE_FILE, arrayKey: 'autoScans',
   collection: 'system_autoscan', documentId: 'state',
   loadConfig: fbService.loadFirebaseConfig, syncRemote: fbService.syncToFirebaseREST,
+  fetchRemote: fbService.fetchFirebaseDocumentREST,
   initialRevision: autoScanFileState.revision,
 });
 
@@ -1729,23 +1837,6 @@ async function loadAndRestoreAutoScans() {
       state = JSON.parse(fs.readFileSync(AUTOSCAN_STATE_FILE, 'utf8'));
     } catch (e) {
       console.error('[STATE] Không thể đọc auto-scan state local:', e.message);
-    }
-  }
-
-  // Chỉ dùng Firebase để recovery khi file local không tồn tại hoặc bị lỗi định dạng.
-  if (!localState.available) {
-    const fbConfig = fbService.loadFirebaseConfig();
-    if (fbConfig && fbConfig.projectId) {
-      try {
-        const fbData = await fbService.fetchFromFirebaseREST('system_autoscan', fbConfig, 'state');
-        if (fbData && fbData[0] && Array.isArray(fbData[0].autoScans)) {
-          autoScanStateSync.ensureRevisionAtLeast(fbData[0].revision);
-          state = fbData[0].autoScans;
-          console.log(`[FIREBASE] Đã lấy ${state.length} phiên Auto-Scan từ Firebase REST.`);
-        }
-      } catch (e) {
-        console.error('[FIREBASE] Không thể đọc Auto-Scan từ Firebase:', e.message);
-      }
     }
   }
 
@@ -2491,14 +2582,6 @@ io.on('connection', (socket) => {
 
 // ======================== START ============================
 
-// Khôi phục queue state từ lần chạy trước (nếu server bị restart)
-loadAndRestoreQueues();
-
-// Khôi phục các phiên Auto-Scan từ lần chạy trước
-const autoScanRestorePromise = loadAndRestoreAutoScans().catch(error => {
-  console.error('[STATE] Auto-Scan restore failed:', error.message);
-});
-
 // SPA fallback
 app.get('/treohoc/*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
@@ -2507,7 +2590,16 @@ app.get('/treohoc', (req, res) => {
   res.redirect('/treohoc/');
 });
 
-autoScanRestorePromise.finally(() => server.listen(PORT, () => {
+async function initializePersistentState() {
+  await synchronizeAllPersistentStates('startup');
+  // Existing queue/Auto-Scan recovery now consumes the reconciled local cache.
+  loadAndRestoreQueues();
+  await loadAndRestoreAutoScans();
+}
+
+initializePersistentState().catch(error => {
+  console.error('[STATE] Persistent state initialization failed:', error.message);
+}).finally(() => server.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════╗
 ║   TREO HỌC LÝ THUYẾT - Web Dashboard       ║
