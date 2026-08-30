@@ -15,14 +15,14 @@ import { useToast } from './hooks/useToast';
 
 const ADMIN_TOKEN_KEY = 'treohoc_admin_token';
 
-const TAB_TITLES = {
-  dashboard: 'Tổng quan hệ thống',
-  autoscan: 'Auto Scan & Treo học khóa học',
-  control: 'Bảng điều khiển Box bài học',
-  accounts: 'Quản lý danh sách tài khoản',
-  queues: 'Hàng chờ & Các phiên đang chạy',
-  logs: 'Logs',
-  settings: 'Cấu hình hệ thống & Firebase',
+const TAB_META = {
+  dashboard: ['Tổng quan', 'Theo dõi nhanh trạng thái treo bài và các tác vụ đang chạy.'],
+  autoscan: ['Auto Scan khóa học', 'Tự động quét khóa học và theo dõi tiến độ theo từng tài khoản.'],
+  control: ['Treo Box bài học', 'Tạo cấu hình mới, chọn tài khoản và bắt đầu một phiên treo.'],
+  accounts: ['Tài khoản', 'Quản lý danh sách tài khoản được phép chạy bot.'],
+  queues: ['Hàng chờ & phiên chạy', 'Kiểm tra tiến độ, tạm dừng hoặc dừng các tác vụ đang chạy.'],
+  logs: ['Logs', 'Tra cứu hoạt động theo ngày, tài khoản và mức độ.'],
+  settings: ['Cài đặt hệ thống', 'Bảo mật admin và kết nối Firebase của hệ thống.'],
 };
 
 function App() {
@@ -117,8 +117,9 @@ function App() {
         {/* Main Content View Container */}
         <main className="main-content">
           <header className="top-header">
-            <div className="top-header-title">
-              {TAB_TITLES[activeTab] || ''}
+            <div className="top-header-copy">
+              <div className="top-header-title">{TAB_META[activeTab]?.[0] || ''}</div>
+              <div className="top-header-description">{TAB_META[activeTab]?.[1] || ''}</div>
             </div>
 
             <div className="top-header-actions">
