@@ -155,10 +155,14 @@ function loadFirebaseConfig() {
 }
 
 function saveFirebaseConfig(config) {
+  const tempPath = `${FIREBASE_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(FIREBASE_STATE_FILE, JSON.stringify(config, null, 2), 'utf8');
+    fs.writeFileSync(tempPath, JSON.stringify(config, null, 2), 'utf8');
+    fs.renameSync(tempPath, FIREBASE_STATE_FILE);
     return true;
-  } catch {
+  } catch (error) {
+    try { fs.unlinkSync(tempPath); } catch { /* ignore cleanup failure */ }
+    console.error('[FIREBASE] Unable to save Firebase configuration:', error.message);
     return false;
   }
 }
@@ -208,16 +212,43 @@ function syncToFirebaseREST(collection, id, data, config) {
   return task;
 }
 
-async function fetchFromFirebaseREST(collection, config, documentId = null) {
-  if (!config || !config.projectId) return null;
+async function fetchFirebaseDocumentREST(collection, documentId, config) {
+  if (!config || !config.projectId || !config.apiKey) {
+    return { status: 'disabled', data: null, error: null };
+  }
   try {
     const projectId = config.projectId;
-    const suffix = documentId ? `/${encodeURIComponent(documentId)}` : '';
-    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collection}${suffix}?key=${config.apiKey}`;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collection}/${encodeURIComponent(documentId)}?key=${config.apiKey}`;
+    const res = await fetchWithTimeout(url);
+    if (res.status === 404) return { status: 'missing', data: null, httpStatus: 404, error: null };
+    if (!res.ok) {
+      const message = await res.text();
+      return {
+        status: 'unavailable',
+        data: null,
+        httpStatus: res.status,
+        error: new Error(`Firebase HTTP ${res.status}: ${message}`),
+      };
+    }
+    return { status: 'ok', data: decodeFirestoreDocument(await res.json()), httpStatus: res.status, error: null };
+  } catch (error) {
+    console.error(`[FIREBASE] Fetch failed ${collection}/${documentId}:`, error.message);
+    return { status: 'unavailable', data: null, error };
+  }
+}
+
+async function fetchFromFirebaseREST(collection, config, documentId = null) {
+  if (documentId) {
+    const result = await fetchFirebaseDocumentREST(collection, documentId, config);
+    return result.status === 'ok' ? [result.data] : null;
+  }
+  if (!config || !config.projectId || !config.apiKey) return null;
+  try {
+    const projectId = config.projectId;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collection}?key=${config.apiKey}`;
     const res = await fetchWithTimeout(url);
     if (!res.ok) return null;
     const data = await res.json();
-    if (documentId) return [decodeFirestoreDocument(data)];
     if (!data.documents) return [];
     return data.documents.map(decodeFirestoreDocument);
   } catch (err) {
@@ -275,6 +306,7 @@ module.exports = {
   loadFirebaseConfig,
   saveFirebaseConfig,
   syncToFirebaseREST,
+  fetchFirebaseDocumentREST,
   fetchFromFirebaseREST,
   deleteDocumentsByPrefixREST,
   encodeFirestoreFields,

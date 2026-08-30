@@ -1,6 +1,33 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { syncToFirebaseREST, deleteDocumentsByPrefixREST } = require('../firebase-service');
+const { syncToFirebaseREST, fetchFirebaseDocumentREST, deleteDocumentsByPrefixREST } = require('../firebase-service');
+
+test('structured Firebase reads distinguish disabled, missing, unavailable, and valid documents', async t => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  const disabled = await fetchFirebaseDocumentREST('states', 'one', null);
+  assert.equal(disabled.status, 'disabled');
+
+  global.fetch = async () => ({ ok: false, status: 404 });
+  const missing = await fetchFirebaseDocumentREST('states', 'one', { projectId: 'p', apiKey: 'k' });
+  assert.equal(missing.status, 'missing');
+
+  global.fetch = async () => ({ ok: false, status: 503, text: async () => 'offline' });
+  const unavailable = await fetchFirebaseDocumentREST('states', 'one', { projectId: 'p', apiKey: 'k' });
+  assert.equal(unavailable.status, 'unavailable');
+  assert.equal(unavailable.httpStatus, 503);
+
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ fields: { revision: { integerValue: '7' }, items: { arrayValue: { values: [{ stringValue: 'A' }] } } } }),
+  });
+  const valid = await fetchFirebaseDocumentREST('states', 'one', { projectId: 'p', apiKey: 'k' });
+  assert.equal(valid.status, 'ok');
+  assert.equal(valid.data.revision, 7);
+  assert.deepEqual(valid.data.items, ['A']);
+});
 
 test('all writes to the same Firebase document are globally serialized', async t => {
   const originalFetch = global.fetch;
