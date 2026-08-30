@@ -3,6 +3,10 @@ const assert = require('node:assert/strict');
 const {
   AutoCourseSession,
   courseReachedTarget,
+  createCourseFinalizationPlan,
+  getCourseTargetRemainingMs,
+  POST_TARGET_GRACE_MINUTES,
+  COURSE_FINALIZATION_STATES,
   isAutoCourseAccountBlockingStatus,
   getPersistentAutoCourseOptions,
   AUTO_COURSE_STATUSES,
@@ -22,6 +26,193 @@ test('hoàn thành khóa khi thời gian tích lũy đã đạt mục tiêu', ()
 test('khóa không cấu hình mục tiêu dùng trạng thái hoàn thành của bài học', () => {
   assert.equal(courseReachedTarget(0, 0, true), true);
   assert.equal(courseReachedTarget(0, 0, false), false);
+});
+
+test('course finalization finishes lessons with at most five minutes remaining', () => {
+  const oneMinute = createCourseFinalizationPlan(null, 60 * 1000, 10 * 60 * 1000);
+  const fiveMinutes = createCourseFinalizationPlan(null, 5 * 60 * 1000, 10 * 60 * 1000);
+  const exactEnd = createCourseFinalizationPlan(null, 0, 10 * 60 * 1000);
+
+  assert.equal(oneMinute.mode, 'finish-current-lesson');
+  assert.equal(oneMinute.allowanceMs, 60 * 1000);
+  assert.equal(fiveMinutes.mode, 'finish-current-lesson');
+  assert.equal(fiveMinutes.allowanceMs, POST_TARGET_GRACE_MINUTES * 60 * 1000);
+  assert.equal(exactEnd.allowanceMs, 0);
+});
+
+test('post-target grace period is a hard one-shot five-minute maximum', () => {
+  const enteredAtMs = 30 * 60 * 1000;
+  const plan = createCourseFinalizationPlan(null, 40 * 60 * 1000, enteredAtMs);
+  const attemptedRepeat = createCourseFinalizationPlan(plan, 35 * 60 * 1000, plan.deadlineElapsedMs);
+
+  assert.equal(plan.mode, 'grace-period');
+  assert.equal(plan.allowanceMs, 5 * 60 * 1000);
+  assert.equal(plan.deadlineElapsedMs, enteredAtMs + 5 * 60 * 1000);
+  assert.strictEqual(attemptedRepeat, plan, 're-entering finalization must not create another grace window');
+});
+
+test('mid-lesson target boundary is reached before a checkpoint-gated grace allowance', () => {
+  const studiedMs = 750 * 60 * 1000;
+  const requiredMs = getCourseTargetRemainingMs(756, studiedMs);
+  const afterTarget = createCourseFinalizationPlan(null, 54 * 60 * 1000, requiredMs);
+
+  assert.equal(requiredMs, 6 * 60 * 1000, 'study exactly the six minutes still required');
+  assert.equal(afterTarget.allowanceMs, 5 * 60 * 1000, 'only a below-target checkpoint may then use the bounded grace period');
+});
+
+test('course checkpoint refreshes before re-scan and trusts refreshed Web Odoo progress', async () => {
+  const session = new AutoCourseSession('test', { name: 'Test' });
+  const courseUrl = 'https://x/slides/course-1';
+  const events = [];
+  session.courseProgress[courseUrl] = {
+    title: 'Course 1',
+    targetMinutes: 756,
+    studiedMinutes: 761,
+    completed: false,
+    finalizationState: COURSE_FINALIZATION_STATES.TARGET_REACHED,
+  };
+  session._activeCourseRunId = 7;
+  session.page = {
+    reload: async () => { events.push('reload'); },
+    waitForTimeout: async () => { events.push('stabilize'); },
+  };
+  session._fakeVisibilityAPI = async () => {};
+  session._scanCourseDetailsForCheckpoint = async () => {
+    events.push('scan');
+    return {
+      courseTitle: 'Course 1',
+      actualStudiedMinutes: 756,
+      totalLessons: 3,
+      uncompletedLessons: [{ progressPercent: 90 }],
+      allLessons: [],
+    };
+  };
+
+  const result = await session._checkpointAndVerifyCourse({
+    courseUrl,
+    targetMinutes: 756,
+    courseTitle: 'Course 1',
+    courseRunId: 7,
+  });
+
+  assert.equal(result.confirmed, true);
+  assert.deepEqual(events, ['reload', 'stabilize', 'scan']);
+  assert.equal(session.courseProgress[courseUrl].studiedMinutes, 756);
+  assert.equal(session.courseProgress[courseUrl].completed, true);
+  assert.equal(session.courseProgress[courseUrl].finalizationState, COURSE_FINALIZATION_STATES.COMPLETED);
+});
+
+test('final checkpoint below target never resumes the old course or marks it complete locally', async () => {
+  const session = new AutoCourseSession('test', { name: 'Test' });
+  const courseUrl = 'https://x/slides/course-1';
+  session.courseProgress[courseUrl] = {
+    title: 'Course 1',
+    targetMinutes: 756,
+    studiedMinutes: 761,
+    completed: false,
+    finalizationState: COURSE_FINALIZATION_STATES.TARGET_REACHED,
+  };
+  session._activeCourseRunId = 9;
+  session.page = {
+    reload: async () => {},
+    waitForTimeout: async () => {},
+  };
+  session._fakeVisibilityAPI = async () => {};
+  session._scanCourseDetailsForCheckpoint = async () => ({
+    courseTitle: 'Course 1',
+    actualStudiedMinutes: 755,
+    totalLessons: 3,
+    uncompletedLessons: [{ progressPercent: 90 }],
+    allLessons: [],
+  });
+
+  const result = await session._checkpointAndVerifyCourse({
+    courseUrl,
+    targetMinutes: 756,
+    courseTitle: 'Course 1',
+    courseRunId: 9,
+  });
+
+  assert.equal(result.confirmed, false);
+  assert.equal(session.courseProgress[courseUrl].studiedMinutes, 755);
+  assert.equal(session.courseProgress[courseUrl].completed, false);
+  assert.equal(session.courseProgress[courseUrl].finalizationState, COURSE_FINALIZATION_STATES.VERIFICATION_PENDING);
+});
+
+test('checkpoint below target can explicitly continue the current lesson', async () => {
+  const session = new AutoCourseSession('test', { name: 'Test' });
+  const courseUrl = 'https://x/slides/course-1';
+  const events = [];
+  session.courseProgress[courseUrl] = {
+    title: 'Course 1',
+    targetMinutes: 756,
+    studiedMinutes: 756,
+    completed: false,
+    finalizationState: COURSE_FINALIZATION_STATES.CHECKPOINT,
+  };
+  session._activeCourseRunId = 10;
+  session.page = {
+    reload: async () => { events.push('reload'); },
+    waitForTimeout: async () => { events.push('stabilize'); },
+  };
+  session._fakeVisibilityAPI = async () => {};
+  session._scanCourseDetailsForCheckpoint = async () => {
+    events.push('scan');
+    return {
+      courseTitle: 'Course 1',
+      actualStudiedMinutes: 755,
+      totalLessons: 3,
+      uncompletedLessons: [{ progressPercent: 90 }],
+      allLessons: [],
+    };
+  };
+
+  const result = await session._checkpointAndVerifyCourse({
+    courseUrl,
+    targetMinutes: 756,
+    courseTitle: 'Course 1',
+    courseRunId: 10,
+    preserveCurrentPage: true,
+    continueStudying: true,
+  });
+
+  assert.equal(result.confirmed, false);
+  assert.deepEqual(events, ['reload', 'stabilize', 'scan']);
+  assert.equal(session.courseProgress[courseUrl].completed, false);
+  assert.equal(session.courseProgress[courseUrl].finalizationState, COURSE_FINALIZATION_STATES.NORMAL_STUDY);
+});
+
+test('stale checkpoint callback cannot update a course after switching runs', async () => {
+  const session = new AutoCourseSession('test', { name: 'Test' });
+  const courseUrl = 'https://x/slides/course-1';
+  let scanned = false;
+  session.courseProgress[courseUrl] = {
+    targetMinutes: 60,
+    studiedMinutes: 60,
+    completed: false,
+    finalizationState: COURSE_FINALIZATION_STATES.TARGET_REACHED,
+  };
+  session._activeCourseRunId = 11;
+  session.page = {
+    reload: async () => {},
+    waitForTimeout: async () => { session._activeCourseRunId = 12; },
+  };
+  session._fakeVisibilityAPI = async () => {};
+  session._scanCourseDetailsForCheckpoint = async () => {
+    scanned = true;
+    return null;
+  };
+
+  const result = await session._checkpointAndVerifyCourse({
+    courseUrl,
+    targetMinutes: 60,
+    courseTitle: 'Course 1',
+    courseRunId: 11,
+  });
+
+  assert.equal(result.stale, true);
+  assert.equal(scanned, false);
+  assert.equal(session.courseProgress[courseUrl].completed, false);
 });
 
 test('không dùng badge hoặc icon check chung của trang để kết luận bài đã xong', async () => {
