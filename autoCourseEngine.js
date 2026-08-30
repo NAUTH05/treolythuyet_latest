@@ -5,6 +5,15 @@ const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, readDomT
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
 const SESSION_LOG_SEPARATOR = '---------------------------------------------------------';
+const POST_TARGET_GRACE_MINUTES = 5;
+
+const COURSE_FINALIZATION_STATES = Object.freeze({
+  NORMAL_STUDY: 'normal-study',
+  TARGET_REACHED: 'target-reached',
+  CHECKPOINT: 'checkpoint',
+  COMPLETED: 'completed',
+  VERIFICATION_PENDING: 'verification-pending',
+});
 
 // Danh sách CHÍNH THỨC mọi trạng thái một phiên Auto-Scan có thể mang.
 // Dashboard phải hiểu được toàn bộ danh sách này (xem test frontendStatusContract).
@@ -32,6 +41,27 @@ function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted 
   const target = Math.max(0, Number(targetMinutes) || 0);
   const studied = Math.max(0, Number(studiedMinutes) || 0);
   return target > 0 ? studied >= target : allLessonsCompleted;
+}
+
+function createCourseFinalizationPlan(existingPlan, lessonRemainingMs, elapsedMs = 0) {
+  if (existingPlan) return existingPlan;
+
+  const remainingMs = Math.max(0, Number(lessonRemainingMs) || 0);
+  const graceMs = POST_TARGET_GRACE_MINUTES * 60 * 1000;
+  const allowanceMs = Math.min(remainingMs, graceMs);
+
+  return Object.freeze({
+    state: COURSE_FINALIZATION_STATES.TARGET_REACHED,
+    mode: remainingMs <= graceMs ? 'finish-current-lesson' : 'grace-period',
+    lessonRemainingMsAtTarget: remainingMs,
+    allowanceMs,
+    deadlineElapsedMs: Math.max(0, Number(elapsedMs) || 0) + allowanceMs,
+  });
+}
+
+function getCourseTargetRemainingMs(targetMinutes, trackedStudyMs) {
+  const targetMs = Math.max(0, Number(targetMinutes) || 0) * 60 * 1000;
+  return Math.max(0, targetMs - Math.max(0, Number(trackedStudyMs) || 0));
 }
 
 function isAutoCourseAccountBlockingStatus(status) {
@@ -101,6 +131,8 @@ class AutoCourseSession extends EventEmitter {
     this._pauseStartedAt = null;
     this._totalPausedMs = 0;
     this._sessionSeparatorLogged = false;
+    this._courseRunGeneration = 0;
+    this._activeCourseRunId = null;
   }
 
   // Đối tượng phiên này đã chạy (hoặc đang chạy) chưa?
@@ -319,6 +351,131 @@ class AutoCourseSession extends EventEmitter {
         try { await verifyPage.close(); } catch { /* ignore */ }
       }
     }
+  }
+
+  _isCurrentCourseRun(courseRunId) {
+    return !this._stopped && this._activeCourseRunId === courseRunId;
+  }
+
+  _setCourseFinalizationState(courseUrl, state) {
+    if (!this.courseProgress[courseUrl]) return;
+    this.courseProgress[courseUrl].finalizationState = state;
+    this.emit('status', this.getStatus());
+  }
+
+  async _scanCourseDetailsForCheckpoint(courseUrl, preserveCurrentPage = false) {
+    if (!preserveCurrentPage || !this.context) return scanCourseDetails(this.page, courseUrl);
+
+    let checkpointPage = null;
+    try {
+      checkpointPage = await this.context.newPage();
+      return await scanCourseDetails(checkpointPage, courseUrl);
+    } finally {
+      if (checkpointPage) {
+        try { await checkpointPage.close(); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  async _verifyCourseProgressAfterCheckpoint({
+    courseUrl,
+    targetMinutes,
+    courseTitle,
+    courseRunId,
+    preserveCurrentPage = false,
+    continueStudying = false,
+  }) {
+    this.log('🔍 Re-checking course progress after checkpoint', 'info');
+    let verifiedScan = null;
+    for (let attempt = 1; attempt <= 2 && this._isCurrentCourseRun(courseRunId); attempt++) {
+      verifiedScan = await this._scanCourseDetailsForCheckpoint(courseUrl, preserveCurrentPage);
+      if (verifiedScan && verifiedScan.totalLessons > 0) break;
+      if (attempt < 2) {
+        this.log(`⚠️ Course checkpoint scan failed (attempt ${attempt}/2) — retrying once`, 'warn');
+        await this.page.waitForTimeout(5000);
+      }
+    }
+
+    if (!this._isCurrentCourseRun(courseRunId)) return { confirmed: false, stale: true, scanResult: verifiedScan };
+
+    if (!verifiedScan || verifiedScan.totalLessons === 0) {
+      this._setCourseFinalizationState(
+        courseUrl,
+        continueStudying
+          ? COURSE_FINALIZATION_STATES.NORMAL_STUDY
+          : COURSE_FINALIZATION_STATES.VERIFICATION_PENDING
+      );
+      this.log(
+        continueStudying
+          ? `⚠️ Unable to verify refreshed Web Odoo progress for [${courseTitle}] — continuing the current lesson within its existing limit`
+          : `⚠️ Unable to verify refreshed Web Odoo progress for [${courseTitle}] — this course will not resume in the current run`,
+        'warn'
+      );
+      return { confirmed: false, stale: false, scanResult: verifiedScan };
+    }
+
+    const verifiedMinutes = Math.max(0, Number(verifiedScan.actualStudiedMinutes) || 0);
+    const allLessonsCompleted = verifiedScan.uncompletedLessons.length === 0;
+    const confirmed = courseReachedTarget(targetMinutes, verifiedMinutes, allLessonsCompleted);
+    this.courseProgress[courseUrl] = {
+      ...this.courseProgress[courseUrl],
+      title: verifiedScan.courseTitle || courseTitle,
+      targetMinutes,
+      studiedMinutes: verifiedMinutes,
+      completed: confirmed,
+      finalizationState: confirmed
+        ? COURSE_FINALIZATION_STATES.COMPLETED
+        : continueStudying
+          ? COURSE_FINALIZATION_STATES.NORMAL_STUDY
+          : COURSE_FINALIZATION_STATES.VERIFICATION_PENDING,
+    };
+    this.emit('status', this.getStatus());
+
+    if (confirmed) {
+      this.log(`✅ Course confirmed complete: ${verifiedMinutes}/${targetMinutes} minutes`, 'success');
+    } else {
+      this.log(
+        continueStudying
+          ? `⏱️ Checkpoint reports ${verifiedMinutes}/${targetMinutes} minutes — continuing the current lesson`
+          : `⚠️ Checkpoint reports ${verifiedMinutes}/${targetMinutes} minutes for [${verifiedScan.courseTitle || courseTitle}] — not marking complete and not resuming this course in the current run`,
+        continueStudying ? 'info' : 'warn'
+      );
+    }
+
+    return { confirmed, stale: false, scanResult: verifiedScan };
+  }
+
+  async _checkpointAndVerifyCourse({
+    courseUrl,
+    targetMinutes,
+    courseTitle,
+    courseRunId,
+    preserveCurrentPage = false,
+    continueStudying = false,
+  }) {
+    if (!this._isCurrentCourseRun(courseRunId)) return { confirmed: false, stale: true, scanResult: null };
+
+    this._setCourseFinalizationState(courseUrl, COURSE_FINALIZATION_STATES.CHECKPOINT);
+    this.log('🔄 Refreshing page for checkpoint verification', 'info');
+
+    try {
+      await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+      await this._fakeVisibilityAPI();
+      await this.page.waitForTimeout(7000);
+    } catch (err) {
+      this.log(`⚠️ Checkpoint refresh failed: ${String(err.message).split('\n')[0]} — continuing with bounded course re-scan`, 'warn');
+    }
+
+    if (!this._isCurrentCourseRun(courseRunId)) return { confirmed: false, stale: true, scanResult: null };
+
+    return this._verifyCourseProgressAfterCheckpoint({
+      courseUrl,
+      targetMinutes,
+      courseTitle,
+      courseRunId,
+      preserveCurrentPage,
+      continueStudying,
+    });
   }
 
   // Chờ nếu phiên đang ở trạng thái Tạm dừng (paused)
@@ -652,8 +809,10 @@ class AutoCourseSession extends EventEmitter {
 
         const cConfig = this.coursesConfig[cIdx];
         this.currentCourseIndex = cIdx;
+        const courseRunId = ++this._courseRunGeneration;
+        this._activeCourseRunId = courseRunId;
 
-        const targetMinutes = (cConfig.targetHours || 0) * 60 + (cConfig.targetMinutes || 0);
+        const targetMinutes = (Number(cConfig.targetHours) || 0) * 60 + (Number(cConfig.targetMinutes) || 0);
         this._setStatus('scanning');
         this.emit('status', this.getStatus());
         this.log(`🔍 Bắt đầu quét Khóa học ${cIdx + 1}/${this.coursesConfig.length}: ${cConfig.courseUrl} (Mục tiêu: ${cConfig.targetHours || 0}h ${cConfig.targetMinutes || 0}m)`, 'info');
@@ -690,10 +849,25 @@ class AutoCourseSession extends EventEmitter {
           targetMinutes,
           studiedMinutes: courseStudiedMins,
           completed: false,
+          finalizationState: COURSE_FINALIZATION_STATES.NORMAL_STUDY,
         };
 
         if (scanResult.actualStudiedText) {
           this.log(`⏱️ Thời gian đã hoàn thành tích lũy trên web: ${scanResult.actualStudiedText} (${courseStudiedMins} phút)`, 'info');
+        }
+
+        if (targetMinutes > 0 && courseStudiedMins >= targetMinutes) {
+          this.log(`🎯 Course already reached target: ${courseStudiedMins}/${targetMinutes} minutes`, 'success');
+          this.log('⏭️ No additional study required', 'info');
+          this.log('🔄 Performing checkpoint verification', 'info');
+          await this._checkpointAndVerifyCourse({
+            courseUrl: cConfig.courseUrl,
+            targetMinutes,
+            courseTitle: scanResult.courseTitle,
+            courseRunId,
+          });
+          if (cIdx + 1 < this.coursesConfig.length) this.log('➡️ Switching to next course', 'success');
+          continue;
         }
 
         if (scanResult.uncompletedLessons.length === 0) {
@@ -707,11 +881,9 @@ class AutoCourseSession extends EventEmitter {
           continue;
         }
 
-        if (targetMinutes > 0 && courseStudiedMins >= targetMinutes) {
-          this.log(`🎉 Khóa học [${scanResult.courseTitle}] trên web đã đạt ${scanResult.actualStudiedText || (courseStudiedMins + ' phút')} (Đã đạt/vượt mục tiêu ${cConfig.targetHours}h ${cConfig.targetMinutes}m)! Bỏ qua khóa này.`, 'success');
-          this.courseProgress[cConfig.courseUrl].completed = true;
-          continue;
-        }
+        const courseBaseStudiedMs = courseStudiedMins * 60 * 1000;
+        let courseSessionStudiedMs = 0;
+        let courseFinalizedThisRun = false;
 
         // Vòng lặp qua các bài chưa hoàn thành trong khóa
         for (let lIdx = 0; lIdx < scanResult.uncompletedLessons.length; lIdx++) {
@@ -725,8 +897,16 @@ class AutoCourseSession extends EventEmitter {
           this.log(`⏳ Thời gian học trong ngày còn lại: ${this._formatMinutes(remainingDailyMins)} (${remainingDailyMins} phút / tối đa ${this._formatMinutes(this.options.dailyMaxMinutes)})`, 'info');
 
           if (targetMinutes > 0 && courseStudiedMins >= targetMinutes) {
-            this.log(`🎉 Khóa học [${scanResult.courseTitle}] đã đạt đủ mục tiêu ${targetMinutes} phút yêu cầu!`, 'success');
-            this.courseProgress[cConfig.courseUrl].completed = true;
+            this.log(`🎯 Course target reached before opening another lesson: ${courseStudiedMins}/${targetMinutes} minutes`, 'success');
+            this.log('⏭️ No additional study required', 'info');
+            await this._checkpointAndVerifyCourse({
+              courseUrl: cConfig.courseUrl,
+              targetMinutes,
+              courseTitle: scanResult.courseTitle,
+              courseRunId,
+            });
+            courseFinalizedThisRun = true;
+            if (cIdx + 1 < this.coursesConfig.length) this.log('➡️ Switching to next course', 'success');
             break;
           }
 
@@ -735,6 +915,7 @@ class AutoCourseSession extends EventEmitter {
 
           let apiTimerSec = null;
           const responseHandler = async (res) => {
+            if (!this._isCurrentCourseRun(courseRunId)) return;
             if (res.url().includes('countdown-start')) {
               try {
                 const data = await res.json();
@@ -866,15 +1047,67 @@ class AutoCourseSession extends EventEmitter {
           let elapsedMs = 0;
           let lessonConfirmedCompleted = lessonMinutes === 0;
           let extensionCount = 0; // Đếm số lần tự động gia hạn bài học này
+          let courseFinalizationPlan = null;
+          let courseCompletedAtCheckpoint = false;
+
+          const enterCourseFinalization = () => {
+            const lessonRemainingMs = Math.max(0, durationMs - elapsedMs);
+            courseFinalizationPlan = createCourseFinalizationPlan(
+              courseFinalizationPlan,
+              lessonRemainingMs,
+              elapsedMs
+            );
+            this._setCourseFinalizationState(cConfig.courseUrl, COURSE_FINALIZATION_STATES.TARGET_REACHED);
+            this.log(`⏱️ Checkpoint has not yet confirmed the course target: ${courseStudiedMins}/${targetMinutes} local minutes`, 'warn');
+            this.log('⏱️ Entering course finalization mode', 'warn');
+
+            if (lessonRemainingMs <= 0) {
+              this.log('✅ Course target was reached exactly as the current lesson ended', 'success');
+            } else if (courseFinalizationPlan.mode === 'finish-current-lesson') {
+              this.log('📖 Current lesson is still active', 'info');
+              this.log('⏳ Current lesson is nearly complete — allowing it to finish', 'info');
+            } else {
+              this.log('📖 Current lesson is still active', 'info');
+              this.log(`⏱️ Current lesson has ${Math.ceil(lessonRemainingMs / 60000)} minutes remaining`, 'info');
+              this.log('🛑 Applying maximum 5-minute post-target grace period', 'warn');
+            }
+          };
+
+          const verifyCurrentCheckpoint = async (refreshPage) => {
+            const verifyArgs = {
+              courseUrl: cConfig.courseUrl,
+              targetMinutes,
+              courseTitle: scanResult.courseTitle,
+              courseRunId,
+              preserveCurrentPage: true,
+              continueStudying: true,
+            };
+            if (!refreshPage) {
+              this._setCourseFinalizationState(cConfig.courseUrl, COURSE_FINALIZATION_STATES.CHECKPOINT);
+            }
+            const result = refreshPage
+              ? await this._checkpointAndVerifyCourse(verifyArgs)
+              : await this._verifyCourseProgressAfterCheckpoint(verifyArgs);
+            if (result.confirmed) {
+              courseCompletedAtCheckpoint = true;
+              courseFinalizedThisRun = true;
+            }
+            return result;
+          };
 
           while (elapsedMs < durationMs && !this._stopped) {
             await this._checkPaused();
 
             // Hết khung giờ học → F5 lưu checkpoint rồi tạm nghỉ (server tự hẹn giờ chạy lại)
             if (this._msRemainingInWindow() === -2) {
+              if (courseFinalizationPlan) {
+                this.log('⏰ Study window ended during course finalization — stopping the lesson for checkpoint', 'warn');
+                break;
+              }
               this.log('⏰ Hết giờ khung học — F5 lưu checkpoint và tạm nghỉ...', 'warn');
               try {
                 await this.page.reload({ waitUntil: 'load', timeout: 60000 });
+                await verifyCurrentCheckpoint(false);
               } catch { /* ignore */ }
               this._hitTimeWindowLimit();
               return;
@@ -894,10 +1127,42 @@ class AutoCourseSession extends EventEmitter {
             const jitteredMs = Math.round(refreshIntervalMs + (Math.random() * 2 - 1) * jitter);
             let waitStep = Math.min(Math.max(60000, jitteredMs), durationMs - elapsedMs);
 
+            // Stop exactly at the course target first. Only after that transition may the
+            // one-shot finalization allowance be consumed.
+            if (!courseFinalizationPlan && targetMinutes > 0) {
+              const courseTargetRemainingMs = getCourseTargetRemainingMs(
+                targetMinutes,
+                courseBaseStudiedMs + courseSessionStudiedMs
+              );
+              if (courseTargetRemainingMs <= 0) {
+                this.log('🔄 Local course timer reached its target — checkpointing before any additional study', 'info');
+                const checkpointResult = await verifyCurrentCheckpoint(true);
+                if (checkpointResult.stale || checkpointResult.confirmed) break;
+                enterCourseFinalization();
+                if (courseFinalizationPlan.allowanceMs > 0) continue;
+                break;
+              }
+              waitStep = Math.min(waitStep, courseTargetRemainingMs);
+            } else if (courseFinalizationPlan) {
+              const finalizationRemainingMs = Math.max(0, courseFinalizationPlan.deadlineElapsedMs - elapsedMs);
+              if (finalizationRemainingMs <= 0) {
+                if (courseFinalizationPlan.mode === 'grace-period') {
+                  this.log('🛑 5-minute post-target grace period reached', 'warn');
+                  this.log('⏹️ Stopping current lesson', 'warn');
+                }
+                break;
+              }
+              waitStep = Math.min(waitStep, finalizationRemainingMs);
+            }
+
             // Không học vượt ngân sách phút còn lại trong ngày.
             const dailyRemainingMs = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes) * 60000;
             waitStep = Math.min(waitStep, dailyRemainingMs);
             if (waitStep <= 0) {
+              if (courseFinalizationPlan) {
+                this.log('🛑 Daily study limit reached during course finalization — stopping for checkpoint', 'warn');
+                break;
+              }
               this._hitDailyLimit();
               return;
             }
@@ -905,7 +1170,7 @@ class AutoCourseSession extends EventEmitter {
             // Không chờ vượt quá thời điểm kết thúc Ca học hiện tại
             const shiftCheck = this._checkCustomShifts();
             if (shiftCheck.currentShift && shiftCheck.remainingMs < waitStep) {
-              waitStep = Math.max(5000, shiftCheck.remainingMs);
+              waitStep = Math.min(waitStep, Math.max(5000, shiftCheck.remainingMs));
             }
 
             // Không chờ vượt quá thời điểm kết thúc khung giờ hiện tại
@@ -918,25 +1183,55 @@ class AutoCourseSession extends EventEmitter {
             if (this._stopped) break;
 
             elapsedMs += activeWaitMs;
+            courseSessionStudiedMs += activeWaitMs;
 
             this._rolloverDailyCounter();
             const addMins = Math.round(activeWaitMs / 60000);
             this.dailyStudiedMinutes += addMins;
-            courseStudiedMins += addMins;
+            courseStudiedMins = Math.floor((courseBaseStudiedMs + courseSessionStudiedMs) / 60000);
             this.courseProgress[cConfig.courseUrl].studiedMinutes = courseStudiedMins;
 
             const remainingDailyMins = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes);
             this.log(`📊 Đang treo bài [${lesson.title}]: Đã treo ${Math.round(elapsedMs / 60000)}/${lessonMinutes} phút | Hôm nay: ${this._formatMinutes(this.dailyStudiedMinutes)} / ${this._formatMinutes(this.options.dailyMaxMinutes)} (Còn lại: ${this._formatMinutes(remainingDailyMins)})`, 'info');
             this.emit('status', this.getStatus());
 
+            if (!courseFinalizationPlan
+              && targetMinutes > 0
+              && courseBaseStudiedMs + courseSessionStudiedMs >= targetMinutes * 60 * 1000) {
+              this.log('🔄 Local course timer reached its target — checkpointing before any additional study', 'info');
+              const checkpointResult = await verifyCurrentCheckpoint(true);
+              if (checkpointResult.stale || checkpointResult.confirmed) break;
+              enterCourseFinalization();
+              if (elapsedMs < durationMs && courseFinalizationPlan.allowanceMs > 0) {
+                continue;
+              }
+            }
+
+            if (courseFinalizationPlan
+              && courseFinalizationPlan.mode === 'grace-period'
+              && elapsedMs >= courseFinalizationPlan.deadlineElapsedMs
+              && elapsedMs < durationMs) {
+              this.log('🛑 5-minute post-target grace period reached', 'warn');
+              this.log('⏹️ Stopping current lesson', 'warn');
+              break;
+            }
+
             if (activeWaitMs < waitStep && !this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
-              try { await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch { /* ignore */ }
+              if (courseFinalizationPlan) break;
+              try {
+                await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                await verifyCurrentCheckpoint(false);
+              } catch { /* ignore */ }
               return;
             }
 
             // Ghi nhận phần vừa học trước, sau đó mới hẹn tiếp ca/ngày kế tiếp.
             if (!this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
-              try { await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch { /* ignore */ }
+              if (courseFinalizationPlan) break;
+              try {
+                await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+                await verifyCurrentCheckpoint(false);
+              } catch { /* ignore */ }
               return;
             }
 
@@ -957,6 +1252,11 @@ class AutoCourseSession extends EventEmitter {
                 this.log(`⚠️ F5 bị redirect: ${this.page.url()} → Đang chờ hệ thống cho phép vào lại...`, 'warn');
                 const reentered = await this._waitUntilOnUrl(lesson.url);
                 if (reentered) this.log(`✅ Đã vào lại bài học sau khi F5 bị redirect`, 'success');
+              }
+
+              if (!this._stopped) {
+                const checkpointResult = await verifyCurrentCheckpoint(false);
+                if (checkpointResult.stale || checkpointResult.confirmed) break;
               }
 
               // Heartbeat Check: Đọc lại bộ đếm web sau F5 nếu tìm thấy thời gian đếm ngược hợp lệ (>0 phút)
@@ -1001,6 +1301,11 @@ class AutoCourseSession extends EventEmitter {
                   await this._waitUntilOnUrl(lesson.url);
                 }
 
+                if (!this._stopped) {
+                  const checkpointResult = await verifyCurrentCheckpoint(false);
+                  if (checkpointResult.stale || checkpointResult.confirmed) break;
+                }
+
                 if (this._isOnUrl(lesson.url)) {
                   // 1. Kiểm tra badge hoàn thành trên slide player
                   let isCompleted = await this._isCurrentLessonCompleted();
@@ -1021,6 +1326,8 @@ class AutoCourseSession extends EventEmitter {
 
                   if (isCompleted) {
                     lessonConfirmedCompleted = true;
+                  } else if (courseFinalizationPlan) {
+                    this.log(`ℹ️ Course finalization is active — lesson [${lesson.title}] will not be extended`, 'info');
                   } else {
                     // 3. Nếu CẢ HAI nguồn (slide player & trang khóa học) đều báo BÀI CHƯA ĐẠT 100%:
                     // Tiến hành kiểm tra timer hoặc gia hạn, nhưng CÓ GIỚI HẠN (max 3 lần gia hạn) để chống kẹt vô hạn.
@@ -1055,6 +1362,11 @@ class AutoCourseSession extends EventEmitter {
             }
           }
 
+          if (!this._stopped && courseCompletedAtCheckpoint) {
+            if (cIdx + 1 < this.coursesConfig.length) this.log('➡️ Switching to next course', 'success');
+            break;
+          }
+
           if (!this._stopped && this.status !== 'paused' && lessonConfirmedCompleted) {
             this.log(`✅ Hoàn thành treo bài [${lesson.title}] (${lessonMinutes} phút)!`, 'success');
             this.emit('progress-saved', {
@@ -1067,9 +1379,24 @@ class AutoCourseSession extends EventEmitter {
           } else if (!this._stopped && this.status !== 'paused') {
             this.log(`⚠️ Bài [${lesson.title}] chưa được Web Odoo xác nhận hoàn thành — không ghi nhận là đã xong.`, 'warn');
           }
+
+          if (!this._stopped && courseFinalizationPlan) {
+            if (courseFinalizationPlan.mode === 'finish-current-lesson' && lessonConfirmedCompleted) {
+              this.log('✅ Current lesson finished during course finalization', 'success');
+            }
+            await this._checkpointAndVerifyCourse({
+              courseUrl: cConfig.courseUrl,
+              targetMinutes,
+              courseTitle: scanResult.courseTitle,
+              courseRunId,
+            });
+            courseFinalizedThisRun = true;
+            if (cIdx + 1 < this.coursesConfig.length) this.log('➡️ Switching to next course', 'success');
+            break;
+          }
         }
 
-        if (courseReachedTarget(targetMinutes, courseStudiedMins, true)) {
+        if (!courseFinalizedThisRun && targetMinutes === 0 && courseReachedTarget(targetMinutes, courseStudiedMins, true)) {
           this.courseProgress[cConfig.courseUrl].completed = true;
         }
       }
@@ -1126,6 +1453,8 @@ class AutoCourseSession extends EventEmitter {
     this._phase = PHASE_FINISHED;
     if (this._stopped) return;
     this._stopped = true;
+    this._activeCourseRunId = null;
+    this._courseRunGeneration++;
     this._clearStealthLoop();
     if (this.browser) {
       try { await this.browser.close(); } catch { /* ignore */ }
@@ -1137,6 +1466,10 @@ class AutoCourseSession extends EventEmitter {
 module.exports = {
   AutoCourseSession,
   courseReachedTarget,
+  createCourseFinalizationPlan,
+  getCourseTargetRemainingMs,
+  POST_TARGET_GRACE_MINUTES,
+  COURSE_FINALIZATION_STATES,
   isAutoCourseAccountBlockingStatus,
   getPersistentAutoCourseOptions,
   AUTO_COURSE_STATUSES,
