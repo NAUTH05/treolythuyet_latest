@@ -80,19 +80,11 @@ test('đọc được document cũ lưu object dưới dạng chuỗi JSON', () 
   assert.deepEqual(decodeFirestoreDocument(legacy), { autoScans: [{ id: 'a' }] });
 });
 
-test('document vượt ngân sách 1MB bị cắt bớt log cũ thay vì để Firestore từ chối', async t => {
-  const originalFetch = global.fetch;
+test('document vượt ngân sách 1MB bị cắt bớt log cũ thay vì để Firestore từ chối', t => {
   const originalWarn = console.warn;
-  t.after(() => { global.fetch = originalFetch; console.warn = originalWarn; });
+  t.after(() => { console.warn = originalWarn; });
   console.warn = () => {};
-
-  let sentBody = null;
-  global.fetch = async (_url, options) => {
-    sentBody = JSON.parse(options.body);
-    return { ok: true, status: 200 };
-  };
-
-  const { syncToFirebaseREST } = require('../firebase-service');
+  const { fitDocumentWithinBudget, restoreAdminValue } = require('../firebase-service');
   const logs = Array.from({ length: 5000 }, (_, i) => ({
     timestamp: '22-08-2026 10:00:00',
     account: 'user1',
@@ -100,15 +92,11 @@ test('document vượt ngân sách 1MB bị cắt bớt log cũ thay vì để F
     msg: `Dòng log số ${i} `.repeat(12),
   }));
 
-  await syncToFirebaseREST('system_logs_daily', '22-08-2026_user1', { date: '22-08-2026', logs }, {
-    projectId: `budget-${process.pid}`,
-    apiKey: 'key',
-  });
+  const prepared = fitDocumentWithinBudget({ date: '22-08-2026', logs }, 'system_logs_daily/test');
+  const restored = restoreAdminValue(prepared);
 
-  assert.ok(Buffer.byteLength(JSON.stringify(sentBody.fields), 'utf8') <= 950 * 1024);
-  assert.deepEqual(sentBody.fields.truncated, { booleanValue: true });
-  assert.ok(Number(sentBody.fields.omittedOldestCount.integerValue) > 0);
-  // Cắt từ đầu mảng → log mới nhất phải còn lại.
-  const kept = sentBody.fields.logs.arrayValue.values;
-  assert.equal(kept[kept.length - 1].mapValue.fields.msg.stringValue, logs[logs.length - 1].msg);
+  assert.ok(Buffer.byteLength(JSON.stringify(encodeFirestoreFields(restored)), 'utf8') <= 950 * 1024);
+  assert.equal(restored.truncated, true);
+  assert.ok(restored.omittedOldestCount > 0);
+  assert.equal(restored.logs[restored.logs.length - 1].msg, logs[logs.length - 1].msg);
 });

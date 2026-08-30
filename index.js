@@ -64,9 +64,9 @@ async function loadAccounts() {
     arrayKey: 'accounts',
     collection: 'system_accounts',
     documentId: 'list',
-    loadConfig: fbService.loadFirebaseConfig,
-    syncRemote: fbService.syncToFirebaseREST,
-    fetchRemote: fbService.fetchFirebaseDocumentREST,
+    loadConfig: fbService.getFirebaseAdminConfiguration,
+    syncRemote: fbService.syncToFirebase,
+    fetchRemote: fbService.fetchFirebaseDocument,
     initialRevision: local.revision,
   });
   await accountsSync.reconcile();
@@ -146,5 +146,5 @@ async function main() {
 
 main().catch(err => {
   console.error(chalk.red(`Fatal error: ${err.message}`));
-  process.exit(1);
-});
+  process.exitCode = 1;
+}).finally(() => fbService.shutdownFirebaseAdmin());
