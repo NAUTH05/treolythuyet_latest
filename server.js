@@ -2565,7 +2565,9 @@ async function gracefulShutdown(signal) {
   try { flushDailyLogsFor(dailyLogs); } catch (error) {
     console.error('[STATE] Daily log shutdown flush failed:', error.message);
   }
-  await Promise.allSettled([saveQueueState(), saveAutoScanState()]);
+  if (fbService.getFirebaseAdminConfiguration().enabled) {
+    await Promise.allSettled([saveQueueState(), saveAutoScanState()]);
+  }
 
   const results = await Promise.allSettled(
     getPersistentStateSyncs().map(sync => sync.flushPending(15000))
