@@ -111,7 +111,43 @@ There is no `npm run lint` script in this repository. Runtime logs and Playwrigh
 
 ## Optional reverse proxy
 
-On Windows, place IIS, ARR, or another reverse proxy in front of Node.js and forward `/lythuyet` to `http://127.0.0.1:3000`. Preserve WebSocket upgrade support for `/lythuyet/socket.io` and use long proxy timeouts for active sessions.
+The Node process is HTTP-only on port `3000`. A public HTTPS domain requires IIS/ARR, Caddy, or another reverse proxy listening on `443`.
+
+For IIS:
+
+1. Install the IIS Web Server role and the IIS WebSocket Protocol feature.
+2. Install IIS URL Rewrite and Application Request Routing (ARR).
+3. In IIS Manager, open **Server** -> **Application Request Routing Cache** -> **Server Proxy Settings**, then enable **Proxy**.
+4. Bind the site to `mrnauthdev.dpdns.org` on HTTPS port `443` with a valid certificate. A Cloudflare Origin Certificate is suitable when Cloudflare SSL mode is **Full (strict)**.
+5. Put this `web.config` in the IIS site root:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <webSocket enabled="true" />
+    <rewrite>
+      <rules>
+        <rule name="TreoWeb reverse proxy" stopProcessing="true">
+          <match url="(.*)" />
+          <action type="Rewrite" url="http://127.0.0.1:3000/{R:0}" />
+        </rule>
+      </rules>
+    </rewrite>
+  </system.webServer>
+</configuration>
+```
+
+The Cloudflare DNS record may remain **Proxied**. Set Cloudflare **SSL/TLS** mode to **Full (strict)** after the IIS certificate is installed. Do not proxy directly to port `3000`; terminate HTTPS at IIS and keep Node private behind the proxy. Allow inbound TCP `80` and `443` in Windows Firewall if HTTP validation or certificate issuance requires them.
+
+Verify the origin before testing the domain:
+
+```powershell
+Invoke-WebRequest http://127.0.0.1:3000/lythuyet/ -UseBasicParsing
+Get-NetTCPConnection -State Listen -LocalPort 443
+```
+
+If Cloudflare still shows `525`, inspect the process owning port `443` and its IIS HTTPS binding. A TCP listener alone is not enough; it must speak TLS for the requested hostname.
 
 ## Existing Linux/VPS VHost configuration
 
