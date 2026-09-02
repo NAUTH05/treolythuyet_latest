@@ -10,7 +10,7 @@ const { AutoCourseRegistry } = require('./autoCourseRegistry');
 const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
-const { SerializedStateSync, readStateDocument, writeJsonAtomicSync } = require('./stateSync');
+const { SerializedStateSync, writeJsonAtomicSync } = require('./stateSync');
 
 async function respondAfterStateSync(res, pending, body) {
   try {
@@ -19,31 +19,14 @@ async function respondAfterStateSync(res, pending, body) {
   } catch (error) {
     return res.status(503).json({
       ok: false,
-      localApplied: true,
-      error: `Đã cập nhật local nhưng chưa thể xác nhận đồng bộ Firebase: ${error.message}`,
+      localApplied: false,
+      error: `Firestore unavailable; change was not persisted: ${error.message}`,
     });
   }
 }
 
-const ADMIN_CONFIG_FILE = path.join(__dirname, 'admin-config.json');
-
 function getAdminConfig() {
-  if (!fs.existsSync(ADMIN_CONFIG_FILE)) {
-    return { adminPassword: 'admin123' };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(ADMIN_CONFIG_FILE, 'utf8'));
-  } catch {
-    return { adminPassword: 'admin123' };
-  }
-}
-
-function saveAdminConfig(cfg) {
-  try {
-    fs.writeFileSync(ADMIN_CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
-  } catch (e) {
-    console.error('[ADMIN] Không thể lưu admin config:', e.message);
-  }
+  return { adminPassword: process.env.ADMIN_PASSWORD || '' };
 }
 
 // =================== ADMIN AUTH (Bearer token) ===================
@@ -72,22 +55,15 @@ function requireAdmin(req, res, next) {
 
 // =================== PRESETS PERSISTENCE ===================
 
-const PRESETS_FILE = path.join(__dirname, 'presets.json');
-const presetsState = readStateDocument(PRESETS_FILE, 'presets');
 const presetsSync = new SerializedStateSync({
-  label: 'presets', filePath: PRESETS_FILE, arrayKey: 'presets', collection: 'system_presets', documentId: 'list',
+  label: 'presets', filePath: null, arrayKey: 'presets', collection: 'system_presets', documentId: 'list',
   loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
   fetchRemote: fbService.fetchFirebaseDocument,
-  initialRevision: presetsState.revision,
+  initialRevision: 0,
 });
 
 function loadPresets() {
-  if (!fs.existsSync(PRESETS_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(PRESETS_FILE, 'utf8')).presets || [];
-  } catch {
-    return [];
-  }
+  return presetsSync.getData();
 }
 
 function savePresets(presets) {
@@ -105,23 +81,16 @@ function savePresets(presets) {
 
 // =================== AUTO-SCAN PRESETS =====================
 
-const AUTO_PRESETS_FILE = path.join(__dirname, 'autoscan-presets.json');
-const autoPresetsState = readStateDocument(AUTO_PRESETS_FILE, 'presets');
 const autoPresetsSync = new SerializedStateSync({
-  label: 'auto-scan presets', filePath: AUTO_PRESETS_FILE, arrayKey: 'presets',
+  label: 'auto-scan presets', filePath: null, arrayKey: 'presets',
   collection: 'system_autoscan_presets', documentId: 'list',
   loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
   fetchRemote: fbService.fetchFirebaseDocument,
-  initialRevision: autoPresetsState.revision,
+  initialRevision: 0,
 });
 
 function loadAutoPresets() {
-  if (!fs.existsSync(AUTO_PRESETS_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(AUTO_PRESETS_FILE, 'utf8')).presets || [];
-  } catch {
-    return [];
-  }
+  return autoPresetsSync.getData();
 }
 
 function saveAutoPresets(presets) {
@@ -370,13 +339,11 @@ const queues = new Map();   // queueId -> queue data
 
 // =================== QUEUE STATE PERSISTENCE ==============
 
-const QUEUE_STATE_FILE = path.join(__dirname, 'queue-state.json');
-const queueFileState = readStateDocument(QUEUE_STATE_FILE, 'queues');
 const queueStateSync = new SerializedStateSync({
-  label: 'queues', filePath: QUEUE_STATE_FILE, arrayKey: 'queues', collection: 'system_queues', documentId: 'state',
+  label: 'queues', filePath: null, arrayKey: 'queues', collection: 'system_queues', documentId: 'state',
   loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
   fetchRemote: fbService.fetchFirebaseDocument,
-  initialRevision: queueFileState.revision,
+  initialRevision: 0,
 });
 
 function saveQueueState() {
@@ -414,15 +381,7 @@ function saveQueueState() {
 }
 
 function loadAndRestoreQueues() {
-  if (!fs.existsSync(QUEUE_STATE_FILE)) return;
-  let state;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(QUEUE_STATE_FILE, 'utf8'));
-    state = Array.isArray(parsed) ? parsed : parsed.queues;
-  } catch (e) {
-    console.error('[STATE] Không thể đọc queue state:', e.message);
-    return;
-  }
+  const state = queueStateSync.getData();
   if (!Array.isArray(state)) {
     console.error('[STATE] Queue state không đúng định dạng, bỏ qua khôi phục.');
     return;
@@ -1029,23 +988,15 @@ function scheduleNextPair(queue) {
 
 // ==================== ACCOUNTS MGMT ========================
 
-const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
-const accountsFileState = readStateDocument(ACCOUNTS_FILE, 'accounts');
 const accountsStateSync = new SerializedStateSync({
-  label: 'accounts', filePath: ACCOUNTS_FILE, arrayKey: 'accounts', collection: 'system_accounts', documentId: 'list',
+  label: 'accounts', filePath: null, arrayKey: 'accounts', collection: 'system_accounts', documentId: 'list',
   loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
   fetchRemote: fbService.fetchFirebaseDocument,
-  initialRevision: accountsFileState.revision,
+  initialRevision: 0,
 });
 
 function loadAccounts() {
-  if (!fs.existsSync(ACCOUNTS_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8')).accounts || [];
-  } catch (error) {
-    console.error('[ACCOUNTS] Invalid local accounts cache:', error.message);
-    return [];
-  }
+  return accountsStateSync.getData();
 }
 
 function saveAccounts(accounts) {
@@ -1073,7 +1024,7 @@ async function synchronizeAllPersistentStates(reason = 'startup', syncs = getPer
   const config = fbService.getFirebaseAdminConfiguration();
   console.log(`[FIREBASE] ${reason === 'startup' ? 'Startup synchronization started' : 'Synchronization started after configuration update'}`);
   if (!config.enabled) {
-    console.warn(`[FIREBASE] Admin SDK ${config.status} - local cache mode is active${config.error ? `: ${config.error}` : ''}`);
+    console.warn(`[FIREBASE] Admin SDK ${config.status} - persistent state is unavailable${config.error ? `: ${config.error}` : ''}`);
   } else {
     const verification = await fbService.verifyFirebaseConnection();
     if (!verification.connected) console.warn(`[FIREBASE] Firestore connection verification failed (${verification.status})`);
@@ -1132,11 +1083,10 @@ app.post('/lythuyet/api/admin/change-password', (req, res) => {
   if (oldPassword !== cfg.adminPassword) {
     return res.status(401).json({ error: 'Mật khẩu cũ không chính xác' });
   }
-  cfg.adminPassword = newPassword;
-  saveAdminConfig(cfg);
-  // Thu hồi toàn bộ token đang hoạt động → buộc đăng nhập lại bằng mật khẩu mới
-  activeTokens.clear();
-  res.json({ ok: true });
+  return res.status(501).json({
+    ok: false,
+    error: 'Admin password is managed by ADMIN_PASSWORD in the server environment. Update .env and restart the service.',
+  });
 });
 
 // Lấy Firebase config & status
@@ -1671,14 +1621,12 @@ const ACCOUNT_BUSY_RETRY_MS = 5 * 60 * 1000;
 // chạy lại các phiên đang dở. Timer này được registry quản lý nên bấm Dừng/Xóa
 // trong lúc chờ sẽ hủy được (trước đây là setTimeout trần, không thể hủy).
 const RESTORE_START_DELAY_MS = 5000;
-const AUTOSCAN_STATE_FILE = path.join(__dirname, 'autoscan-state.json');
-const autoScanFileState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
 const autoScanStateSync = new SerializedStateSync({
-  label: 'auto-scan', filePath: AUTOSCAN_STATE_FILE, arrayKey: 'autoScans',
+  label: 'auto-scan', filePath: null, arrayKey: 'autoScans',
   collection: 'system_autoscan', documentId: 'state',
   loadConfig: fbService.getFirebaseAdminConfiguration, syncRemote: fbService.syncToFirebase,
   fetchRemote: fbService.fetchFirebaseDocument,
-  initialRevision: autoScanFileState.revision,
+  initialRevision: 0,
 });
 
 // Lưu trạng thái Auto-Scan ra file + đồng bộ Firebase (giống Queue thủ công)
@@ -1835,16 +1783,7 @@ function restartAutoScanSession(sessionId) {
 
 // Khôi phục các phiên Auto-Scan từ lần chạy trước (nếu server bị restart hoặc từ Firebase)
 async function loadAndRestoreAutoScans() {
-  let state = null;
-  const localState = readStateDocument(AUTOSCAN_STATE_FILE, 'autoScans');
-  if (localState.available) state = localState.data;
-  if (!localState.available && fs.existsSync(AUTOSCAN_STATE_FILE)) {
-    try {
-      state = JSON.parse(fs.readFileSync(AUTOSCAN_STATE_FILE, 'utf8'));
-    } catch (e) {
-      console.error('[STATE] Không thể đọc auto-scan state local:', e.message);
-    }
-  }
+  const state = autoScanStateSync.getData();
 
   if (!state || !Array.isArray(state)) return;
 
@@ -1912,7 +1851,7 @@ async function loadAndRestoreAutoScans() {
     }
   }
 
-  await saveAutoScanState();
+  if (state.length > 0 && fbService.getFirebaseAdminConfiguration().enabled) await saveAutoScanState();
   if (state.length > 0) {
     console.log(`[STATE] Khôi phục ${state.length} phiên Auto-Scan (${active} hoạt động/đang hẹn giờ).`);
   }

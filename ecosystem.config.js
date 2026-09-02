@@ -13,8 +13,9 @@ module.exports = {
       merge_logs: true,
       env: {
         NODE_ENV: 'production',
-        PORT: 3000,
-        FIREBASE_SERVICE_ACCOUNT_FILE: '/home/dpdns-mrnauthdev/.config/treoweb/firebase-service-account.json',
+        PORT: process.env.PORT || 3000,
+        FIREBASE_SERVICE_ACCOUNT_FILE: process.env.FIREBASE_SERVICE_ACCOUNT_FILE || '',
+        ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || '',
       },
     },
   ],

@@ -1,10 +1,8 @@
 const yargs = require('yargs');
 const chalk = require('chalk');
-const fs = require('fs');
-const path = require('path');
 const { BotSession } = require('./bot');
 const fbService = require('./firebase-service');
-const { SerializedStateSync, readStateDocument } = require('./stateSync');
+const { SerializedStateSync } = require('./stateSync');
 
 // ============================================================
 //  CLI MODE - Chay tu command line
@@ -56,30 +54,23 @@ const argv = yargs
   .argv;
 
 async function loadAccounts() {
-  const p = path.join(__dirname, 'accounts.json');
-  const local = readStateDocument(p, 'accounts');
   const accountsSync = new SerializedStateSync({
     label: 'accounts',
-    filePath: p,
+    filePath: null,
     arrayKey: 'accounts',
     collection: 'system_accounts',
     documentId: 'list',
     loadConfig: fbService.getFirebaseAdminConfiguration,
     syncRemote: fbService.syncToFirebase,
     fetchRemote: fbService.fetchFirebaseDocument,
-    initialRevision: local.revision,
+    initialRevision: 0,
   });
-  await accountsSync.reconcile();
-  if (!fs.existsSync(p)) {
-    console.error(chalk.red('Khong tim thay accounts.json va khong the khoi phuc tu Firebase!'));
+  const result = await accountsSync.reconcile();
+  if (result.remoteStatus && !['ok', 'missing'].includes(result.remoteStatus)) {
+    console.error(chalk.red(`Khong the tai accounts tu Firestore (${result.remoteStatus}).`));
     process.exit(1);
   }
-  const restored = readStateDocument(p, 'accounts');
-  if (!restored.available) {
-    console.error(chalk.red('accounts.json khong hop le va Firebase khong co ban khoi phuc!'));
-    process.exit(1);
-  }
-  return restored.data;
+  return accountsSync.getData();
 }
 
 function getSelectedAccounts(accounts, selector) {

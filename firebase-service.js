@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+require('dotenv').config();
 const {
   initializeApp,
   cert,
@@ -194,8 +195,7 @@ function loadFirebaseAdminConfiguration({ env = process.env, baseDir = __dirname
 
     const explicitFile = env.FIREBASE_SERVICE_ACCOUNT_FILE;
     const googleFile = env.GOOGLE_APPLICATION_CREDENTIALS;
-    const defaultFile = path.join(baseDir, 'firebase-service-account.json');
-    const credentialFile = explicitFile || googleFile || (fs.existsSync(defaultFile) ? defaultFile : null);
+    const credentialFile = explicitFile || googleFile;
     if (credentialFile) {
       const resolved = path.resolve(credentialFile);
       const parsed = readJsonCredential(fs.readFileSync(resolved, 'utf8'), explicitFile

@@ -4,6 +4,7 @@ const path = require('path');
 const DEFAULT_RETRY_DELAYS = [5000, 15000, 30000, 60000, 120000];
 
 function writeJsonAtomicSync(filePath, value) {
+  if (!filePath) return;
   const dir = path.dirname(filePath);
   const tempPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`);
   fs.writeFileSync(tempPath, JSON.stringify(value, null, 2), 'utf8');
@@ -16,6 +17,9 @@ function writeJsonAtomicSync(filePath, value) {
 }
 
 function readStateDocument(filePath, arrayKey) {
+  if (!filePath) {
+    return { available: false, data: [], revision: 0, updatedAt: null, sync: null, document: null };
+  }
   if (!fs.existsSync(filePath)) {
     return { available: false, data: [], revision: 0, updatedAt: null, sync: null, document: null };
   }
@@ -60,7 +64,7 @@ function isRemoteConfigured(config) {
 }
 
 class SerializedStateSync {
-  constructor({ label, filePath, arrayKey, collection, documentId, loadConfig, syncRemote, fetchRemote,
+  constructor({ label, filePath = null, arrayKey, collection, documentId, loadConfig, syncRemote, fetchRemote,
     initialRevision = 0, retryDelays = DEFAULT_RETRY_DELAYS, logger = console }) {
     this.label = label;
     this.filePath = filePath;
@@ -82,6 +86,7 @@ class SerializedStateSync {
     this.lastSyncError = null;
     this.nextRetryAt = null;
     this.idleWaiters = [];
+    this.currentDocument = null;
   }
 
   ensureRevisionAtLeast(revision) {
@@ -89,6 +94,9 @@ class SerializedStateSync {
   }
 
   persist(payload) {
+    if (!this.filePath && !this._firebaseEnabled()) {
+      return Promise.reject(new Error(`Firestore is unavailable; ${this.label} was not persisted`));
+    }
     const document = { ...payload, revision: ++this.revision, updatedAt: new Date().toISOString() };
     try {
       this._setPendingDocument(document, true);
@@ -111,6 +119,11 @@ class SerializedStateSync {
     if (!isRemoteConfigured(config)) {
       const remoteStatus = config && config.status || 'disabled';
       const error = config && config.error || null;
+      if (!this.filePath) {
+        this.lastSyncError = error || `Firebase Admin SDK ${remoteStatus}`;
+        this.logger.warn(`[FIREBASE] ${this.label}: Admin SDK ${remoteStatus} - persistent state unavailable`);
+        return { label: this.label, action: 'unavailable', remoteStatus, count: 0, error: this.lastSyncError };
+      }
       this.logger.log(`[FIREBASE] ${this.label}: Admin SDK ${remoteStatus} - using local cache`);
       return { label: this.label, action: 'local-only', remoteStatus, count: local.data.length, error };
     }
@@ -119,12 +132,17 @@ class SerializedStateSync {
     const remoteResult = await this.fetchRemote(this.collection, this.documentId, config);
     if (remoteResult.status !== 'ok' && remoteResult.status !== 'missing') {
       this.lastSyncError = remoteResult.error ? remoteResult.error.message : 'Firebase unavailable';
+      if (!this.filePath) {
+        this.logger.warn(`[FIREBASE] ${this.label}: Firebase ${remoteResult.status} - persistent state unavailable`);
+        return { label: this.label, action: 'unavailable', remoteStatus: remoteResult.status, count: 0, error: this.lastSyncError };
+      }
       this.logger.warn(`[FIREBASE] ${this.label}: Firebase ${remoteResult.status} - using local cache`);
       if (local.available && local.sync && local.sync.dirty) this._adoptLocalAsPending(local);
       return { label: this.label, action: local.available ? 'local-cache' : 'unavailable-no-cache', remoteStatus: remoteResult.status, count: local.data.length, error: this.lastSyncError };
     }
     if (remoteResult.status === 'missing') {
       if (!local.available) {
+        this.currentDocument = { [this.arrayKey]: [], revision: 0, updatedAt: new Date().toISOString() };
         this.logger.log(`[FIREBASE] ${this.label}: remote document and local cache are both missing`);
         return { label: this.label, action: 'empty', remoteStatus: 'missing', count: 0 };
       }
@@ -179,6 +197,11 @@ class SerializedStateSync {
       lastSuccessfulSyncAt: this.lastSuccessfulSyncAt, lastSyncError: this.lastSyncError, nextRetryAt: this.nextRetryAt };
   }
 
+  getData() {
+    const data = this.currentDocument && this.currentDocument[this.arrayKey];
+    return Array.isArray(data) ? structuredClone(data) : [];
+  }
+
   waitForIdle(timeoutMs = 5000) {
     if (!this.pendingDocument && !this.workerRunning && !this.retryTimer) return Promise.resolve(this.getStatus());
     return new Promise((resolve, reject) => {
@@ -220,11 +243,12 @@ class SerializedStateSync {
     const cleanDocument = withoutSyncMetadata(document);
     this.ensureRevisionAtLeast(cleanDocument.revision);
     this.pendingDocument = cleanDocument;
+    this.currentDocument = cleanDocument;
     if (!this.retryTimer) {
       this.lastSyncError = null;
       this.nextRetryAt = null;
     }
-    if (writeLocal) writeJsonAtomicSync(this.filePath, { ...cleanDocument, _sync: this._syncMetadata(true) });
+    if (writeLocal && this.filePath) writeJsonAtomicSync(this.filePath, { ...cleanDocument, _sync: this._syncMetadata(true) });
     this.logger.log(`[FIREBASE] ${this.label}: state marked dirty at revision ${cleanDocument.revision}`);
   }
 
@@ -241,6 +265,7 @@ class SerializedStateSync {
     const cleanRemote = withoutSyncMetadata(remote);
     this.ensureRevisionAtLeast(cleanRemote.revision);
     this.pendingDocument = null;
+    this.currentDocument = cleanRemote;
     this._clearRetryTimer();
     this.retryIndex = 0;
     this.lastSuccessfulSyncAt = new Date().toISOString();
@@ -254,7 +279,8 @@ class SerializedStateSync {
   }
 
   _writeCleanLocal(document) {
-    writeJsonAtomicSync(this.filePath, { ...withoutSyncMetadata(document), _sync: this._syncMetadata(false, { nextRetryAt: null, lastSyncError: null }) });
+    this.currentDocument = withoutSyncMetadata(document);
+    if (this.filePath) writeJsonAtomicSync(this.filePath, { ...this.currentDocument, _sync: this._syncMetadata(false, { nextRetryAt: null, lastSyncError: null }) });
   }
 
   _kickWorker() {
@@ -334,8 +360,8 @@ class SerializedStateSync {
     this.lastSuccessfulSyncAt = new Date().toISOString();
     this.lastSyncError = null;
     this.nextRetryAt = null;
-    const current = readStateDocument(this.filePath, this.arrayKey);
-    if (current.available && current.revision === document.revision) this._writeCleanLocal(document);
+    const current = this.filePath ? readStateDocument(this.filePath, this.arrayKey) : { available: true, revision: this.currentDocument && this.currentDocument.revision };
+    if (!this.filePath || (current.available && current.revision === document.revision)) this._writeCleanLocal(document);
     if (reconnected) this.logger.log(`[FIREBASE] Reconnected - synchronizing pending ${this.label} state`);
     this.logger.log(`[FIREBASE] ${this.label}: sync confirmed at revision ${document.revision}`);
   }
@@ -346,8 +372,8 @@ class SerializedStateSync {
     const delay = this.retryDelays[Math.min(this.retryIndex, this.retryDelays.length - 1)];
     this.retryIndex += 1;
     this.nextRetryAt = new Date(Date.now() + delay).toISOString();
-    const current = readStateDocument(this.filePath, this.arrayKey);
-    if (current.available && current.revision === this.pendingDocument.revision) {
+    const current = this.filePath ? readStateDocument(this.filePath, this.arrayKey) : { available: true, revision: this.currentDocument && this.currentDocument.revision, document: this.currentDocument };
+    if (current.available && current.revision === this.pendingDocument.revision && this.filePath) {
       writeJsonAtomicSync(this.filePath, { ...withoutSyncMetadata(current.document), _sync: this._syncMetadata(true) });
     }
     this.logger.warn(`[FIREBASE] ${this.label}: state marked dirty - ${this.lastSyncError}`);

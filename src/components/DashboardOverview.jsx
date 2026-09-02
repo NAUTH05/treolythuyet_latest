@@ -102,6 +102,7 @@ export default function DashboardOverview({ accounts, sessions, queues, autoScan
             <div className="health-row"><span className="health-dot health-dot-warning" /><span>Đang chờ xử lý</span><strong>{activeQueuesList.length}</strong></div>
             <div className="health-row"><span className="health-dot health-dot-info" /><span>Auto Scan hoạt động</span><strong>{activeAutoScansList.length}</strong></div>
             <button className="btn btn-ghost btn-block overview-secondary-action" onClick={() => onNavigate('queues')}>Xem tất cả tiến độ →</button>
+          </div>
         </div>
       </div>
     </div>

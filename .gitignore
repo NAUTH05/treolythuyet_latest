@@ -20,3 +20,4 @@ treohoclythuyet_correctUI/
 web.assets_frontend_lazy.min_odoo.js
 web.assets_frontend_minimal.min_odoo.js
 *.txt
+firebase-service-account.json
