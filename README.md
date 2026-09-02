@@ -21,7 +21,10 @@ Set-Location C:\Apps
 git clone -b dev-windows https://github.com/NAUTH05/treolythuyet_latest treolythuyet_latest
 Set-Location C:\Apps\treolythuyet_latest
 npm ci
+Push-Location client
+npm ci
 npm run build
+Pop-Location
 npm run install-browser
 ```
 
