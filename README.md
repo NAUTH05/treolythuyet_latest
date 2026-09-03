@@ -4,7 +4,7 @@ Linux VPS deployment guide for the test_dev branch.
 
 Public URL: https://lythuyet.mrnauthdev.dpdns.org
 
-Do not use /lythuyet as the public URL.
+The public URL is the bare hostname; do not append a path.
 
 ## Overview
 
@@ -29,7 +29,7 @@ Internet
   -> Firebase Admin/Firestore and lesson site
 ~~~
 
-The source requires internal paths /lythuyet/, /lythuyet/api/*, and /lythuyet/socket.io. Nginx maps the domain root to the internal dashboard path while preserving those paths. The browser-facing endpoint remains the bare domain.
+The source serves the dashboard at /, APIs at /api/*, and Socket.IO at /socket.io. The browser-facing endpoint is the bare domain.
 
 ## Requirements
 
@@ -192,7 +192,7 @@ Never use chmod -R 777.
 npm run build
 ~~~
 
-This runs cd client && npm run build and writes Vite output to public/, which Express serves at internal /lythuyet/.
+This runs cd client && npm run build and writes Vite output to public/, which Express serves at /.
 
 ## Verify Installation
 
@@ -211,7 +211,7 @@ npm start
 Default local endpoint:
 
 ~~~bash
-curl -I http://127.0.0.1:3000/lythuyet/
+curl -I http://127.0.0.1:3000/
 ~~~
 
 There is no dedicated /health endpoint. Stop with Ctrl+C.
@@ -288,22 +288,8 @@ server {
     listen [::]:80;
     server_name lythuyet.mrnauthdev.dpdns.org;
 
-    # Source requires /lythuyet/ internally; public URL remains /.
-    location = / {
-        proxy_pass http://127.0.0.1:3000/lythuyet/;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_read_timeout 86400s;
-        proxy_send_timeout 86400s;
-    }
-
-    # Preserve /lythuyet/assets, /lythuyet/api, and /lythuyet/socket.io.
-    location /lythuyet/ {
+    # Proxy the entire public domain to the root-mounted Node application.
+    location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -318,7 +304,7 @@ server {
 }
 ~~~
 
-The internal location exists because the source explicitly requires it; it is not the public URL. If PORT changes, replace both 3000 values.
+If PORT changes, replace 3000 in proxy_pass. The browser URL remains the bare hostname.
 
 Enable and test:
 
@@ -362,13 +348,13 @@ Public ports are 22, 80, and 443. Do not expose Node's port.
 
 ~~~bash
 pm2 status
-curl -I http://127.0.0.1:3000/lythuyet/
+curl -I http://127.0.0.1:3000/
 sudo nginx -t
 curl -I http://lythuyet.mrnauthdev.dpdns.org
 curl -I https://lythuyet.mrnauthdev.dpdns.org
 ~~~
 
-HTTP may redirect to HTTPS. Open exactly https://lythuyet.mrnauthdev.dpdns.org, sign in, and confirm dashboard data plus a Socket.IO WebSocket/polling connection at /lythuyet/socket.io.
+HTTP may redirect to HTTPS. Open exactly https://lythuyet.mrnauthdev.dpdns.org, sign in, and confirm dashboard data plus a Socket.IO WebSocket/polling connection at /socket.io.
 
 ## Testing
 
@@ -469,14 +455,14 @@ Check disk, executable permissions, and PM2 logs.
 
 ~~~bash
 pm2 status
-curl -I http://127.0.0.1:3000/lythuyet/
+curl -I http://127.0.0.1:3000/
 sudo nginx -t
 sudo tail -f /var/log/nginx/error.log
 ~~~
 
 ### WebSocket / Socket.IO failure
 
-Check HTTP/1.1, Upgrade, and Connection headers; confirm the client path /lythuyet/socket.io; confirm Node and Nginx use the same port/hostname.
+Check HTTP/1.1, Upgrade, and Connection headers; confirm the client path /socket.io; confirm Node and Nginx use the same port/hostname.
 
 ### HTTPS failure
 
@@ -534,7 +520,7 @@ Never commit .env, Firebase credentials, passwords, API keys, private keys, acce
 6. Put Firebase JSON under /etc/treolythuyet/, create .env, and set ADMIN_PASSWORD, PORT, and one Firebase credential method.
 7. Set secure ownership/modes and run npm run verify:firebase-admin.
 8. Run npm run build and npm test.
-9. Run npm start; test curl -I http://127.0.0.1:3000/lythuyet/; stop with Ctrl+C.
+9. Run npm start; test curl -I http://127.0.0.1:3000/; stop with Ctrl+C.
 10. Install PM2, run pm2 start ecosystem.config.js, and verify pm2 status.
 11. Run pm2 save and pm2 startup, execute PM2's printed command, reboot, and verify.
 12. Point lythuyet.mrnauthdev.dpdns.org to the VPS IP and verify DNS.

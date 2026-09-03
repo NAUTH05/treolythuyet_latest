@@ -11,7 +11,7 @@ export default function AdminAuthModal({ onVerify }) {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('/lythuyet/api/admin/verify', {
+      const res = await fetch('/api/admin/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password }),

@@ -113,18 +113,18 @@ function saveAutoPresets(presets) {
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  path: '/lythuyet/socket.io',
+  path: '/socket.io',
 });
 
 const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(express.json());
-app.use('/lythuyet', express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Bảo vệ toàn bộ /lythuyet/api trừ route đăng nhập — bao trùm mọi route hiện có
+// Bảo vệ toàn bộ /api trừ route đăng nhập — bao trùm mọi route hiện có
 // và tương lai, không cần gắn guard từng route riêng lẻ.
-app.use('/lythuyet/api', (req, res, next) => {
+app.use('/api', (req, res, next) => {
   if (req.method === 'POST' && req.path === '/admin/verify') return next();
   return requireAdmin(req, res, next);
 });
@@ -1055,7 +1055,7 @@ async function synchronizeAllPersistentStates(reason = 'startup', syncs = getPer
 }
 
 // Xác thực Admin password
-app.post('/lythuyet/api/admin/verify', (req, res) => {
+app.post('/api/admin/verify', (req, res) => {
   const { password } = req.body;
   const cfg = getAdminConfig();
   if (password === cfg.adminPassword) {
@@ -1067,14 +1067,14 @@ app.post('/lythuyet/api/admin/verify', (req, res) => {
 });
 
 // Đăng xuất — thu hồi token hiện tại (route này nằm sau middleware nên đã yêu cầu token)
-app.post('/lythuyet/api/admin/logout', (req, res) => {
+app.post('/api/admin/logout', (req, res) => {
   const token = extractToken(req.headers);
   if (token) activeTokens.delete(token);
   res.json({ ok: true });
 });
 
 // Đổi mật khẩu Admin
-app.post('/lythuyet/api/admin/change-password', (req, res) => {
+app.post('/api/admin/change-password', (req, res) => {
   const { oldPassword, newPassword } = req.body;
   if (!newPassword || newPassword.length < 4) {
     return res.status(400).json({ error: 'Mật khẩu mới phải có ít nhất 4 ký tự' });
@@ -1090,7 +1090,7 @@ app.post('/lythuyet/api/admin/change-password', (req, res) => {
 });
 
 // Lấy Firebase config & status
-app.get('/lythuyet/api/admin/firebase-config', async (req, res) => {
+app.get('/api/admin/firebase-config', async (req, res) => {
   const verification = await fbService.verifyFirebaseConnection();
   firebaseSyncSummary.connected = Boolean(verification.connected);
   const admin = fbService.getFirebaseAdminStatus();
@@ -1109,7 +1109,7 @@ app.get('/lythuyet/api/admin/firebase-config', async (req, res) => {
 });
 
 // Reload credentials already installed on the server. Credential material is never accepted here.
-app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
+app.post('/api/admin/firebase-config', async (req, res) => {
   const submitted = req.body && (req.body.config || req.body.serviceAccount || req.body.credentials);
   if (submitted && Object.keys(submitted).length > 0) {
     return res.status(400).json({
@@ -1187,7 +1187,7 @@ app.post('/lythuyet/api/admin/firebase-config', async (req, res) => {
 // ===================== API ROUTES ==========================
 
 // Lấy danh sách tài khoản
-app.get('/lythuyet/api/accounts', (req, res) => {
+app.get('/api/accounts', (req, res) => {
   const accounts = loadAccounts();
   // Ẩn password khi trả về
   res.json(accounts.map((a, i) => ({
@@ -1199,7 +1199,7 @@ app.get('/lythuyet/api/accounts', (req, res) => {
 });
 
 // Thêm tài khoản
-app.post('/lythuyet/api/accounts', async (req, res) => {
+app.post('/api/accounts', async (req, res) => {
   const { name, email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Cần email và mật khẩu' });
   const accounts = loadAccounts();
@@ -1208,7 +1208,7 @@ app.post('/lythuyet/api/accounts', async (req, res) => {
 });
 
 // Xóa tài khoản
-app.delete('/lythuyet/api/accounts/:index', async (req, res) => {
+app.delete('/api/accounts/:index', async (req, res) => {
   const idx = parseInt(req.params.index) - 1;
   const accounts = loadAccounts();
   if (idx < 0 || idx >= accounts.length) return res.status(404).json({ error: 'Không tìm thấy' });
@@ -1217,7 +1217,7 @@ app.delete('/lythuyet/api/accounts/:index', async (req, res) => {
 });
 
 // Sửa tài khoản
-app.put('/lythuyet/api/accounts/:index', async (req, res) => {
+app.put('/api/accounts/:index', async (req, res) => {
   const idx = parseInt(req.params.index) - 1;
   const accounts = loadAccounts();
   if (idx < 0 || idx >= accounts.length) return res.status(404).json({ error: 'Không tìm thấy' });
@@ -1229,7 +1229,7 @@ app.put('/lythuyet/api/accounts/:index', async (req, res) => {
 });
 
 // Lấy trạng thái tất cả sessions
-app.get('/lythuyet/api/sessions', (req, res) => {
+app.get('/api/sessions', (req, res) => {
   const list = [];
   for (const [id, session] of sessions) {
     list.push(session.getStatus());
@@ -1238,7 +1238,7 @@ app.get('/lythuyet/api/sessions', (req, res) => {
 });
 
 // Bắt đầu treo bài (hàng chờ cặp)
-app.post('/lythuyet/api/start', async (req, res) => {
+app.post('/api/start', async (req, res) => {
   const { pairs, startHour, delayStart, scheduledDateTime, accountIndices, time, refreshInterval, stealthInterval, randomStartMin, randomStartMax } = req.body;
 
   if (!pairs || !Array.isArray(pairs) || pairs.length === 0) {
@@ -1392,7 +1392,7 @@ app.post('/lythuyet/api/start', async (req, res) => {
 });
 
 // Dừng session
-app.post('/lythuyet/api/stop/:id', async (req, res) => {
+app.post('/api/stop/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   await session.stop();
@@ -1400,7 +1400,7 @@ app.post('/lythuyet/api/stop/:id', async (req, res) => {
 });
 
 // F5 thủ công
-app.post('/lythuyet/api/refresh/:id', async (req, res) => {
+app.post('/api/refresh/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   if (session.status !== 'running') return res.status(400).json({ error: 'Session không đang chạy' });
@@ -1409,7 +1409,7 @@ app.post('/lythuyet/api/refresh/:id', async (req, res) => {
 });
 
 // Tạm dừng session
-app.post('/lythuyet/api/pause-session/:id', async (req, res) => {
+app.post('/api/pause-session/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   if (!session.pause()) return res.status(400).json({ error: 'Session không đang chạy' });
@@ -1425,7 +1425,7 @@ app.post('/lythuyet/api/pause-session/:id', async (req, res) => {
 });
 
 // Tiếp tục session
-app.post('/lythuyet/api/resume-session/:id', async (req, res) => {
+app.post('/api/resume-session/:id', async (req, res) => {
   const session = sessions.get(req.params.id);
   if (!session) return res.status(404).json({ error: 'Session không tìm thấy' });
   if (!session.resume()) return res.status(400).json({ error: 'Session không đang tạm dừng' });
@@ -1440,7 +1440,7 @@ app.post('/lythuyet/api/resume-session/:id', async (req, res) => {
 });
 
 // D\u1EEBng t\u1EA5t c\u1EA3
-app.post('/lythuyet/api/stop-all', async (req, res) => {
+app.post('/api/stop-all', async (req, res) => {
   const promises = [];
   for (const [id, session] of sessions) {
     if (session.status === 'running' || session.status === 'logging-in' || session.status === 'paused') {
@@ -1462,7 +1462,7 @@ app.post('/lythuyet/api/stop-all', async (req, res) => {
 });
 
 // L\u1EA5y h\u00E0ng ch\u1EDD
-app.get('/lythuyet/api/queues', (req, res) => {
+app.get('/api/queues', (req, res) => {
   const list = [];
   for (const [id, queue] of queues) {
     list.push(getQueueStatus(queue));
@@ -1471,14 +1471,14 @@ app.get('/lythuyet/api/queues', (req, res) => {
 });
 
 // Get queue log
-app.get('/lythuyet/api/queue-log/:id', (req, res) => {
+app.get('/api/queue-log/:id', (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue not found' });
   res.json(queue.logs || []);
 });
 
 // H\u1EE7y h\u00E0ng ch\u1EDD
-app.post('/lythuyet/api/cancel-queue/:id', async (req, res) => {
+app.post('/api/cancel-queue/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue kh\u00F4ng t\u00ECm th\u1EA5y' });
   if (queue.timer) { clearTimeout(queue.timer); queue.timer = null; }
@@ -1498,12 +1498,12 @@ app.post('/lythuyet/api/cancel-queue/:id', async (req, res) => {
 // =================== PRESETS API ===========================
 
 // Lấy danh sách Mẫu Preset
-app.get('/lythuyet/api/presets', (req, res) => {
+app.get('/api/presets', (req, res) => {
   res.json(loadPresets());
 });
 
 // Tạo hoặc Cập nhật Mẫu Preset
-app.post('/lythuyet/api/presets', async (req, res) => {
+app.post('/api/presets', async (req, res) => {
   const { name, boxes } = req.body;
   if (!name || !boxes || !Array.isArray(boxes) || boxes.length === 0) {
     return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách Box hợp lệ' });
@@ -1522,7 +1522,7 @@ app.post('/lythuyet/api/presets', async (req, res) => {
 });
 
 // Xóa Mẫu Preset
-app.delete('/lythuyet/api/presets/:id', async (req, res) => {
+app.delete('/api/presets/:id', async (req, res) => {
   const { id } = req.params;
   let presets = loadPresets();
   const initialLen = presets.length;
@@ -1535,12 +1535,12 @@ app.delete('/lythuyet/api/presets/:id', async (req, res) => {
 
 // =================== AUTO-SCAN PRESETS API =================
 
-app.get('/lythuyet/api/auto-presets', (req, res) => {
+app.get('/api/auto-presets', (req, res) => {
   res.json(loadAutoPresets());
 });
 
 // Tạo Mẫu Preset Auto-Scan (lưu toàn bộ cấu hình form)
-app.post('/lythuyet/api/auto-presets', async (req, res) => {
+app.post('/api/auto-presets', async (req, res) => {
   const { name, config } = req.body;
   if (!name || !config || !Array.isArray(config.courses) || config.courses.length === 0) {
     return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách khóa học hợp lệ' });
@@ -1559,7 +1559,7 @@ app.post('/lythuyet/api/auto-presets', async (req, res) => {
 });
 
 // Xóa Mẫu Preset Auto-Scan
-app.delete('/lythuyet/api/auto-presets/:id', async (req, res) => {
+app.delete('/api/auto-presets/:id', async (req, res) => {
   const { id } = req.params;
   let presets = loadAutoPresets();
   const initialLen = presets.length;
@@ -1573,7 +1573,7 @@ app.delete('/lythuyet/api/auto-presets/:id', async (req, res) => {
 // =================== DELETE QUEUES API =====================
 
 // Xóa 1 hàng chờ
-app.delete('/lythuyet/api/queues/:id', async (req, res) => {
+app.delete('/api/queues/:id', async (req, res) => {
   const queueId = req.params.id;
   const queue = queues.get(queueId);
   if (!queue) return res.status(404).json({ error: 'Hàng chờ không tồn tại' });
@@ -1590,7 +1590,7 @@ app.delete('/lythuyet/api/queues/:id', async (req, res) => {
 });
 
 // Xóa tất cả hàng chờ đã hoàn thành / kết thúc / lỗi / hủy
-app.post('/lythuyet/api/queues/clear-completed', async (req, res) => {
+app.post('/api/queues/clear-completed', async (req, res) => {
   let clearedCount = 0;
   for (const [id, queue] of queues) {
     if (queue.status === 'completed' || queue.status === 'cancelled' || queue.status === 'error') {
@@ -1912,7 +1912,7 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
     .finally(() => autoScanRegistry.releaseAccount(autoSession));
 }
 
-app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
+app.post('/api/auto-scan/start', async (req, res) => {
   const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices, initialDailyMinutesToggle, initialDailyMinutes } = req.body;
   if (!courses || !Array.isArray(courses) || courses.length === 0) {
     return res.status(400).json({ error: 'Cần nhập ít nhất 1 khóa học' });
@@ -1987,7 +1987,7 @@ app.post('/lythuyet/api/auto-scan/start', async (req, res) => {
 });
 
 // Điều chỉnh thời gian đã học hôm nay cho phiên Auto-Scan
-app.post('/lythuyet/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
+app.post('/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
   const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
 
@@ -1997,7 +1997,7 @@ app.post('/lythuyet/api/auto-scan/set-daily-minutes/:id', async (req, res) => {
 });
 
 // Tạm dừng 1 phiên Auto-Scan
-app.post('/lythuyet/api/auto-scan/pause/:id', async (req, res) => {
+app.post('/api/auto-scan/pause/:id', async (req, res) => {
   const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
 
@@ -2009,7 +2009,7 @@ app.post('/lythuyet/api/auto-scan/pause/:id', async (req, res) => {
 });
 
 // Tiếp tục 1 phiên Auto-Scan
-app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
+app.post('/api/auto-scan/resume/:id', async (req, res) => {
   const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
   if (autoSession.status !== 'paused') {
@@ -2048,7 +2048,7 @@ app.post('/lythuyet/api/auto-scan/resume/:id', async (req, res) => {
 });
 
 // Dừng 1 phiên Auto-Scan theo yêu cầu từ Dashboard (hủy cả lịch hẹn nếu có)
-app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
+app.post('/api/auto-scan/stop/:id', async (req, res) => {
   const autoSession = autoScanRegistry.get(req.params.id);
   if (!autoSession) return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
 
@@ -2068,7 +2068,7 @@ app.post('/lythuyet/api/auto-scan/stop/:id', async (req, res) => {
 });
 
 // Xóa tất cả phiên Auto-Scan đã kết thúc (hoàn thành / dừng / lỗi) khỏi Dashboard
-app.post('/lythuyet/api/auto-scan/clear-completed', async (req, res) => {
+app.post('/api/auto-scan/clear-completed', async (req, res) => {
   let clearedCount = 0;
   for (const [id, autoSession] of autoScanRegistry.entries()) {
     if (AUTO_TERMINAL_STATUSES.has(autoSession.status)) {
@@ -2083,7 +2083,7 @@ app.post('/lythuyet/api/auto-scan/clear-completed', async (req, res) => {
 });
 
 // Xóa thẻ phiên Auto-Scan khỏi Dashboard (hủy cả lịch hẹn nếu có)
-app.delete('/lythuyet/api/auto-scan/sessions/:id', async (req, res) => {
+app.delete('/api/auto-scan/sessions/:id', async (req, res) => {
   if (!autoScanRegistry.has(req.params.id)) {
     return res.status(404).json({ error: 'Không tìm thấy phiên Auto-Scan' });
   }
@@ -2095,7 +2095,7 @@ app.delete('/lythuyet/api/auto-scan/sessions/:id', async (req, res) => {
 });
 
 // Tạm dừng hàng chờ
-app.post('/lythuyet/api/pause-queue/:id', async (req, res) => {
+app.post('/api/pause-queue/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (queue.status !== 'running' && queue.status !== 'waiting') {
@@ -2178,7 +2178,7 @@ app.post('/treohoc/api/resume-queue/:id', requireAdmin, async (req, res) => {
 });
 
 // Đôn hàng chờ - chạy ngay box đang đợi
-app.post('/lythuyet/api/rush-queue/:id', async (req, res) => {
+app.post('/api/rush-queue/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue kh\u00F4ng t\u00ECm th\u1EA5y' });
   if (queue.status !== 'waiting' && queue.status !== 'time-limit') return res.status(400).json({ error: 'Queue kh\u00F4ng \u0111ang ch\u1EDD' });
@@ -2200,7 +2200,7 @@ app.post('/lythuyet/api/rush-queue/:id', async (req, res) => {
 });
 
 // Thêm box vào hàng chờ đang tồn tại
-app.post('/lythuyet/api/add-pairs/:id', async (req, res) => {
+app.post('/api/add-pairs/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (queue.status === 'cancelled' || queue.status === 'completed') {
@@ -2250,7 +2250,7 @@ app.post('/lythuyet/api/add-pairs/:id', async (req, res) => {
 });
 
 // Chạy lại queue (completed/error/cancelled)
-app.post('/lythuyet/api/retry-queue/:id', async (req, res) => {
+app.post('/api/retry-queue/:id', async (req, res) => {
   const oldQueue = queues.get(req.params.id);
   if (!oldQueue) return res.status(404).json({ error: 'Queue không tìm thấy' });
   if (oldQueue.status === 'running' || oldQueue.status === 'waiting') {
@@ -2286,7 +2286,7 @@ app.post('/lythuyet/api/retry-queue/:id', async (req, res) => {
 });
 
 // Sửa pairs trong queue (chỉ sửa được box chưa chạy)
-app.put('/lythuyet/api/edit-queue/:id', async (req, res) => {
+app.put('/api/edit-queue/:id', async (req, res) => {
   const queue = queues.get(req.params.id);
   if (!queue) return res.status(404).json({ error: 'Queue không tìm thấy' });
 
@@ -2361,7 +2361,7 @@ app.put('/lythuyet/api/edit-queue/:id', async (req, res) => {
 });
 
 // Lấy danh sách các folder logs theo ngày (DD-MM-YYYY)
-app.get('/lythuyet/api/logs/folders', (req, res) => {
+app.get('/api/logs/folders', (req, res) => {
   try {
     ensureDailyLogsCurrent();
     const today = vnDateDDMMYYYY();
@@ -2412,7 +2412,7 @@ app.get('/lythuyet/api/logs/folders', (req, res) => {
 });
 
 // Lấy toàn bộ logs theo ngày (date=DD-MM-YYYY hoặc YYYY-MM-DD)
-app.get('/lythuyet/api/logs/by-date', (req, res) => {
+app.get('/api/logs/by-date', (req, res) => {
   ensureDailyLogsCurrent();
   const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
   if (!reqDate) return res.status(400).json({ error: 'Ngày log không hợp lệ' });
@@ -2438,7 +2438,7 @@ app.get('/lythuyet/api/logs/by-date', (req, res) => {
 });
 
 // Xóa folder / xóa logs của một ngày
-app.delete('/lythuyet/api/logs/by-date', async (req, res) => {
+app.delete('/api/logs/by-date', async (req, res) => {
   const reqDate = formatToDDMMYYYY(req.query.date);
   if (!reqDate) return res.status(400).json({ error: 'Thiếu hoặc sai tham số date' });
   const today = vnDateDDMMYYYY();
@@ -2489,7 +2489,7 @@ app.delete('/lythuyet/api/logs/by-date', async (req, res) => {
 });
 
 // Lấy log gần nhất
-app.get('/lythuyet/api/logs', (req, res) => {
+app.get('/api/logs', (req, res) => {
   ensureDailyLogsCurrent();
   const today = vnDateDDMMYYYY();
   res.json(filterLogsForDate(logHistory, today, true));
@@ -2527,12 +2527,9 @@ io.on('connection', (socket) => {
 
 // ======================== START ============================
 
-// SPA fallback
-app.get('/treohoc/*', (req, res) => {
+// SPA fallback for the public domain root.
+app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-app.get('/treohoc', (req, res) => {
-  res.redirect('/treohoc/');
 });
 
 async function initializePersistentState() {

@@ -3,7 +3,7 @@ import { defineConfig } from 'vite'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/lythuyet/',
+  base: '/',
   resolve: {
     alias: {
       'socket.io-client': 'socket.io-client/dist/socket.io.js',
@@ -12,9 +12,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/lythuyet/api': {
+      '/api': {
         target: 'http://localhost:3000',
-        rewrite: (path) => path.replace(/^\/lythuyet/, ''),
       },
       '/socket.io': {
         target: 'http://localhost:3000',

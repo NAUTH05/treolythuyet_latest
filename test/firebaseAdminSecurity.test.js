@@ -33,8 +33,8 @@ test('service-account files are excluded from Git', () => {
 
 test('accounts API exposes password presence but never returns account passwords', () => {
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
-  const start = server.indexOf("app.get('/lythuyet/api/accounts'");
-  const end = server.indexOf("app.post('/lythuyet/api/accounts'", start);
+  const start = server.indexOf("app.get('/api/accounts'");
+  const end = server.indexOf("app.post('/api/accounts'", start);
   const route = server.slice(start, end);
   assert.ok(start >= 0 && end > start);
   assert.match(route, /hasPassword/);

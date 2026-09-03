@@ -11,7 +11,7 @@ export function useSocket() {
 
   useEffect(() => {
     const socket = io({
-      path: '/lythuyet/socket.io',
+      path: '/socket.io',
       auth: { token: sessionStorage.getItem('treohoc_admin_token') || '' },
     });
     socketRef.current = socket;
