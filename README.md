@@ -173,6 +173,33 @@ For a Cloudflare-proxied record, create a Cloudflare Origin Certificate for `mrn
 
 For a browser-trusted certificate, use win-acme or Certify The Web to request a Let's Encrypt certificate and install the IIS binding automatically. If converting Cloudflare PEM files to PFX, use a complete OpenSSL installation and a password-protected PFX. An OpenSSL package without `legacy.dll` cannot run the `-legacy` conversion; use a standard PFX or win-acme instead.
 
+### Create and install a certificate with win-acme
+
+win-acme (WACS) is the recommended Windows/IIS path when you want a browser-trusted Let's Encrypt certificate without manually creating a PFX:
+
+1. Download the current win-acme release from `https://www.win-acme.com/` and extract it, for example, to `C:\Tools\win-acme`.
+2. Open PowerShell as Administrator and run `C:\Tools\win-acme\wacs.exe`.
+3. Choose **Create certificate (N)**.
+4. Choose the IIS source, select site `TreoWeb`, and select the hostname `mrnauthdev.dpdns.org`.
+5. Choose the default Windows Certificate Store and IIS installation/binding steps when prompted.
+6. Choose a validation method. HTTP-01 requires public TCP `80` and an HTTP binding for `mrnauthdev.dpdns.org`; with Cloudflare proxying, temporarily switch the DNS record to **DNS only** during validation. DNS-01 can be used instead when port `80` cannot be exposed.
+7. Confirm the requested certificate and allow win-acme to create its renewal scheduled task.
+
+After successful issuance, keep Cloudflare DNS **Proxied** and set SSL/TLS to **Full (strict)**. win-acme renewals update the IIS certificate/binding automatically; do not copy the certificate or private key into the application directory.
+
+Verify the certificate and binding:
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\My |
+  Where-Object Subject -Match 'mrnauthdev' |
+  Select-Object Subject, Thumbprint, NotAfter
+
+Get-WebBinding -Name TreoWeb -Protocol https |
+  Select-Object bindingInformation, certificateHash, certificateStoreName, sslFlags
+```
+
+The expected binding is `https *:443:mrnauthdev.dpdns.org sslFlags=1`. Test renewal status in **Task Scheduler** under **Task Scheduler Library -> win-acme**.
+
 Keep the DNS record pointed to the server and proxied:
 
 ```text
