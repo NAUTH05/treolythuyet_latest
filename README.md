@@ -104,7 +104,7 @@ Node listens on HTTP port `3000`. IIS must terminate TLS on port `443` and ARR m
 
 ### Use the hostname root without `/lythuyet`
 
-To open the Dashboard at `https://lythuyet.nauthdev.qd.je/`, keep the existing Node routes and rewrite only the IIS root request internally. The browser remains on the clean hostname while the application continues using `/lythuyet`, `/lythuyet/api`, and `/lythuyet/socket.io` internally.
+To open the Dashboard at `https://lythuyet.mrnauthdev.dpdns.org/`, keep the existing Node routes and rewrite only the IIS root request internally. The browser remains on the clean hostname while the application continues using `/lythuyet`, `/lythuyet/api`, and `/lythuyet/socket.io` internally.
 
 Use this `web.config` in `C:\inetpub\treoweb-proxy`:
 
@@ -182,21 +182,21 @@ In IIS Manager:
 4. Type: `https`.
 5. IP address: `All Unassigned`.
 6. Port: `443`.
-7. Host name: `lythuyet.nauthdev.qd.je`.
+7. Host name: `lythuyet.mrnauthdev.dpdns.org`.
 8. Select the certificate for that hostname.
 9. Enable **Require Server Name Indication (SNI)** when other HTTPS sites share the IP.
 
 Expected binding:
 
 ```text
-https *:443:lythuyet.nauthdev.qd.je sslFlags=1
+https *:443:lythuyet.mrnauthdev.dpdns.org sslFlags=1
 ```
 
 PID 4 (`System`) owning port 443 is normal for IIS/HTTP.sys.
 
 ### Certificate choices
 
-For a Cloudflare-proxied record, create a Cloudflare Origin Certificate for `lythuyet.nauthdev.qd.je`, install it in `Cert:\LocalMachine\My`, bind it to IIS, and set Cloudflare SSL/TLS to **Full (strict)**.
+For a Cloudflare-proxied record, create a Cloudflare Origin Certificate for `lythuyet.mrnauthdev.dpdns.org`, install it in `Cert:\LocalMachine\My`, bind it to IIS, and set Cloudflare SSL/TLS to **Full (strict)**.
 
 For a browser-trusted certificate, use win-acme or Certify The Web to request a Let's Encrypt certificate and install the IIS binding automatically. If converting Cloudflare PEM files to PFX, use a complete OpenSSL installation and a password-protected PFX. An OpenSSL package without `legacy.dll` cannot run the `-legacy` conversion; use a standard PFX or win-acme instead.
 
@@ -207,9 +207,9 @@ win-acme (WACS) is the recommended Windows/IIS path when you want a browser-trus
 1. Download the current win-acme release from `https://www.win-acme.com/` and extract it, for example, to `C:\Tools\win-acme`.
 2. Open PowerShell as Administrator and run `C:\Tools\win-acme\wacs.exe`.
 3. Choose **Create certificate (N)**.
-4. Choose the IIS source, select site `TreoWeb`, and select the hostname `lythuyet.nauthdev.qd.je`.
+4. Choose the IIS source, select site `TreoWeb`, and select the hostname `lythuyet.mrnauthdev.dpdns.org`.
 5. Choose the default Windows Certificate Store and IIS installation/binding steps when prompted.
-6. Choose a validation method. HTTP-01 requires public TCP `80` and an HTTP binding for `lythuyet.nauthdev.qd.je`; with Cloudflare proxying, temporarily switch the DNS record to **DNS only** during validation. DNS-01 can be used instead when port `80` cannot be exposed.
+6. Choose a validation method. HTTP-01 requires public TCP `80` and an HTTP binding for `lythuyet.mrnauthdev.dpdns.org`; with Cloudflare proxying, temporarily switch the DNS record to **DNS only** during validation. DNS-01 can be used instead when port `80` cannot be exposed.
 7. Confirm the requested certificate and allow win-acme to create its renewal scheduled task.
 
 After successful issuance, keep Cloudflare DNS **Proxied** and set SSL/TLS to **Full (strict)**. win-acme renewals update the IIS certificate/binding automatically; do not copy the certificate or private key into the application directory.
@@ -225,12 +225,12 @@ Get-WebBinding -Name TreoWeb -Protocol https |
   Select-Object bindingInformation, certificateHash, certificateStoreName, sslFlags
 ```
 
-The expected binding is `https *:443:lythuyet.nauthdev.qd.je sslFlags=1`. Test renewal status in **Task Scheduler** under **Task Scheduler Library -> win-acme**.
+The expected binding is `https *:443:lythuyet.mrnauthdev.dpdns.org sslFlags=1`. Test renewal status in **Task Scheduler** under **Task Scheduler Library -> win-acme**.
 
 Keep the DNS record pointed to the server and proxied:
 
 ```text
-lythuyet.nauthdev.qd.je  A  160.250.180.238  Proxied
+lythuyet.mrnauthdev.dpdns.org  A  160.250.180.238  Proxied
 ```
 
 Do not proxy Cloudflare directly to port `3000`. Allow inbound TCP `443` in Windows Firewall.
@@ -247,7 +247,7 @@ Test the public domain:
 
 ```powershell
 try {
-  Invoke-WebRequest https://lythuyet.nauthdev.qd.je/ -UseBasicParsing
+  Invoke-WebRequest https://lythuyet.mrnauthdev.dpdns.org/ -UseBasicParsing
 } catch {
   Write-Host 'HTTP status:' $_.Exception.Response.StatusCode.value__
   $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
