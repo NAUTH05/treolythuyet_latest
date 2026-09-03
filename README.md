@@ -1,48 +1,49 @@
 # Treo Hoc Ly Thuyet - Windows Server
 
-This branch is the Windows Server deployment edition. Core application logic is unchanged from the fixed Firestore-first version: Firestore is the persistent source of truth for accounts, presets, queues, and Auto-Scan state. No `accounts.json` or local application database is used.
+This branch is the Windows Server deployment edition. The fixed application uses Firestore as the persistent source of truth for accounts, presets, queues, and Auto-Scan state. No `accounts.json` or local JSON database is required.
 
 ## Requirements
 
 - Windows Server 2019 or later
-- Node.js LTS (64-bit)
-- Git for Windows
-- npm (included with Node.js)
-- A Firebase service account with Firestore access
+- Node.js LTS (64-bit), Git for Windows, npm
 - PowerShell 5.1 or PowerShell 7
+- Firebase service-account credentials with Firestore access
+- Playwright Chromium
+- IIS, URL Rewrite, and ARR for a public HTTPS domain
 
-## Installation
+## Install
 
-Run PowerShell as the service account or deployment administrator:
+Run PowerShell as the deployment account:
 
 ```powershell
 New-Item -ItemType Directory -Force C:\Apps\treolythuyet_latest | Out-Null
 Set-Location C:\Apps
 git clone -b dev-windows https://github.com/NAUTH05/treolythuyet_latest treolythuyet_latest
 Set-Location C:\Apps\treolythuyet_latest
+
 npm ci
 Push-Location client
 npm ci
 npm run build
 Pop-Location
 npm run install-browser
+Test-Path .\public\index.html
 ```
 
-Playwright downloads Chromium for the current user. Run the install command under the same Windows account that PM2 will use.
+The final command must return `True`. The client has a separate `package.json`, so both dependency trees must be installed.
 
-## Credentials and .env
+## Firebase and .env
 
-Keep the Firebase key outside Git:
+Keep the Firebase key outside the repository:
 
 ```powershell
 New-Item -ItemType Directory -Force C:\Secure\TreoWeb | Out-Null
-# Copy the downloaded key to C:\Secure\TreoWeb\firebase-service-account.json
 Copy-Item C:\Path\To\firebase-service-account.json C:\Secure\TreoWeb\firebase-service-account.json
 Copy-Item .env.example .env
 notepad .env
 ```
 
-Set Windows paths in `.env`:
+Example:
 
 ```env
 NODE_ENV=production
@@ -51,35 +52,43 @@ ADMIN_PASSWORD=replace-with-a-long-random-password
 FIREBASE_SERVICE_ACCOUNT_FILE=C:\Secure\TreoWeb\firebase-service-account.json
 ```
 
-Restrict the credential file to the service account and administrators using NTFS permissions. Do not commit `.env` or the JSON key.
+Never commit `.env`, a private key, or a service-account JSON file. Restrict the key with NTFS permissions.
 
-Verify the server-side Admin SDK before starting:
+Verify before starting PM2:
 
 ```powershell
+$env:FIREBASE_SERVICE_ACCOUNT_FILE = 'C:\Secure\TreoWeb\firebase-service-account.json'
 npm run verify:firebase-admin
 ```
 
-## Start and PM2
+If this reports `UNAUTHENTICATED`, check the key and Windows time synchronization. Firestore rules do not control OAuth authentication.
+
+## Local start
 
 ```powershell
-npm install -g pm2
-pm2 start ecosystem.config.js
-pm2 status
-pm2 logs treoweb
-pm2 save
+npm start
+Invoke-WebRequest http://127.0.0.1:3000/lythuyet/ -UseBasicParsing
 ```
 
-`ecosystem.config.js` reads deployment paths from environment variables and does not contain a user-specific Windows path. Load `.env` before starting PM2, or set the variables in the account's environment:
+Expected status is `200`. Use the server IP from another computer; `localhost` refers to the computer running the browser.
+
+## PM2 and reboot
+
+Set variables in the same PowerShell session before starting PM2:
 
 ```powershell
 $env:FIREBASE_SERVICE_ACCOUNT_FILE = 'C:\Secure\TreoWeb\firebase-service-account.json'
 $env:ADMIN_PASSWORD = 'replace-with-a-long-random-password'
 $env:PORT = '3000'
-pm2 startOrReload ecosystem.config.js --update-env
+
+npm install -g pm2
+pm2 start ecosystem.config.js --update-env
+pm2 status
+pm2 logs treoweb
 pm2 save
 ```
 
-For reboot persistence, configure a Windows Task Scheduler task that runs at startup under the same service account. The action should be:
+For reboot persistence, create a Windows Task Scheduler task running at startup under the same service account:
 
 ```text
 Program: C:\Program Files\nodejs\pm2.cmd
@@ -87,45 +96,43 @@ Arguments: resurrect
 Start in: C:\Apps\treolythuyet_latest
 ```
 
-Set the task to run whether the user is logged on or not and grant it the required Playwright desktop/session permissions. After a reboot, confirm with `pm2 status` and `pm2 logs treoweb`.
+Do not use Linux-only `pm2 startup` or `systemctl` commands on Windows.
 
-## Dashboard and CLI
+## IIS/ARR reverse proxy
 
-Open `http://localhost:3000/lythuyet` or the server hostname. The CLI also reads accounts from Firestore:
+Node listens on HTTP port `3000`. For `https://mrnauthdev.dpdns.org/lythuyet/`, IIS must terminate TLS on port `443` and ARR must proxy to `http://127.0.0.1:3000`.
 
-```powershell
-node index.js --url https://example.invalid/slides/slide/lesson --time 240 --account all
+Install the IIS Web Server role, WebSocket Protocol, IIS URL Rewrite, and Application Request Routing:
+
+- https://www.iis.net/downloads/microsoft/url-rewrite
+- https://www.iis.net/downloads/microsoft/application-request-routing
+
+Enable ARR proxying in IIS Manager:
+
+```text
+Server -> Application Request Routing Cache -> Server Proxy Settings -> Enable proxy
 ```
 
-If Firestore is unavailable, the application fails clearly and never falls back to stale local state.
+The IIS site root should contain only proxy configuration:
 
-## Validation
-
-```powershell
-npm test
-npm run build
-npm run verify:firebase-admin
+```text
+C:\Apps\treolythuyet_latest  Node source
+C:\inetpub\treoweb-proxy     IIS site root
+C:\Secure\TreoWeb             Firebase and TLS private files
 ```
 
-There is no `npm run lint` script in this repository. Runtime logs and Playwright/browser files may use the filesystem; persistent application data remains in Firestore.
+Create the root and configuration:
 
-## Optional reverse proxy
+```powershell
+New-Item -ItemType Directory -Force C:\inetpub\treoweb-proxy | Out-Null
+notepad C:\inetpub\treoweb-proxy\web.config
+```
 
-The Node process is HTTP-only on port `3000`. A public HTTPS domain requires IIS/ARR, Caddy, or another reverse proxy listening on `443`.
-
-For IIS:
-
-1. Install the IIS Web Server role and the IIS WebSocket Protocol feature.
-2. Install IIS URL Rewrite and Application Request Routing (ARR).
-3. In IIS Manager, open **Server** -> **Application Request Routing Cache** -> **Server Proxy Settings**, then enable **Proxy**.
-4. Bind the site to `mrnauthdev.dpdns.org` on HTTPS port `443` with a valid certificate. A Cloudflare Origin Certificate is suitable when Cloudflare SSL mode is **Full (strict)**.
-5. Put this `web.config` in the IIS site root:
+Use this file. The first character must be `<`; do not indent an XML declaration before the root element:
 
 ```xml
-<?xml version="1.0" encoding="utf-8"?>
 <configuration>
   <system.webServer>
-    <webSocket enabled="true" />
     <rewrite>
       <rules>
         <rule name="TreoWeb reverse proxy" stopProcessing="true">
@@ -138,20 +145,97 @@ For IIS:
 </configuration>
 ```
 
-The Cloudflare DNS record may remain **Proxied**. Set Cloudflare **SSL/TLS** mode to **Full (strict)** after the IIS certificate is installed. Do not proxy directly to port `3000`; terminate HTTPS at IIS and keep Node private behind the proxy. Allow inbound TCP `80` and `443` in Windows Firewall if HTTP validation or certificate issuance requires them.
+### HTTPS binding
 
-Verify the origin before testing the domain:
+In IIS Manager:
+
+1. Right-click **Sites** -> **Add Website**.
+2. Site name: `TreoWeb`.
+3. Physical path: `C:\inetpub\treoweb-proxy`.
+4. Type: `https`.
+5. IP address: `All Unassigned`.
+6. Port: `443`.
+7. Host name: `mrnauthdev.dpdns.org`.
+8. Select the certificate for that hostname.
+9. Enable **Require Server Name Indication (SNI)** when other HTTPS sites share the IP.
+
+Expected binding:
+
+```text
+https *:443:mrnauthdev.dpdns.org sslFlags=1
+```
+
+PID 4 (`System`) owning port 443 is normal for IIS/HTTP.sys.
+
+### Certificate choices
+
+For a Cloudflare-proxied record, create a Cloudflare Origin Certificate for `mrnauthdev.dpdns.org`, install it in `Cert:\LocalMachine\My`, bind it to IIS, and set Cloudflare SSL/TLS to **Full (strict)**.
+
+For a browser-trusted certificate, use win-acme or Certify The Web to request a Let's Encrypt certificate and install the IIS binding automatically. If converting Cloudflare PEM files to PFX, use a complete OpenSSL installation and a password-protected PFX. An OpenSSL package without `legacy.dll` cannot run the `-legacy` conversion; use a standard PFX or win-acme instead.
+
+Keep the DNS record pointed to the server and proxied:
+
+```text
+mrnauthdev.dpdns.org  A  160.250.180.238  Proxied
+```
+
+Do not proxy Cloudflare directly to port `3000`. Allow inbound TCP `443` in Windows Firewall.
+
+## Troubleshooting
+
+Test Node first:
 
 ```powershell
 Invoke-WebRequest http://127.0.0.1:3000/lythuyet/ -UseBasicParsing
-Get-NetTCPConnection -State Listen -LocalPort 443
 ```
 
-If Cloudflare still shows `525`, inspect the process owning port `443` and its IIS HTTPS binding. A TCP listener alone is not enough; it must speak TLS for the requested hostname.
+Test the public domain:
+
+```powershell
+try {
+  Invoke-WebRequest https://mrnauthdev.dpdns.org/lythuyet/ -UseBasicParsing
+} catch {
+  Write-Host 'HTTP status:' $_.Exception.Response.StatusCode.value__
+  $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+  $reader.ReadToEnd()
+}
+```
+
+PowerShell 5.1 may not include `curl.exe`; use `Invoke-WebRequest`.
+
+Common errors:
+
+- `525`: Cloudflare cannot complete TLS with the origin. Check the IIS certificate and binding.
+- `500.19`: IIS cannot parse `web.config`, or URL Rewrite is missing. Ensure the file starts directly with `<configuration>`.
+- `500.50` or `500.52`: URL Rewrite/ARR configuration problem.
+- `502.3`: IIS cannot connect to Node on port `3000`.
+
+Diagnostics:
+
+```powershell
+Get-WebGlobalModule | Select-Object Name, ImagePath
+Get-WindowsFeature Web-WebSockets
+Get-Website
+Get-WebBinding
+Get-Content C:\inetpub\treoweb-proxy\web.config
+
+& "$env:WINDIR\System32\inetsrv\appcmd.exe" list config "TreoWeb/" /section:system.webServer/rewrite/rules
+
+$log = Get-ChildItem C:\inetpub\logs\LogFiles -Recurse -Filter *.log |
+  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+Get-Content $log.FullName -Tail 30
+```
+
+After changes:
+
+```powershell
+iisreset
+pm2 restart treoweb --update-env
+```
 
 ## Existing Linux/VPS VHost configuration
 
-The original Linux deployment remains supported on the fixed application branch:
+The fixed application still supports the existing Linux deployment:
 
 ```nginx
 location /lythuyet {
@@ -167,3 +251,15 @@ location /lythuyet {
     proxy_send_timeout 86400s;
 }
 ```
+
+## Validation checklist
+
+```powershell
+npm test
+Push-Location client
+npm run build
+Pop-Location
+npm run verify:firebase-admin
+```
+
+Confirm `accounts.json` is absent, `public\index.html` exists, Node returns `200`, Firebase verification passes, IIS serves the HTTPS URL, Socket.IO upgrades work, and PM2 survives restart/reboot.
