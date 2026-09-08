@@ -368,10 +368,19 @@ class BotSession extends EventEmitter {
       await this.page.waitForTimeout(this.randomBetween(500, 1500));
     }
 
-    await Promise.all([
-      this.page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }),
-      this.page.click('button[type="submit"]'),
-    ]);
+    // Do not require the full load event: a slow asset can block it after a
+    // successful login. Odoo may redirect or render an error in the same page.
+    const redirect = this.page.waitForURL(
+      url => !url.pathname.includes('/web/login'),
+      { waitUntil: 'domcontentloaded', timeout: 60000 },
+    ).then(() => 'redirect').catch(() => null);
+    const loginError = this.page.waitForSelector('.alert-danger', {
+      state: 'visible',
+      timeout: 60000,
+    }).then(() => 'error').catch(() => null);
+
+    await this.page.click('button[type="submit"]', { noWaitAfter: true });
+    await Promise.race([redirect, loginError]);
 
     const currentUrl = this.page.url();
     if (currentUrl.includes('/web/login')) {
@@ -380,6 +389,7 @@ class BotSession extends EventEmitter {
         const errorText = await errorEl.textContent();
         throw new Error(`Login thất bại: ${errorText.trim()}`);
       }
+      throw new Error('Login không hoàn tất: trang vẫn ở /web/login sau khi gửi form');
     }
 
     this.log('✅ Login thành công!', 'success');
