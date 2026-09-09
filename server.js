@@ -11,6 +11,7 @@ const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = requi
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
 const { SerializedStateSync, writeJsonAtomicSync } = require('./stateSync');
+const { operatingWindow, assignDistributedStartTimes } = require('./autoScanScheduling');
 
 async function respondAfterStateSync(res, pending, body) {
   try {
@@ -1644,6 +1645,8 @@ function saveAutoScanState() {
         currentCourseIndex: s.currentCourseIndex,
         dailyStudiedMinutes: s.dailyStudiedMinutes,
         dailyDate: s.dailyDate || null,
+        scheduledStartAt: s.options.scheduledStartAt || null,
+        scheduledStartDate: s.options.scheduledStartDate || null,
         courseProgress: s.courseProgress,
         nextRunTime: s.nextRunTime || null,
         createdAt: s.createdAt || new Date().toISOString(),
@@ -1668,6 +1671,72 @@ function scheduleAutoScanTimer(sessionId, fireAt, fn, reason = 'timer') {
   autoScanRegistry.setTimer(sessionId, fireAt, fn);
 }
 
+function vnDateISO(date = new Date()) {
+  return date.toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
+}
+
+function ensureDailyStartAssignment(autoSession) {
+  if (!autoSession.options.randomStartEnabled) return null;
+  const nextDayMoment = getNextAllowedStudyDate(
+    new Date(),
+    autoSession.options.allowedDateRanges || [],
+    autoSession.options.newDayStartTime || '06:00',
+  );
+  const targetDate = vnDateISO(nextDayMoment);
+  const start = autoSession.options.randomStartFrom || autoSession.options.newDayStartTime || '06:00';
+  const end = autoSession.options.randomStartTo || start;
+  const window = operatingWindow(targetDate, start, end);
+  if (!window) return null;
+
+  if (autoSession.options.scheduledStartDate === targetDate && autoSession.options.scheduledStartAt) {
+    const existing = new Date(autoSession.options.scheduledStartAt);
+    if (!Number.isNaN(existing.getTime())) return existing;
+  }
+
+  const candidates = autoScanRegistry.values().filter(session => {
+    if (session.status === 'stopped' || session.status === 'completed' || session.status === 'error') return false;
+    return session.options.randomStartEnabled
+      && (session.options.randomStartFrom || session.options.newDayStartTime || '06:00') === start
+      && (session.options.randomStartTo || session.options.newDayStartTime || start) === end;
+  });
+  if (!candidates.includes(autoSession)) candidates.push(autoSession);
+
+  const occupied = new Set();
+  const total = candidates.length;
+  for (const session of candidates) {
+    if (session.options.scheduledStartDate !== targetDate || !session.options.scheduledStartAt) continue;
+    const at = new Date(session.options.scheduledStartAt).getTime();
+    if (Number.isNaN(at)) continue;
+    const ratio = (at - window.startAt.getTime()) / Math.max(1, window.durationMs);
+    occupied.add(Math.max(0, Math.min(total - 1, Math.floor(ratio * total))));
+  }
+
+  const missing = candidates.filter(session => session.options.scheduledStartDate !== targetDate || !session.options.scheduledStartAt);
+  const freeSlots = [...Array(total).keys()].filter(slot => !occupied.has(slot));
+  const assignments = assignDistributedStartTimes(
+    missing.map(session => session.id),
+    start,
+    end,
+    { now: nextDayMoment.getTime() },
+  );
+  const shuffledSlots = freeSlots.sort(() => Math.random() - 0.5);
+  missing.forEach((session, index) => {
+    const slot = shuffledSlots[index];
+    const generated = assignments[index];
+    let at = generated ? new Date(generated.scheduledStartAt) : new Date(window.startAt.getTime());
+    if (slot != null) {
+      const slotStart = window.startAt.getTime() + Math.floor(slot * window.durationMs / total);
+      const slotEnd = window.startAt.getTime() + Math.floor((slot + 1) * window.durationMs / total);
+      at = new Date(slotStart + Math.floor(Math.random() * Math.max(1, slotEnd - slotStart)));
+    }
+    session.options.scheduledStartAt = at.toISOString();
+    session.options.scheduledStartDate = targetDate;
+    session.log(`Hẹn Auto-Scan hôm nay lúc ${at.toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false })} trong khung ${start}-${end}.`, 'info');
+  });
+  const assigned = new Date(autoSession.options.scheduledStartAt);
+  return Number.isNaN(assigned.getTime()) ? null : assigned;
+}
+
 // Tạo + wire một phiên Auto-Scan (dùng chung cho start / restore / resume)
 function createAutoScanSession(sessionId, account, courses, options, restoreState = null) {
   const autoSession = new AutoCourseSession(sessionId, account, courses, options);
@@ -1678,6 +1747,8 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     if (restoreState.dailyStudiedMinutes != null) autoSession.dailyStudiedMinutes = restoreState.dailyStudiedMinutes;
     if (restoreState.dailyDate) autoSession.dailyDate = restoreState.dailyDate;
     if (restoreState.courseProgress) autoSession.courseProgress = restoreState.courseProgress;
+    if (restoreState.scheduledStartAt) autoSession.options.scheduledStartAt = restoreState.scheduledStartAt;
+    if (restoreState.scheduledStartDate) autoSession.options.scheduledStartDate = restoreState.scheduledStartDate;
   }
 
   autoSession.on('log', (entry) => addLog(entry));
@@ -1730,6 +1801,10 @@ function scheduleAutoScanResume(autoSession) {
       autoSession.options.customTimeRules,
       autoSession.options.allowedDateRanges || [],
       autoSession.options.newDayStartTime || '06:00'
+    );
+  } else if (autoSession.options.randomStartEnabled) {
+    resumeAt = ensureDailyStartAssignment(autoSession) || getNextAllowedStudyDate(
+      new Date(), autoSession.options.allowedDateRanges || [], autoSession.options.newDayStartTime || '06:00'
     );
   } else {
     resumeAt = getNextAllowedStudyDate(
@@ -1796,6 +1871,8 @@ async function loadAndRestoreAutoScans() {
       dailyStudiedMinutes: saved.dailyStudiedMinutes || 0,
       dailyDate: saved.dailyDate,
       courseProgress: saved.courseProgress || {},
+      scheduledStartAt: saved.scheduledStartAt || saved.options?.scheduledStartAt || null,
+      scheduledStartDate: saved.scheduledStartDate || saved.options?.scheduledStartDate || null,
     });
     s.status = saved.status;
     s.pausedFromStatus = saved.pausedFromStatus || null;
@@ -1875,6 +1952,15 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
   // hồi sinh qua một timer cũ).
   if (!autoScanRegistry.isCurrent(autoSession)) return;
   if (autoSession.status === 'stopped' || autoSession._stopped) return;
+  if (autoSession.options.randomStartEnabled && autoSession.options.scheduledStartAt) {
+    const scheduledAt = new Date(autoSession.options.scheduledStartAt);
+    if (!Number.isNaN(scheduledAt.getTime()) && scheduledAt.getTime() > Date.now() + 500) {
+      autoSession.nextRunTime = scheduledAt.toISOString();
+      scheduleAutoScanTimer(autoSession.id, scheduledAt, () => startAutoScanWhenFree(autoSession, 'random-scheduled'), 'scheduled-start');
+      saveAutoScanState();
+      return;
+    }
+  }
   // Đối tượng phiên chỉ chạy đúng một lần — hai request/timer cùng gọi thì chỉ
   // lần đầu mở browser (engine cũng có chốt riêng, đây là chốt sớm cho log rõ).
   if (autoSession.isRunning() || autoSession.isFinished()) {
@@ -1913,7 +1999,7 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
 }
 
 app.post('/api/auto-scan/start', async (req, res) => {
-  const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices, initialDailyMinutesToggle, initialDailyMinutes } = req.body;
+  const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, randomStartEnabled, randomStartFrom, randomStartTo, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices, initialDailyMinutesToggle, initialDailyMinutes } = req.body;
   if (!courses || !Array.isArray(courses) || courses.length === 0) {
     return res.status(400).json({ error: 'Cần nhập ít nhất 1 khóa học' });
   }
@@ -1945,7 +2031,23 @@ app.post('/api/auto-scan/start', async (req, res) => {
   const skipped = [];
   const vnTodayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
 
-  for (const acc of targetAccounts) {
+  const randomTargetDate = isAllowedStudyDate(new Date(), allowedDateRanges || [])
+    ? vnTodayStr
+    : vnDateISO(getNextAllowedStudyDate(new Date(), allowedDateRanges || [], newDayStartTime || '06:00'));
+  let randomAssignments = [];
+  if (randomStartEnabled) {
+    try {
+      randomAssignments = assignDistributedStartTimes(
+        targetAccounts,
+        randomStartFrom || newDayStartTime || '06:00',
+        randomStartTo || newDayStartTime || '06:00',
+        { date: randomTargetDate },
+      );
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  }
+  for (const [accountPosition, acc] of targetAccounts.entries()) {
     // Tài khoản đã có phiên Auto-Scan đang sống (chạy / tạm dừng / đang hẹn giờ)
     // thì KHÔNG tạo thẻ thứ hai — bấm Bắt đầu lần nữa là thao tác vô ý, thẻ mới
     // chỉ quay vòng trong vòng chờ 5 phút và làm Dashboard rối.
@@ -1969,6 +2071,11 @@ app.post('/api/auto-scan/start', async (req, res) => {
       dailyMaxMinutes: dailyMaxMinutes || 480,
       allowedDateRanges: allowedDateRanges || [],
       newDayStartTime: newDayStartTime || '06:00',
+      randomStartEnabled: randomStartEnabled === true,
+      randomStartFrom: randomStartFrom || newDayStartTime || '06:00',
+      randomStartTo: randomStartTo || newDayStartTime || '06:00',
+      scheduledStartAt: randomAssignments.find(item => item.accountIndex === accountPosition)?.scheduledStartAt || null,
+      scheduledStartDate: randomStartEnabled ? randomTargetDate : null,
       refreshInterval: parseInt(refreshInterval, 10) || 15,
       stealth: stealth === true,
       stealthInterval: parseInt(stealthInterval, 10) || 30,

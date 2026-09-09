@@ -10,7 +10,56 @@ const LOGIN_NAVIGATION_TIMEOUT_MS = 60000;
 const LOGIN_FORM_TIMEOUT_MS = 15000;
 const LOGIN_POST_SUBMIT_TIMEOUT_MS = 60000;
 const LOGIN_POST_SUBMIT_GRACE_MS = 5000;
-const LOGIN_RETRY_INTERVAL_MS = 30000;
+const LOGIN_RETRY_BASE_MS = 15000;
+const LOGIN_RETRY_MAX_MS = 5 * 60 * 1000;
+const MAX_CONCURRENT_LOGINS = 3;
+
+class LoginLimiter {
+  constructor(max = MAX_CONCURRENT_LOGINS, { logger = () => {} } = {}) {
+    this.max = Math.max(1, Number(max) || MAX_CONCURRENT_LOGINS);
+    this.active = 0;
+    this.queue = [];
+    this.logger = logger;
+  }
+
+  acquire(owner = null) {
+    if (owner && owner._stopped) return Promise.resolve(false);
+    if (this.active < this.max) {
+      this.active++;
+      return Promise.resolve(true);
+    }
+    return new Promise(resolve => {
+      this.queue.push({ owner, resolve });
+    });
+  }
+
+  release() {
+    this.active = Math.max(0, this.active - 1);
+    while (this.queue.length > 0 && this.active < this.max) {
+      const next = this.queue.shift();
+      if (next.owner && next.owner._stopped) {
+        next.resolve(false);
+        continue;
+      }
+      this.active++;
+      next.resolve(true);
+    }
+  }
+
+  cancel(owner) {
+    if (!owner) return;
+    const keep = [];
+    for (const item of this.queue) {
+      if (item.owner === owner) item.resolve(false);
+      else keep.push(item);
+    }
+    this.queue = keep;
+  }
+
+  get pending() { return this.queue.length; }
+}
+
+const globalLoginLimiter = new LoginLimiter();
 
 const COURSE_FINALIZATION_STATES = Object.freeze({
   NORMAL_STUDY: 'normal-study',
@@ -78,6 +127,11 @@ function getPersistentAutoCourseOptions(options = {}) {
     dailyMaxMinutes: options.dailyMaxMinutes ?? 480,
     allowedDateRanges: options.allowedDateRanges || [],
     newDayStartTime: options.newDayStartTime || '06:00',
+    randomStartEnabled: options.randomStartEnabled === true,
+    randomStartFrom: options.randomStartFrom || options.newDayStartTime || '06:00',
+    randomStartTo: options.randomStartTo || options.newDayStartTime || '06:00',
+    scheduledStartAt: options.scheduledStartAt || null,
+    scheduledStartDate: options.scheduledStartDate || null,
     refreshInterval: options.refreshInterval || 15,
     stealthInterval: options.stealthInterval || 30,
     stealth: options.stealth === true,
@@ -100,6 +154,11 @@ class AutoCourseSession extends EventEmitter {
       dailyMaxMinutes: 480, // Tối đa 8 tiếng/ngày
       allowedDateRanges: [], // ["25/07-28/07", "30/07", ...]
       newDayStartTime: '06:00', // Giờ bắt đầu ngày mới (VD: "06:00", "07:30")
+      randomStartEnabled: false,
+      randomStartFrom: '06:00',
+      randomStartTo: '06:00',
+      scheduledStartAt: null,
+      scheduledStartDate: null,
       refreshInterval: 15, // Thời gian F5 reload trang (phút)
       customTimeRules: [], // [{ dates: "25/07", shifts: "07:00-11:30, 14:00-23:00" }, ...]
       stealth: false, // Bật/tắt anti-detection + giả lập thao tác người dùng (mặc định TẮT cho AutoCourse)
@@ -138,6 +197,7 @@ class AutoCourseSession extends EventEmitter {
     this._sessionSeparatorLogged = false;
     this._courseRunGeneration = 0;
     this._activeCourseRunId = null;
+    this.loginLimiter = this.options.loginLimiter || globalLoginLimiter;
   }
 
   // Đối tượng phiên này đã chạy (hoặc đang chạy) chưa?
@@ -730,6 +790,11 @@ class AutoCourseSession extends EventEmitter {
       dailyStudiedMinutes: this.dailyStudiedMinutes,
       dailyMaxMinutes: this.options.dailyMaxMinutes,
       newDayStartTime: this.options.newDayStartTime || '06:00',
+      randomStartEnabled: this.options.randomStartEnabled === true,
+      randomStartFrom: this.options.randomStartFrom || this.options.newDayStartTime || '06:00',
+      randomStartTo: this.options.randomStartTo || this.options.newDayStartTime || '06:00',
+      scheduledStartAt: this.options.scheduledStartAt || null,
+      scheduledStartDate: this.options.scheduledStartDate || null,
       refreshInterval: this.options.refreshInterval || 15,
       dailyDate: this.dailyDate,
       courseProgress: this.courseProgress,
@@ -740,7 +805,7 @@ class AutoCourseSession extends EventEmitter {
     this._setStatus('logging-in');
     this.emit('status', this.getStatus());
 
-    const retryIntervalMs = Math.max(0, Number(this.options.loginRetryIntervalMs ?? LOGIN_RETRY_INTERVAL_MS));
+    const retryIntervalMs = Math.max(1, Number(this.options.loginRetryIntervalMs ?? LOGIN_RETRY_BASE_MS));
     const gracePeriodMs = Math.max(0, Number(this.options.loginPostSubmitGraceMs ?? LOGIN_POST_SUBMIT_GRACE_MS));
     let attempt = 0;
     while (!this._stopped) {
@@ -779,12 +844,23 @@ class AutoCourseSession extends EventEmitter {
           timeout: submitTimeoutMs,
         }).then(() => 'error').catch(() => null);
 
-        await this.page.click('button[type="submit"]', { noWaitAfter: true });
-        const submitOutcome = await this._waitForLoginOutcome(
-          redirect,
-          loginError,
-          submitTimeoutMs,
-        );
+        if (this.loginLimiter.active >= this.loginLimiter.max) {
+          this.log(`Đang chờ lượt đăng nhập (${this.loginLimiter.active}/${this.loginLimiter.max} slot đang được sử dụng).`, 'info');
+        }
+        const acquired = await this.loginLimiter.acquire(this);
+        if (!acquired || this._stopped) return false;
+        let submitOutcome;
+        try {
+          this.log('Đã nhận login slot.', 'info');
+          await this.page.click('button[type="submit"]', { noWaitAfter: true });
+          submitOutcome = await this._waitForLoginOutcome(
+            redirect,
+            loginError,
+            submitTimeoutMs,
+          );
+        } finally {
+          this.loginLimiter.release();
+        }
         if (submitOutcome === 'stopped') return false;
 
         // A redirect may be delayed even after the watcher settles. Give Odoo
@@ -819,8 +895,9 @@ class AutoCourseSession extends EventEmitter {
       }
       if (this._stopped) return false;
       this.emit('status', this.getStatus());
-      this.log(`⏳ Login chưa hoàn tất. Chờ ${Math.round(retryIntervalMs / 1000)} giây trước khi thử lại...`, 'warn');
-      await this._waitInterruptible(retryIntervalMs);
+      const retryDelayMs = Math.min(LOGIN_RETRY_MAX_MS, Math.max(1, Math.floor(retryIntervalMs * Math.pow(1.7, attempt - 1) * (0.75 + Math.random() * 0.5))));
+      this.log(`⏳ Login chưa hoàn tất. Chờ ${Math.round(retryDelayMs / 1000)} giây trước khi thử lại...`, 'warn');
+      await this._waitInterruptible(retryDelayMs);
       if (this._stopped) return false;
       await this._recreatePage();
     }
@@ -1592,6 +1669,7 @@ class AutoCourseSession extends EventEmitter {
     this._phase = PHASE_FINISHED;
     if (this._stopped) return;
     this._stopped = true;
+    this.loginLimiter.cancel(this);
     this._activeCourseRunId = null;
     this._courseRunGeneration++;
     this._clearStealthLoop();
@@ -1617,4 +1695,7 @@ module.exports = {
   PHASE_NEW,
   PHASE_RUNNING,
   PHASE_FINISHED,
+  LoginLimiter,
+  globalLoginLimiter,
+  MAX_CONCURRENT_LOGINS,
 };

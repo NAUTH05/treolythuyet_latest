@@ -157,6 +157,9 @@ function AutoScanCard({ scan, toast }) {
         {isScheduled && scan.nextRunTime && (
           <span>Tự chạy lại: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
         )}
+        {scan.randomStartEnabled && scan.scheduledStartAt && (
+          <span>Hẹn chạy hôm nay: <strong>{formatVNDateTime(scan.scheduledStartAt)}</strong></span>
+        )}
         {DONE_STATUSES.has(scan.status) && scan.completedAt && (
           <span>Kết thúc: <strong>{formatVNDateTime(scan.completedAt)}</strong></span>
         )}
@@ -249,6 +252,9 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
   const [allowedDateRanges, setAllowedDateRanges] = useState('');
   const [dailyMaxHours, setDailyMaxHours] = useState('8');
   const [newDayStartTime, setNewDayStartTime] = useState('06:00');
+  const [randomStartEnabled, setRandomStartEnabled] = useState(false);
+  const [randomStartFrom, setRandomStartFrom] = useState('06:00');
+  const [randomStartTo, setRandomStartTo] = useState('06:30');
   const [refreshInterval, setRefreshInterval] = useState('15');
   const [timeWindowsText, setTimeWindowsText] = useState('');
   const [customTimeRules, setCustomTimeRules] = useState([
@@ -312,6 +318,9 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
     if (cfg.allowedDateRanges != null) setAllowedDateRanges(cfg.allowedDateRanges);
     if (cfg.dailyMaxHours != null) setDailyMaxHours(String(cfg.dailyMaxHours));
     if (cfg.newDayStartTime != null) setNewDayStartTime(cfg.newDayStartTime);
+    if (cfg.randomStartEnabled != null) setRandomStartEnabled(!!cfg.randomStartEnabled);
+    if (cfg.randomStartFrom != null) setRandomStartFrom(cfg.randomStartFrom);
+    if (cfg.randomStartTo != null) setRandomStartTo(cfg.randomStartTo);
     if (cfg.refreshInterval != null) setRefreshInterval(String(cfg.refreshInterval));
     if (cfg.timeWindowsText != null) setTimeWindowsText(cfg.timeWindowsText);
     if (Array.isArray(cfg.customTimeRules)) setCustomTimeRules(cfg.customTimeRules);
@@ -334,6 +343,9 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           allowedDateRanges,
           dailyMaxHours,
           newDayStartTime,
+          randomStartEnabled,
+          randomStartFrom,
+          randomStartTo,
           refreshInterval,
           timeWindowsText,
           customTimeRules,
@@ -439,6 +451,9 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         allowedDateRanges: allowedDateRanges.split(',').map(s => s.trim()).filter(Boolean),
         dailyMaxMinutes: (parseInt(dailyMaxHours, 10) || 8) * 60,
         newDayStartTime: newDayStartTime.trim() || '06:00',
+        randomStartEnabled,
+        randomStartFrom: randomStartFrom.trim() || '06:00',
+        randomStartTo: randomStartTo.trim() || '06:30',
         refreshInterval: parseInt(refreshInterval, 10) || 15,
         stealth,
         initialDailyMinutesToggle,
@@ -680,7 +695,17 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
 
           <div className="form-group">
             <label>Giờ bắt đầu ngày mới (Hẹn tự động chạy lại)</label>
-            <div className="input-row">
+            <label className="check-row">
+              <input type="checkbox" checked={randomStartEnabled} onChange={e => setRandomStartEnabled(e.target.checked)} />
+              <span>Rải ngẫu nhiên thời gian bắt đầu</span>
+            </label>
+            {randomStartEnabled && <div className="input-row">
+              <span className="unit">Từ:</span>
+              <input type="text" value={randomStartFrom} onChange={e => setRandomStartFrom(e.target.value)} style={{ width: 100 }} />
+              <span className="unit">Đến:</span>
+              <input type="text" value={randomStartTo} onChange={e => setRandomStartTo(e.target.value)} style={{ width: 100 }} />
+            </div>}
+            {!randomStartEnabled && <div className="input-row">
               <input
                 type="text"
                 placeholder="06:00"
@@ -689,7 +714,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
                 style={{ width: 100 }}
               />
               <span className="unit">ví dụ: 06:00, 07:00 (mặc định: 06:00)</span>
-            </div>
+            </div>}
             <div className="hint">
               Nếu chạm giới hạn ngày hoặc gặp ngày nghỉ, bot sẽ tự động hẹn giờ chạy lại vào giờ này.
             </div>
