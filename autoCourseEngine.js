@@ -6,6 +6,11 @@ const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
 const SESSION_LOG_SEPARATOR = '---------------------------------------------------------';
 const POST_TARGET_GRACE_MINUTES = 5;
+const LOGIN_NAVIGATION_TIMEOUT_MS = 60000;
+const LOGIN_FORM_TIMEOUT_MS = 15000;
+const LOGIN_POST_SUBMIT_TIMEOUT_MS = 60000;
+const LOGIN_POST_SUBMIT_GRACE_MS = 5000;
+const LOGIN_RETRY_INTERVAL_MS = 30000;
 
 const COURSE_FINALIZATION_STATES = Object.freeze({
   NORMAL_STUDY: 'normal-study',
@@ -388,11 +393,19 @@ class AutoCourseSession extends EventEmitter {
     this.log('🔍 Re-checking course progress after checkpoint', 'info');
     let verifiedScan = null;
     for (let attempt = 1; attempt <= 2 && this._isCurrentCourseRun(courseRunId); attempt++) {
-      verifiedScan = await this._scanCourseDetailsForCheckpoint(courseUrl, preserveCurrentPage);
+      try {
+        verifiedScan = await this._scanCourseDetailsForCheckpoint(courseUrl, preserveCurrentPage);
+      } catch (err) {
+        this.log(`⚠️ Course checkpoint scan gặp lỗi tạm thời: ${String(err.message).split('\n')[0]}`, 'warn');
+        if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+          await this._recreatePage();
+        }
+        verifiedScan = null;
+      }
       if (verifiedScan && verifiedScan.totalLessons > 0) break;
       if (attempt < 2) {
         this.log(`⚠️ Course checkpoint scan failed (attempt ${attempt}/2) — retrying once`, 'warn');
-        await this.page.waitForTimeout(5000);
+        await this._waitInterruptible(5000);
       }
     }
 
@@ -561,7 +574,76 @@ class AutoCourseSession extends EventEmitter {
       || msg.includes('ERR_INTERNET_DISCONNECTED')
       || msg.includes('ECONNREFUSED')
       || msg.includes('ENOTFOUND')
+      || msg.includes('ERR_ABORTED')
+      || msg.toLowerCase().includes('target page, context or browser has been closed')
+      || msg.toLowerCase().includes('page has been closed')
+      || msg.toLowerCase().includes('frame was detached')
       || msg.toLowerCase().includes('timeout');
+  }
+
+  async _waitInterruptible(durationMs) {
+    let remaining = Math.max(0, Number(durationMs) || 0);
+    while (remaining > 0 && !this._stopped) {
+      await this._checkPaused();
+      if (this._stopped) return false;
+      const step = Math.min(250, remaining);
+      await new Promise(resolve => setTimeout(resolve, step));
+      remaining -= step;
+    }
+    return !this._stopped;
+  }
+
+  async _recreatePage() {
+    const oldPage = this.page;
+    try { if (oldPage) await oldPage.close(); } catch { /* ignore */ }
+    if (this._stopped || !this.context) return false;
+    try {
+      this.page = await this.context.newPage();
+      await this._fakeVisibilityAPI();
+      return true;
+    } catch (err) {
+      this.page = null;
+      this.log(`⚠️ Không thể tạo lại trang trình duyệt: ${String(err.message).split('\n')[0]}`, 'warn');
+      return false;
+    }
+  }
+
+  async _readAuthenticationError() {
+    if (!this.page) return null;
+    try {
+      const errorEl = await this.page.$('.alert-danger');
+      if (!errorEl) return null;
+      if (typeof errorEl.isVisible === 'function' && !(await errorEl.isVisible())) return null;
+      const text = String((await errorEl.textContent()) || '').trim();
+      if (!text) return null;
+      const authRejection = /(mật khẩu|tên đăng nhập|đăng nhập|password|username|credential|authentication|invalid login|wrong login|incorrect|access denied|unauthorized|forbidden)/i;
+      return authRejection.test(text) ? text : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async _waitForLoginOutcome(redirect, loginError, timeoutMs = LOGIN_POST_SUBMIT_TIMEOUT_MS) {
+    let timeoutHandle;
+    let stopPoll;
+    const timedOut = new Promise(resolve => {
+      timeoutHandle = setTimeout(() => resolve('timeout'), Math.max(0, timeoutMs));
+    });
+    const stopped = new Promise(resolve => {
+      if (this._stopped) {
+        resolve('stopped');
+        return;
+      }
+      stopPoll = setInterval(() => {
+        if (this._stopped) resolve('stopped');
+      }, 100);
+    });
+    try {
+      return await Promise.race([redirect, loginError, timedOut, stopped]);
+    } finally {
+      clearTimeout(timeoutHandle);
+      if (stopPoll) clearInterval(stopPoll);
+    }
   }
 
   // Kiểm tra trang hiện tại có đúng URL mong muốn không (so sánh pathname)
@@ -581,6 +663,15 @@ class AutoCourseSession extends EventEmitter {
     while (!this._stopped) {
       await this._checkPaused();
       if (this._stopped) return false;
+      if (SCHEDULED_STATUSES.has(this.status)) return false;
+
+      if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+        await this._recreatePage();
+        if (!this.page) {
+          await this._waitInterruptible(30000);
+          continue;
+        }
+      }
 
       // Phát hiện bị văng phiên đăng nhập (trang /web/login) → tự đăng nhập lại
       if (this.page && this.page.url().includes('/web/login')) {
@@ -588,8 +679,9 @@ class AutoCourseSession extends EventEmitter {
         try {
           await this.login();
         } catch (err) {
+          if (err && err.code === 'AUTHENTICATION_REJECTED') throw err;
           this.log(`⚠️ Lỗi đăng nhập lại: ${err.message} → Thử lại sau 30s`, 'warn');
-          await this.page.waitForTimeout(30000);
+          await this._waitInterruptible(30000);
           continue;
         }
       }
@@ -598,7 +690,7 @@ class AutoCourseSession extends EventEmitter {
       attempt++;
       this.log(`⚠️ Đang chờ hệ thống cho phép vào đúng URL (lần ${attempt}): ${this.page ? this.page.url() : ''} → Thử lại sau 30 giây...`, 'warn');
       this.emit('status', this.getStatus());
-      await this.page.waitForTimeout(30000);
+      await this._waitInterruptible(30000);
       if (this._stopped) return false;
       try {
         await this.page.goto(expectedUrl, { waitUntil: 'load', timeout: 60000 });
@@ -606,6 +698,9 @@ class AutoCourseSession extends EventEmitter {
         await this.page.waitForTimeout(2000);
       } catch (err) {
         this.log(`⚠️ Lỗi truy cập lại: ${String(err.message).split('\n')[0]}`, 'warn');
+        if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+          await this._recreatePage();
+        }
       }
     }
     return false;
@@ -645,63 +740,91 @@ class AutoCourseSession extends EventEmitter {
     this._setStatus('logging-in');
     this.emit('status', this.getStatus());
 
-    // Retry vô hạn khi mạng chưa sẵn sàng (giống Queue thủ công)
+    const retryIntervalMs = Math.max(0, Number(this.options.loginRetryIntervalMs ?? LOGIN_RETRY_INTERVAL_MS));
+    const gracePeriodMs = Math.max(0, Number(this.options.loginPostSubmitGraceMs ?? LOGIN_POST_SUBMIT_GRACE_MS));
     let attempt = 0;
     while (!this._stopped) {
       await this._checkPaused();
+      if (this._stopped) return false;
+      if (this._hitSchedulingLimit()) return false;
+      attempt++;
       try {
-        this.log('🔑 Đang mở trang login...', 'info');
-        await this.page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        break; // Thành công → thoát vòng lặp
+        if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+          await this._recreatePage();
+        }
+        if (!this.page) throw new Error('Không có trang trình duyệt để đăng nhập');
+
+        this.log(attempt === 1 ? '🔑 Đang đăng nhập tài khoản...' : `🔁 Login retry #${attempt}...`, 'info');
+        await this.page.goto(LOGIN_URL, {
+          waitUntil: 'domcontentloaded',
+          timeout: Number(this.options.loginNavigationTimeoutMs) || LOGIN_NAVIGATION_TIMEOUT_MS,
+        });
+        await this.page.waitForSelector('input[name="login"]', {
+          timeout: Number(this.options.loginFormTimeoutMs) || LOGIN_FORM_TIMEOUT_MS,
+        });
+        await this.page.fill('input[name="login"]', this.account.email);
+        await this.page.fill('input[name="password"]', this.account.password);
+
+        if (this.options.stealth) {
+          await this.page.waitForTimeout(this._randomBetween(500, 1500));
+        }
+
+        const submitTimeoutMs = Number(this.options.loginPostSubmitTimeoutMs) || LOGIN_POST_SUBMIT_TIMEOUT_MS;
+        const redirect = this.page.waitForURL(
+          url => !url.pathname.includes('/web/login'),
+          { waitUntil: 'domcontentloaded', timeout: submitTimeoutMs },
+        ).then(() => 'redirect').catch(() => null);
+        const loginError = this.page.waitForSelector('.alert-danger', {
+          state: 'visible',
+          timeout: submitTimeoutMs,
+        }).then(() => 'error').catch(() => null);
+
+        await this.page.click('button[type="submit"]', { noWaitAfter: true });
+        const submitOutcome = await this._waitForLoginOutcome(
+          redirect,
+          loginError,
+          submitTimeoutMs,
+        );
+        if (submitOutcome === 'stopped') return false;
+
+        // A redirect may be delayed even after the watcher settles. Give Odoo
+        // a short grace period before classifying the attempt as transient.
+        if (gracePeriodMs > 0) await this._waitInterruptible(gracePeriodMs);
+        if (this._stopped) return false;
+
+        const currentUrl = this.page.url();
+        if (!currentUrl.includes('/web/login')) {
+          this.log(`✅ Login thành công${attempt > 1 ? ` sau ${attempt} lần thử` : ''}!`, 'success');
+          return true;
+        }
+
+        const errorText = await this._readAuthenticationError();
+        if (errorText) {
+          const authError = new Error(`Login thất bại: ${errorText}`);
+          authError.code = 'AUTHENTICATION_REJECTED';
+          throw authError;
+        }
+
+        this.log('⚠️ Sau khi gửi form vẫn đang ở /web/login. Không phát hiện lỗi xác thực rõ ràng.', 'warn');
       } catch (err) {
-        attempt++;
-        if (!this._isNetworkError(err)) throw err; // Lỗi khác → re-throw
-        this.log(`⚠️ Mạng chưa sẵn sàng (lần ${attempt}): ${String(err.message).split('\n')[0]} → Thử lại sau 60 giây...`, 'warn');
-        this.emit('status', this.getStatus());
-        await this.page.waitForTimeout(60000);
-        if (this._stopped) return;
-        try {
-          await this.page.close();
-          this.page = await this.context.newPage();
-        } catch { /* ignore */ }
+        if (err && err.code === 'AUTHENTICATION_REJECTED') {
+          this.log(`❌ Server từ chối đăng nhập: ${err.message.replace(/^Login thất bại:\s*/i, '')}`, 'error');
+          throw err;
+        }
+        if (!this._isNetworkError(err)) {
+          this.log(`⚠️ Login tạm thời chưa hoàn tất: ${String(err.message).split('\n')[0]}`, 'warn');
+        } else {
+          this.log(`⚠️ Login gặp lỗi tạm thời: ${String(err.message).split('\n')[0]}`, 'warn');
+        }
       }
+      if (this._stopped) return false;
+      this.emit('status', this.getStatus());
+      this.log(`⏳ Login chưa hoàn tất. Chờ ${Math.round(retryIntervalMs / 1000)} giây trước khi thử lại...`, 'warn');
+      await this._waitInterruptible(retryIntervalMs);
+      if (this._stopped) return false;
+      await this._recreatePage();
     }
-    if (this._stopped) return;
-
-    await this.page.waitForSelector('input[name="login"]', { timeout: 15000 });
-    await this.page.fill('input[name="login"]', this.account.email);
-    await this.page.fill('input[name="password"]', this.account.password);
-
-    // Delay ngẫu nhiên như người thật trước khi bấm đăng nhập (chỉ khi bật Stealth)
-    if (this.options.stealth) {
-      await this.page.waitForTimeout(this._randomBetween(500, 1500));
-    }
-
-    // Do not require the full load event: a slow asset can block it after a
-    // successful login. Odoo may redirect or render an error in the same page.
-    const redirect = this.page.waitForURL(
-      url => !url.pathname.includes('/web/login'),
-      { waitUntil: 'domcontentloaded', timeout: 60000 },
-    ).then(() => 'redirect').catch(() => null);
-    const loginError = this.page.waitForSelector('.alert-danger', {
-      state: 'visible',
-      timeout: 60000,
-    }).then(() => 'error').catch(() => null);
-
-    await this.page.click('button[type="submit"]', { noWaitAfter: true });
-    await Promise.race([redirect, loginError]);
-
-    // Phát hiện login thất bại (sai mật khẩu) — vẫn ở trang /web/login kèm thông báo lỗi
-    if (this.page.url().includes('/web/login')) {
-      const errorEl = await this.page.$('.alert-danger');
-      if (errorEl) {
-        const errorText = (await errorEl.textContent()) || '';
-        throw new Error(`Login thất bại: ${errorText.trim()}`);
-      }
-      throw new Error('Login không hoàn tất: trang vẫn ở /web/login sau khi gửi form');
-    }
-
-    this.log('✅ Login thành công!', 'success');
+    return false;
   }
 
   // Kiểm tra Ca học theo quy tắc Ngày cụ thể (customTimeRules)
@@ -839,7 +962,10 @@ class AutoCourseSession extends EventEmitter {
           const reason = !scanResult ? 'lỗi quét/mạng' : `bị redirect: ${this.page.url()}`;
           this.log(`⚠️ Quét khóa học thất bại (${reason}) (lần ${scanAttempt}) → Thử lại sau 30 giây...`, 'warn');
           this.emit('status', this.getStatus());
-          await this.page.waitForTimeout(30000);
+          if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+            await this._recreatePage();
+          }
+          await this._waitInterruptible(30000);
         }
         if (this._stopped) break;
 
@@ -956,7 +1082,10 @@ class AutoCourseSession extends EventEmitter {
               navAttempt++;
               this.log(`⚠️ Lỗi mở bài học (lần ${navAttempt}): ${String(err.message).split('\n')[0]} → Thử lại sau 30 giây...`, 'warn');
               this.emit('status', this.getStatus());
-              await this.page.waitForTimeout(30000);
+              if (!this.page || (typeof this.page.isClosed === 'function' && this.page.isClosed())) {
+                await this._recreatePage();
+              }
+              await this._waitInterruptible(30000);
               continue;
             }
             await this._fakeVisibilityAPI();
@@ -965,7 +1094,7 @@ class AutoCourseSession extends EventEmitter {
             navAttempt++;
             this.log(`⚠️ Bài học chưa mở được, bị redirect (lần ${navAttempt}): ${this.page.url()} → Thử lại sau 30 giây...`, 'warn');
             this.emit('status', this.getStatus());
-            await this.page.waitForTimeout(30000);
+            await this._waitInterruptible(30000);
           }
 
           this.page.removeListener('response', responseHandler);

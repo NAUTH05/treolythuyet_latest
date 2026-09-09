@@ -452,3 +452,166 @@ test('danh sách trạng thái chính thức đủ và không chồng lấn', ()
     assert.equal(TERMINAL_STATUSES.has(status), false, `${status} vừa là hẹn giờ vừa là kết thúc`);
   }
 });
+
+function makeLoginPage(outcome, state) {
+  return {
+    url: () => state.url,
+    isClosed: () => state.closed,
+    goto: async () => {
+      if (outcome === 'navigation-timeout' && !state.gotoAttempted) {
+        state.gotoAttempted = true;
+        throw new Error('Timeout 60000ms exceeded');
+      }
+      state.url = 'https://hoclythuyetlaixe.eco-tek.com.vn/web/login';
+    },
+    waitForSelector: async selector => {
+      if (selector === 'input[name="login"]') return {};
+      if (selector === '.alert-danger') {
+        if (outcome === 'auth-rejected' || outcome === 'generic-alert') return {};
+        throw new Error('timeout');
+      }
+      return {};
+    },
+    fill: async () => {},
+    click: async () => {
+      if (outcome === 'success') state.url = 'https://hoclythuyetlaixe.eco-tek.com.vn/web';
+      if (outcome === 'delayed-redirect') {
+        setTimeout(() => { state.url = 'https://hoclythuyetlaixe.eco-tek.com.vn/web'; }, 2);
+      }
+    },
+    waitForURL: async () => {
+      if (outcome === 'success') return 'redirect';
+      if (outcome === 'delayed-redirect') {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        return 'redirect';
+      }
+      throw new Error('timeout');
+    },
+    $: async selector => {
+      if (selector !== '.alert-danger' || !['auth-rejected', 'generic-alert'].includes(outcome)) return null;
+      return {
+        isVisible: async () => true,
+        textContent: async () => outcome === 'auth-rejected'
+          ? 'Sai tên đăng nhập hoặc mật khẩu'
+          : 'Internal Server Error',
+      };
+    },
+    waitForTimeout: async ms => new Promise(resolve => setTimeout(resolve, Math.min(ms, 5))),
+    close: async () => { state.closed = true; },
+  };
+}
+
+function loginSession(outcomes, options = {}) {
+  const session = new AutoCourseSession(
+    'login-test',
+    { name: 'Login Test', email: 'test@example.com', password: 'secret' },
+    [],
+    {
+      loginRetryIntervalMs: 1,
+      loginPostSubmitGraceMs: 0,
+      loginPostSubmitTimeoutMs: 20,
+      loginFormTimeoutMs: 20,
+      loginNavigationTimeoutMs: 20,
+      ...options,
+    },
+  );
+  const pages = [];
+  let index = 1;
+  const newPage = async () => {
+    const state = { url: 'about:blank', closed: false, gotoAttempted: false };
+    const page = makeLoginPage(outcomes[Math.min(index++, outcomes.length - 1)], state);
+    pages.push(page);
+    return page;
+  };
+  session.context = { newPage };
+  session.page = makeLoginPage(outcomes[0], { url: 'about:blank', closed: false, gotoAttempted: false });
+  pages.push(session.page);
+  return { session, pages };
+}
+
+test('login succeeds immediately after form submission', async () => {
+  const { session } = loginSession(['success']);
+  assert.equal(await session.login(), true);
+  assert.equal(session.page.url().includes('/web/login'), false);
+});
+
+test('delayed redirect after submit is accepted during the grace period', async () => {
+  const { session } = loginSession(['delayed-redirect'], { loginPostSubmitGraceMs: 10 });
+  assert.equal(await session.login(), true);
+});
+
+test('staying on login without an auth error retries in the same session and then succeeds', async () => {
+  const { session, pages } = loginSession(['transient', 'success']);
+  assert.equal(await session.login(), true);
+  assert.equal(session.id, 'login-test');
+  assert.equal(pages.length, 2, 'recovery recreates only the page, not the Auto-Scan session');
+});
+
+test('Auto-Scan start remains alive after the production transient login scenario', async () => {
+  const { chromium } = require('playwright');
+  const originalLaunch = chromium.launch;
+  let launchCount = 0;
+  let pageIndex = 0;
+  const pages = [];
+  chromium.launch = async () => {
+    launchCount++;
+    return {
+      newContext: async () => ({
+        newPage: async () => {
+          const state = { url: 'about:blank', closed: false, gotoAttempted: false };
+          const page = makeLoginPage(['transient', 'success'][Math.min(pageIndex++, 1)], state);
+          pages.push(page);
+          return page;
+        },
+      }),
+      close: async () => {},
+    };
+  };
+  try {
+    const session = new AutoCourseSession(
+      'production-regression',
+      { name: 'Production Regression', email: 'test@example.com', password: 'secret' },
+      [],
+      { loginRetryIntervalMs: 1, loginPostSubmitGraceMs: 0, loginPostSubmitTimeoutMs: 20 },
+    );
+    await session.start();
+    assert.equal(session.status, 'completed');
+    assert.equal(session.id, 'production-regression');
+    assert.equal(launchCount, 1, 'recovery must not launch a duplicate browser/session');
+    assert.equal(pages.length, 2, 'recovery may recreate the page within the existing session');
+  } finally {
+    chromium.launch = originalLaunch;
+  }
+});
+
+test('multiple transient login failures are retried until success', async () => {
+  const { session, pages } = loginSession(['transient', 'transient', 'transient', 'success']);
+  assert.equal(await session.login(), true);
+  assert.equal(pages.length, 4);
+});
+
+test('temporary navigation timeout is recoverable', async () => {
+  const { session } = loginSession(['navigation-timeout', 'success']);
+  assert.equal(await session.login(), true);
+});
+
+test('stopping while waiting for a login retry exits promptly', async () => {
+  const { session } = loginSession(['transient'], { loginRetryIntervalMs: 1000 });
+  const pending = session.login();
+  setTimeout(() => { session._stopped = true; }, 5);
+  assert.equal(await pending, false);
+});
+
+test('explicit server authentication rejection remains non-retryable and distinguishable', async () => {
+  const { session } = loginSession(['auth-rejected']);
+  await assert.rejects(session.login(), err => {
+    assert.equal(err.code, 'AUTHENTICATION_REJECTED');
+    assert.match(err.message, /Sai tên đăng nhập/);
+    return true;
+  });
+});
+
+test('generic alert-danger remains retryable when it does not describe authentication rejection', async () => {
+  const { session } = loginSession(['generic-alert', 'success']);
+  assert.equal(await session.login(), true);
+});
