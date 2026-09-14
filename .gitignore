@@ -16,6 +16,7 @@ firebase-service-account.json
 .env
 .DS_Store
 .claude/
+opencode.json
 treohoclythuyet_correctUI/
 web.assets_frontend_lazy.min_odoo.js
 web.assets_frontend_minimal.min_odoo.js

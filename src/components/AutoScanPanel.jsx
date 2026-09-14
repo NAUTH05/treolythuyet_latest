@@ -6,6 +6,7 @@ const AUTO_STATUS = {
   'logging-in': { text: 'Đang đăng nhập', badge: 'badge-logging-in' },
   scanning:     { text: 'Đang quét khóa học', badge: 'badge-running' },
   studying:     { text: 'Đang treo học', badge: 'badge-running' },
+  'surplus-study': { text: 'Đang học surplus', badge: 'badge-running' },
   paused:       { text: 'Tạm dừng', badge: 'badge-idle' },
   'date-limit': { text: 'Ngày nghỉ — đã hẹn lịch', badge: 'badge-logging-in' },
   'daily-limit':{ text: 'Đủ giờ hôm nay — đã hẹn lịch', badge: 'badge-logging-in' },
@@ -16,7 +17,7 @@ const AUTO_STATUS = {
   error:        { text: 'Lỗi', badge: 'badge-error' },
 };
 
-const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying']);
+const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying', 'surplus-study']);
 const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window', 'next-day']);
 const DONE_STATUSES = new Set(['completed', 'stopped', 'error']);
 
@@ -125,7 +126,7 @@ function AutoScanCard({ scan, toast }) {
         <span className="autoscan-card-name">{scan.account}</span>
         <div className="session-actions">
           <span className={`session-badge ${info.badge}`}>{info.text}</span>
-          {(scan.status === 'logging-in' || scan.status === 'scanning' || scan.status === 'studying') && (
+          {(scan.status === 'logging-in' || scan.status === 'scanning' || scan.status === 'studying' || scan.status === 'surplus-study') && (
             <button className="btn btn-sm btn-outline" onClick={handlePause}>Tạm dừng</button>
           )}
           {isPaused && (

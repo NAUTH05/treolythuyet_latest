@@ -246,6 +246,41 @@ async function scanCourseDetails(page, courseUrl) {
         actualStudiedText = `${h} giờ ${m} phút`;
       }
 
+      // Read course-level progress separately from lesson badges. These
+      // selectors target the course header/progress container so an
+      // individual lesson's 100% cannot pass the all-courses gate.
+      let courseProgressPercent = null;
+      let courseLevelCompleted = false;
+      const courseCompletedMarker = document.querySelector(
+        '[data-course-completed="true"], [data-course-completion="100"], .o_wslides_course_header .o_wslides_progress_bar[data-completed="true"]'
+      );
+      if (courseCompletedMarker) {
+        courseLevelCompleted = true;
+        courseProgressPercent = 100;
+      }
+      if (!courseLevelCompleted) {
+        const progressCandidates = Array.from(document.querySelectorAll(
+          '[data-course-progress], [data-course-completion], .o_wslides_course_header .o_wslides_progress_bar, .o_wslides_course_header [role="progressbar"], .o_wslides_course_main .o_wslides_progress_bar'
+        ));
+        for (const el of progressCandidates) {
+          const values = [
+            el.getAttribute('data-course-progress'),
+            el.getAttribute('data-course-completion'),
+            el.getAttribute('aria-valuenow'),
+            el.style && el.style.width,
+            el.textContent,
+          ];
+          for (const value of values) {
+            const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*%?/);
+            if (!match) continue;
+            const parsed = Number(match[1]);
+            if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) continue;
+            courseProgressPercent = Math.max(courseProgressPercent ?? 0, parsed);
+          }
+        }
+        courseLevelCompleted = courseProgressPercent != null && courseProgressPercent >= 100;
+      }
+
       // Extract all lesson items
       const lessonItems = [];
       const links = Array.from(document.querySelectorAll('a[href*="/slides/slide/"]'));
@@ -292,6 +327,8 @@ async function scanCourseDetails(page, courseUrl) {
 
       return {
         courseTitle,
+        courseProgressPercent,
+        courseLevelCompleted,
         actualStudiedMinutes,
         actualStudiedText,
         totalLessons: lessonItems.length,

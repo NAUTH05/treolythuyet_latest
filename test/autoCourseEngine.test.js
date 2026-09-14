@@ -615,3 +615,59 @@ test('generic alert-danger remains retryable when it does not describe authentic
   const { session } = loginSession(['generic-alert', 'success']);
   assert.equal(await session.login(), true);
 });
+
+test('surplus gate ignores local target completion without website course-level completion', () => {
+  const courses = [
+    { courseUrl: 'https://x/slides/course-1', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-2', targetMinutes: 1 },
+  ];
+  const session = new AutoCourseSession('gate', { name: 'Gate' }, courses);
+  session.courseProgress = {
+    [courses[0].courseUrl]: { completed: true, websiteCourseCompleted: true },
+    [courses[1].courseUrl]: { completed: true, websiteCourseCompleted: false },
+  };
+  assert.equal(session._allConfiguredCoursesCompleted(), true);
+  assert.equal(session._allConfiguredCoursesWebsiteCompleted(), false);
+});
+
+test('surplus target is generated once and remains within 15-60 minutes', () => {
+  const session = new AutoCourseSession('surplus-target', { name: 'Target' });
+  session._randomBetween = () => 37;
+  assert.equal(session._generateSurplusTargetOnce(), 37);
+  session._randomBetween = () => 15;
+  assert.equal(session._generateSurplusTargetOnce(), 37);
+  assert.equal(session.getStatus().surplusTargetMinutes, 37);
+});
+
+test('surplus initialization builds an eligible pool dynamically and preserves target', async () => {
+  const courses = [
+    { courseUrl: 'https://x/slides/course-1', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-2', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-3', targetMinutes: 1 },
+  ];
+  const session = new AutoCourseSession('surplus-init', { name: 'Init' }, courses);
+  session.context = {};
+  session._verifyAllConfiguredCoursesCompleted = async () => true;
+  session._scanCourseDetailsForCheckpoint = async (url) => ({
+    courseLevelCompleted: url !== courses[1].courseUrl,
+    courseTitle: url,
+    allLessons: url === courses[1].courseUrl ? [] : [{ title: 'Lesson', url: `${url}/lesson-1` }],
+  });
+  session.surplusTargetMinutes = 47;
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(session.surplusMode, true);
+  assert.deepEqual(session.surplusEligibleCourses, [courses[0].courseUrl, courses[2].courseUrl]);
+  assert.equal(session.surplusTargetMinutes, 47);
+});
+
+test('surplus initialization exhausts cleanly when all completed courses have no lessons', async () => {
+  const courseUrl = 'https://x/slides/course-1';
+  const session = new AutoCourseSession('surplus-empty', { name: 'Empty' }, [{ courseUrl }]);
+  session.context = {};
+  session._verifyAllConfiguredCoursesCompleted = async () => true;
+  session._scanCourseDetailsForCheckpoint = async () => ({ courseLevelCompleted: true, allLessons: [] });
+  assert.equal(await session._initializeSurplusMode(), false);
+  assert.equal(session.surplusExhausted, true);
+  assert.equal(session.surplusMode, false);
+  assert.equal(session.surplusTargetMinutes, null);
+});

@@ -1648,6 +1648,11 @@ function saveAutoScanState() {
         scheduledStartAt: s.options.scheduledStartAt || null,
         scheduledStartDate: s.options.scheduledStartDate || null,
         courseProgress: s.courseProgress,
+        surplusMode: s.surplusMode === true,
+        surplusTargetMinutes: s.surplusTargetMinutes ?? null,
+        surplusStudiedMinutes: s.surplusStudiedMinutes || 0,
+        surplusEligibleCourses: s.surplusEligibleCourses || [],
+        surplusExhausted: s.surplusExhausted === true,
         nextRunTime: s.nextRunTime || null,
         createdAt: s.createdAt || new Date().toISOString(),
         completedAt: s.completedAt || null,
@@ -1747,6 +1752,11 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     if (restoreState.dailyStudiedMinutes != null) autoSession.dailyStudiedMinutes = restoreState.dailyStudiedMinutes;
     if (restoreState.dailyDate) autoSession.dailyDate = restoreState.dailyDate;
     if (restoreState.courseProgress) autoSession.courseProgress = restoreState.courseProgress;
+    if (restoreState.surplusMode != null) autoSession.surplusMode = restoreState.surplusMode === true;
+    if (restoreState.surplusTargetMinutes != null) autoSession.surplusTargetMinutes = Math.max(15, Math.min(60, Number(restoreState.surplusTargetMinutes)));
+    if (restoreState.surplusStudiedMinutes != null) autoSession.surplusStudiedMinutes = Math.max(0, Number(restoreState.surplusStudiedMinutes) || 0);
+    if (Array.isArray(restoreState.surplusEligibleCourses)) autoSession.surplusEligibleCourses = [...new Set(restoreState.surplusEligibleCourses)];
+    if (restoreState.surplusExhausted != null) autoSession.surplusExhausted = restoreState.surplusExhausted === true;
     if (restoreState.scheduledStartAt) autoSession.options.scheduledStartAt = restoreState.scheduledStartAt;
     if (restoreState.scheduledStartDate) autoSession.options.scheduledStartDate = restoreState.scheduledStartDate;
   }
@@ -1844,6 +1854,11 @@ function restartAutoScanSession(sessionId) {
     dailyStudiedMinutes: old.dailyStudiedMinutes,
     dailyDate: old.dailyDate, // engine tự reset bộ đếm khi thấy sang ngày mới
     courseProgress: old.courseProgress,
+    surplusMode: old.surplusMode,
+    surplusTargetMinutes: old.surplusTargetMinutes,
+    surplusStudiedMinutes: old.surplusStudiedMinutes,
+    surplusEligibleCourses: old.surplusEligibleCourses,
+    surplusExhausted: old.surplusExhausted,
   });
 
   addLog({
@@ -1871,6 +1886,11 @@ async function loadAndRestoreAutoScans() {
       dailyStudiedMinutes: saved.dailyStudiedMinutes || 0,
       dailyDate: saved.dailyDate,
       courseProgress: saved.courseProgress || {},
+      surplusMode: saved.surplusMode === true,
+      surplusTargetMinutes: saved.surplusTargetMinutes,
+      surplusStudiedMinutes: saved.surplusStudiedMinutes || 0,
+      surplusEligibleCourses: saved.surplusEligibleCourses || [],
+      surplusExhausted: saved.surplusExhausted === true,
       scheduledStartAt: saved.scheduledStartAt || saved.options?.scheduledStartAt || null,
       scheduledStartDate: saved.scheduledStartDate || saved.options?.scheduledStartDate || null,
     });
@@ -1888,7 +1908,7 @@ async function loadAndRestoreAutoScans() {
         level: 'info',
       });
       active++;
-    } else if (saved.status === 'idle' || saved.status === 'logging-in' || saved.status === 'scanning' || saved.status === 'studying') {
+    } else if (saved.status === 'idle' || saved.status === 'logging-in' || saved.status === 'scanning' || saved.status === 'studying' || saved.status === 'surplus-study') {
       logHistory.push({
         timestamp: formatVN(new Date()),
         account: saved.account.name,
@@ -2141,6 +2161,11 @@ app.post('/api/auto-scan/resume/:id', async (req, res) => {
       dailyStudiedMinutes: autoSession.dailyStudiedMinutes,
       dailyDate: autoSession.dailyDate,
       courseProgress: autoSession.courseProgress,
+      surplusMode: autoSession.surplusMode,
+      surplusTargetMinutes: autoSession.surplusTargetMinutes,
+      surplusStudiedMinutes: autoSession.surplusStudiedMinutes,
+      surplusEligibleCourses: autoSession.surplusEligibleCourses,
+      surplusExhausted: autoSession.surplusExhausted,
     });
     addLog({
       timestamp: formatVN(new Date()),
