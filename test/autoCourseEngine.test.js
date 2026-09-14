@@ -671,3 +671,166 @@ test('surplus initialization exhausts cleanly when all completed courses have no
   assert.equal(session.surplusMode, false);
   assert.equal(session.surplusTargetMinutes, null);
 });
+
+// ── Surplus hardening: mục tiêu RNG chỉ là mức mong muốn TỐI ĐA ──
+
+function makeSurplusStudySession({ id, courses, lessonsByCourse, lessonMinutesByUrl = new Map(), failingLessonUrls = [] }) {
+  const session = new AutoCourseSession(id, { name: id }, courses);
+  session.context = {};
+  const gotoCounts = new Map();
+  const studyCallsMs = [];
+  let currentUrl = 'about:blank';
+
+  session._verifyAllConfiguredCoursesCompleted = async () => true;
+  // Checkpoint rescan luôn trả về ĐẦY ĐỦ danh sách bài — buộc engine phải tự
+  // lọc bớt bài đã học/bỏ được, nếu không sẽ treo lặp cùng một bài.
+  session._scanCourseDetailsForCheckpoint = async (url) => ({
+    courseLevelCompleted: true,
+    courseTitle: url,
+    allLessons: (lessonsByCourse.get(url) || []).map(lesson => ({ ...lesson })),
+  });
+  session._fakeVisibilityAPI = async () => {};
+  session._waitForActiveStudyTime = async (ms) => {
+    studyCallsMs.push(ms);
+    return ms;
+  };
+  session._randomBetween = (min) => min;
+  session.page = {
+    url: () => currentUrl,
+    goto: async (url) => {
+      gotoCounts.set(url, (gotoCounts.get(url) || 0) + 1);
+      if (failingLessonUrls.includes(url)) {
+        currentUrl = 'about:blank';
+        throw new Error('net::ERR_CONNECTION_REFUSED');
+      }
+      currentUrl = url;
+    },
+    waitForTimeout: async () => {},
+    reload: async () => {},
+    evaluate: async () => {
+      const minutes = lessonMinutesByUrl.get(currentUrl);
+      return minutes != null
+        ? { hours: 0, minutes, seconds: 0, totalMinutes: minutes, source: 'test' }
+        : null;
+    },
+  };
+
+  return { session, gotoCounts, studyCallsMs };
+}
+
+test('surplus exhaustion keeps real studied minutes, never reopens lessons, never shrinks the target', async () => {
+  const courses = [
+    { courseUrl: 'https://x/slides/course-a', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-b', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-c', targetMinutes: 1 },
+  ];
+  const lessonsByCourse = new Map([
+    [courses[0].courseUrl, [{ title: 'A1', url: 'https://x/slides/slide/course-a/lesson-a1-101' }]],
+    [courses[1].courseUrl, [{ title: 'B1', url: 'https://x/slides/slide/course-b/lesson-b1-201' }]],
+    [courses[2].courseUrl, [{ title: 'C1', url: 'https://x/slides/slide/course-c/lesson-c1-301' }]],
+  ]);
+  const lessonMinutesByUrl = new Map([
+    ['https://x/slides/slide/course-a/lesson-a1-101', 10],
+    ['https://x/slides/slide/course-b/lesson-b1-201', 8],
+    ['https://x/slides/slide/course-c/lesson-c1-301', 13],
+  ]);
+  const { session, gotoCounts } = makeSurplusStudySession({ id: 'surplus-exhaust', courses, lessonsByCourse, lessonMinutesByUrl });
+  session.surplusTargetMinutes = 52;
+
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(await session._runSurplusStudy(), false);
+
+  assert.equal(session.surplusExhausted, true, 'no studyable lessons remain → exhausted');
+  assert.equal(session.surplusMode, false);
+  assert.equal(session.surplusStudiedMinutes, 31, 'keeps the real 31 studied minutes — never reports 52/52');
+  assert.equal(session.surplusTargetMinutes, 52, 'the RNG target is never regenerated or shrunk');
+  for (const [url] of lessonMinutesByUrl) {
+    assert.equal(gotoCounts.get(url), 1, `lesson ${url} must be opened exactly once`);
+  }
+  assert.equal(await session._finalizeSurplusCompletion(), true, 'exhaustion completes exactly like reaching the target');
+  assert.equal(session.surplusMode, false);
+});
+
+test('surplus stops exactly at the RNG target without finishing the current lesson', async () => {
+  const courses = [
+    { courseUrl: 'https://x/slides/course-a', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-b', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-c', targetMinutes: 1 },
+  ];
+  const lessonsByCourse = new Map([
+    [courses[0].courseUrl, [{ title: 'A1', url: 'https://x/slides/slide/course-a/lesson-a1-101' }]],
+    [courses[1].courseUrl, [{ title: 'B1', url: 'https://x/slides/slide/course-b/lesson-b1-201' }]],
+    [courses[2].courseUrl, [{ title: 'C1', url: 'https://x/slides/slide/course-c/lesson-c1-301' }]],
+  ]);
+  const lessonMinutesByUrl = new Map([
+    ['https://x/slides/slide/course-a/lesson-a1-101', 25],
+    ['https://x/slides/slide/course-b/lesson-b1-201', 20],
+    ['https://x/slides/slide/course-c/lesson-c1-301', 30],
+  ]);
+  const { session, gotoCounts, studyCallsMs } = makeSurplusStudySession({ id: 'surplus-exact-stop', courses, lessonsByCourse, lessonMinutesByUrl });
+  session.surplusTargetMinutes = 50;
+
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(await session._runSurplusStudy(), true);
+
+  assert.equal(session.surplusStudiedMinutes, 50, 'studies exactly 25 + 20 + 5 = 50 minutes');
+  assert.equal(session.surplusExhausted, false, 'enough lesson time exists → no exhaustion');
+  assert.equal(session.surplusMode, false);
+  assert.deepEqual(
+    studyCallsMs,
+    [25 * 60 * 1000, 20 * 60 * 1000, 5 * 60 * 1000],
+    'the last lesson is studied for only the 5 remaining minutes, not its full 30'
+  );
+  for (const [url] of lessonMinutesByUrl) {
+    assert.equal(gotoCounts.get(url), 1, `lesson ${url} must be opened exactly once`);
+  }
+  assert.equal(await session._finalizeSurplusCompletion(), true);
+});
+
+test('surplus lessons that cannot open are marked unusable once and exhaust cleanly', async () => {
+  const courseUrl = 'https://x/slides/course-a';
+  const url1 = 'https://x/slides/slide/course-a/lesson-a1-101';
+  const url2 = 'https://x/slides/slide/course-a/lesson-a2-102';
+  const { session, gotoCounts } = makeSurplusStudySession({
+    id: 'surplus-unusable',
+    courses: [{ courseUrl, targetMinutes: 1 }],
+    lessonsByCourse: new Map([[courseUrl, [{ title: 'A1', url: url1 }, { title: 'A2', url: url2 }]]]),
+    failingLessonUrls: [url1, url2],
+  });
+  session.surplusTargetMinutes = 20;
+
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(await session._runSurplusStudy(), false);
+
+  assert.equal(session.surplusExhausted, true);
+  assert.equal(session.surplusMode, false);
+  assert.equal(session.surplusStudiedMinutes, 0, 'nothing was studyable — real number stays 0');
+  assert.equal(session.surplusTargetMinutes, 20);
+  assert.equal(session._surplusUnusableLessons.size, 2);
+  assert.equal(gotoCounts.get(url1), 1, 'an unusable lesson must never be retried');
+  assert.equal(gotoCounts.get(url2), 1, 'an unusable lesson must never be retried');
+  assert.equal(await session._finalizeSurplusCompletion(), true);
+});
+
+test('exhausted surplus defers completion on failed verification without re-entering surplus', async () => {
+  const session = new AutoCourseSession('surplus-defer-exhausted', { name: 'Defer' });
+  session.surplusTargetMinutes = 40;
+  session.surplusStudiedMinutes = 31;
+  session.surplusExhausted = true;
+  session.surplusMode = false;
+  session._verifyAllConfiguredCoursesCompleted = async () => false;
+
+  assert.equal(await session._finalizeSurplusCompletion(), false);
+  assert.equal(session.surplusMode, false, 'an exhausted session must not re-enter surplus mode');
+  assert.equal(session.surplusStudiedMinutes, 31, 'real studied minutes survive the deferral');
+});
+
+test('target-reached surplus defers completion by re-arming surplus mode', async () => {
+  const session = new AutoCourseSession('surplus-defer-target', { name: 'Defer' });
+  session.surplusTargetMinutes = 40;
+  session.surplusStudiedMinutes = 40;
+  session._verifyAllConfiguredCoursesCompleted = async () => false;
+
+  assert.equal(await session._finalizeSurplusCompletion(), false);
+  assert.equal(session.surplusMode, true);
+});

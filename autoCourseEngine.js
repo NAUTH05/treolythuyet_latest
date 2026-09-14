@@ -199,6 +199,9 @@ class AutoCourseSession extends EventEmitter {
       : [];
     this.surplusExhausted = options.surplusExhausted === true;
     this._surplusUnusableLessons = new Set();
+    // Bài đã học xong trong surplus phase này — không được mở lại trong cùng
+    // phase (chống treo lặp cùng một bài để "gấp" đủ phút mục tiêu).
+    this._surplusStudiedLessons = new Set();
     this._stopped = false;
     this._phase = PHASE_NEW;
     this._stealthTimer = null;
@@ -428,7 +431,9 @@ class AutoCourseSession extends EventEmitter {
       try { result = await this._scanCourseDetailsForCheckpoint(config.courseUrl, true); } catch { /* handled below */ }
       if (!result || result.courseLevelCompleted !== true) continue;
       const lessons = Array.isArray(result.allLessons)
-        ? result.allLessons.filter(lesson => lesson && lesson.url && !this._surplusUnusableLessons.has(`${config.courseUrl}|${lesson.url}`))
+        ? result.allLessons.filter(lesson => lesson && lesson.url
+          && !this._surplusUnusableLessons.has(`${config.courseUrl}|${lesson.url}`)
+          && !this._surplusStudiedLessons.has(`${config.courseUrl}|${lesson.url}`))
         : [];
       if (lessons.length === 0) continue;
       eligible.push({ courseUrl: config.courseUrl, title: result.courseTitle || config.courseUrl, lessons });
@@ -462,7 +467,9 @@ class AutoCourseSession extends EventEmitter {
     let result = null;
     try { result = await this._scanCourseDetailsForCheckpoint(courseUrl, true); } catch { /* retry next lesson */ }
     if (result && Array.isArray(result.allLessons)) {
-      const lessons = result.allLessons.filter(lesson => lesson && lesson.url && !this._surplusUnusableLessons.has(`${courseUrl}|${lesson.url}`));
+      const lessons = result.allLessons.filter(lesson => lesson && lesson.url
+        && !this._surplusUnusableLessons.has(`${courseUrl}|${lesson.url}`)
+        && !this._surplusStudiedLessons.has(`${courseUrl}|${lesson.url}`));
       if (lessons.length > 0) this._surplusLessonPools.set(courseUrl, lessons);
       else this._surplusLessonPools.delete(courseUrl);
     }
@@ -485,9 +492,17 @@ class AutoCourseSession extends EventEmitter {
 
       const available = this.surplusEligibleCourses.filter(url => (this._surplusLessonPools.get(url) || []).length > 0);
       if (available.length === 0) {
+        // Mục tiêu surplus chỉ là mức mong muốn TỐI ĐA. Khi website không còn
+        // bài học được nữa thì kết thúc bằng kiệt khẩu (exhaustion): giữ nguyên
+        // số phút thực đã học, không regenerate mục tiêu, không reset tiến độ.
         this.surplusExhausted = true;
         this.surplusMode = false;
-        this.log('⚠️ No eligible surplus lessons remain; ending surplus phase cleanly', 'warn');
+        this.log('⚠️ Surplus target cannot be fully satisfied', 'warn');
+        this.log(`🎲 Surplus target: ${this.surplusTargetMinutes} minutes`, 'warn');
+        this.log(`📚 Surplus actually studied: ${Math.round(this.surplusStudiedMinutes)} minutes`, 'warn');
+        this.log('🚫 No eligible studyable lessons remain', 'warn');
+        this.log('✅ Ending surplus phase due to exhaustion', 'success');
+        this.emit('status', this.getStatus());
         return false;
       }
       const courseUrl = available[this._randomBetween(0, available.length - 1)];
@@ -519,9 +534,15 @@ class AutoCourseSession extends EventEmitter {
       const studyMs = Math.min(lessonMinutes * 60000, remainingSurplusMs, dailyRemainingMs);
       const activeMs = await this._waitForActiveStudyTime(studyMs);
       const studiedMinutes = activeMs / 60000;
-      this.surplusStudiedMinutes = Math.min(this.surplusTargetMinutes, this.surplusStudiedMinutes + studiedMinutes);
+      // Giữ NGUYÊN số phút thực — không kẹp về mục tiêu, không làm tròn lên.
+      this.surplusStudiedMinutes += studiedMinutes;
       this.dailyStudiedMinutes += studiedMinutes;
       this.log(`Surplus study: ${Math.round(this.surplusStudiedMinutes)}/${this.surplusTargetMinutes} minutes`, 'info');
+      // Tiêu thụ bài vừa học: bài này không được mở lại trong surplus phase
+      // hiện tại (kể cả sau khi checkpoint rescan trả về full danh sách bài).
+      this._surplusStudiedLessons.add(`${courseUrl}|${lesson.url}`);
+      lessons.splice(lessonIndex, 1);
+      if (lessons.length === 0) this.surplusEligibleCourses = this.surplusEligibleCourses.filter(url => url !== courseUrl);
       await this._checkpointSurplusCourse(courseUrl);
       if (this.surplusStudiedMinutes >= this.surplusTargetMinutes) {
         this.log('✅ Surplus target completed', 'success');
@@ -534,11 +555,18 @@ class AutoCourseSession extends EventEmitter {
   }
 
   async _finalizeSurplusCompletion() {
-    if (this.surplusStudiedMinutes < this.surplusTargetMinutes) return false;
+    // Mục tiêu surplus là mức mong muốn tối đa: coi như hoàn thành khi đã đạt
+    // mục tiêu RNG HOẶC khi website không còn bài học được (exhaustion).
+    const targetReached = this.surplusTargetMinutes != null
+      && this.surplusStudiedMinutes >= this.surplusTargetMinutes;
+    const exhausted = this.surplusExhausted === true;
+    if (!targetReached && !exhausted) return false;
     const verified = await this._verifyAllConfiguredCoursesCompleted();
     if (!verified) {
-      this.surplusMode = true;
-      this.log('⚠️ Surplus time reached, but final all-course verification failed; deferring completion', 'warn');
+      // Chỉ hẹn lại surplus mode khi chưa kiệt khẩu — phiên exhausted không
+      // được quay lại học surplus nữa (đã không còn bài để học).
+      if (!exhausted) this.surplusMode = true;
+      this.log('⚠️ Surplus phase ended, but final all-course verification failed; deferring completion', 'warn');
       return false;
     }
     this.surplusMode = false;
@@ -1201,7 +1229,7 @@ class AutoCourseSession extends EventEmitter {
         if (await this._initializeSurplusMode()) {
           surplusHandled = true;
           await this._runSurplusStudy();
-        } else {
+        } else if (!this.surplusExhausted) {
           this.surplusMode = false;
           this.log('⚠️ Restored surplus state failed the all-course 100% verification; returning to normal course mode', 'warn');
         }
@@ -1848,7 +1876,10 @@ class AutoCourseSession extends EventEmitter {
         }
         if (allWebsiteCoursesCompleted && this.surplusExhausted) {
           this._setStatus('completed');
-          this.log('⚠️ Surplus phase exhausted because no usable lessons remain', 'warn');
+          const surplusSummary = this.surplusTargetMinutes != null
+            ? `${Math.round(this.surplusStudiedMinutes)}/${this.surplusTargetMinutes} target minutes`
+            : `${Math.round(this.surplusStudiedMinutes)} minutes`;
+          this.log(`⚠️ Surplus phase exhausted (${surplusSummary} — no eligible studyable lessons remain)`, 'warn');
           this.log('✅ Account fully completed', 'success');
           this.log('➡️ Moving account to complete queue', 'success');
           this.emit('status', this.getStatus());
