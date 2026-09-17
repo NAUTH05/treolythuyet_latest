@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const { BotSession } = require('./bot');
 const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES } = require('./autoCourseEngine');
 const { AutoCourseRegistry } = require('./autoCourseRegistry');
+const { isStaleScheduledSession, restartScheduledSession, applyAutoScanRestoreState } = require('./autoScanRecovery');
 const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
@@ -1748,18 +1749,7 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
   autoSession.createdAt = (restoreState && restoreState.createdAt) || new Date().toISOString();
   autoSession.completedAt = null;
   autoSession.nextRunTime = null;
-  if (restoreState) {
-    if (restoreState.dailyStudiedMinutes != null) autoSession.dailyStudiedMinutes = restoreState.dailyStudiedMinutes;
-    if (restoreState.dailyDate) autoSession.dailyDate = restoreState.dailyDate;
-    if (restoreState.courseProgress) autoSession.courseProgress = restoreState.courseProgress;
-    if (restoreState.surplusMode != null) autoSession.surplusMode = restoreState.surplusMode === true;
-    if (restoreState.surplusTargetMinutes != null) autoSession.surplusTargetMinutes = Math.max(15, Math.min(60, Number(restoreState.surplusTargetMinutes)));
-    if (restoreState.surplusStudiedMinutes != null) autoSession.surplusStudiedMinutes = Math.max(0, Number(restoreState.surplusStudiedMinutes) || 0);
-    if (Array.isArray(restoreState.surplusEligibleCourses)) autoSession.surplusEligibleCourses = [...new Set(restoreState.surplusEligibleCourses)];
-    if (restoreState.surplusExhausted != null) autoSession.surplusExhausted = restoreState.surplusExhausted === true;
-    if (restoreState.scheduledStartAt) autoSession.options.scheduledStartAt = restoreState.scheduledStartAt;
-    if (restoreState.scheduledStartDate) autoSession.options.scheduledStartDate = restoreState.scheduledStartDate;
-  }
+  applyAutoScanRestoreState(autoSession, restoreState || {});
 
   autoSession.on('log', (entry) => addLog(entry));
   autoSession.on('status', (status) => {
@@ -1839,27 +1829,30 @@ function scheduleAutoScanResume(autoSession) {
 function restartAutoScanSession(sessionId) {
   const old = autoScanRegistry.get(sessionId);
   if (!old) return;
-  // Chỉ được restart từ một trạng thái đang hẹn giờ. 'stopped'/'completed'/'error'
-  // là kết thúc: không bao giờ tự chạy lại (chống "chạy tiếp sau khi đã Dừng").
-  if (!AUTO_SCHEDULED_STATUSES.has(old.status)) {
-    console.log(`[AUTOSCAN] bỏ qua restart | session=${sessionId} | status=${old.status} (không phải trạng thái hẹn giờ)`);
+  // restartScheduledSession() dọn timer cũ, chốt điều kiện (chỉ từ trạng thái hẹn
+  // giờ, không từ phiên đã Dừng/đang chạy) rồi tạo ĐÚNG MỘT phiên mới. Đối tượng
+  // phiên cũ không bao giờ được gọi start() lại.
+  const fresh = restartScheduledSession(autoScanRegistry, sessionId, {
+    createFreshSession: (previous) => createAutoScanSession(sessionId, previous.account, previous.coursesConfig, {
+      headless: true,
+      ...getPersistentAutoCourseOptions(previous.options),
+    }, {
+      createdAt: previous.createdAt,
+      dailyStudiedMinutes: previous.dailyStudiedMinutes,
+      dailyDate: previous.dailyDate, // engine tự reset bộ đếm khi thấy sang ngày mới
+      courseProgress: previous.courseProgress,
+      surplusMode: previous.surplusMode,
+      surplusTargetMinutes: previous.surplusTargetMinutes,
+      surplusStudiedMinutes: previous.surplusStudiedMinutes,
+      surplusEligibleCourses: previous.surplusEligibleCourses,
+      surplusExhausted: previous.surplusExhausted,
+    }),
+    startSession: (session) => startAutoScanWhenFree(session, 'hẹn-giờ'),
+  });
+  if (!fresh) {
+    console.log(`[AUTOSCAN] bỏ qua restart | session=${sessionId} | status=${old.status} | phase=${old._phase}`);
     return;
   }
-
-  const fresh = createAutoScanSession(sessionId, old.account, old.coursesConfig, {
-    headless: true,
-    ...getPersistentAutoCourseOptions(old.options),
-  }, {
-    createdAt: old.createdAt,
-    dailyStudiedMinutes: old.dailyStudiedMinutes,
-    dailyDate: old.dailyDate, // engine tự reset bộ đếm khi thấy sang ngày mới
-    courseProgress: old.courseProgress,
-    surplusMode: old.surplusMode,
-    surplusTargetMinutes: old.surplusTargetMinutes,
-    surplusStudiedMinutes: old.surplusStudiedMinutes,
-    surplusEligibleCourses: old.surplusEligibleCourses,
-    surplusExhausted: old.surplusExhausted,
-  });
 
   addLog({
     timestamp: formatVN(new Date()),
@@ -1867,9 +1860,34 @@ function restartAutoScanSession(sessionId) {
     msg: `▶️ Đến giờ hẹn — khởi động lại Auto-Scan cho ${old.account.name}`,
     level: 'info',
   });
-  startAutoScanWhenFree(fresh, 'hẹn-giờ');
   saveAutoScanState();
 }
+
+// Tự khôi phục lịch hẹn bị "mắc kẹt": phiên ở trạng thái hẹn giờ, đã quá
+// nextRunTime, KHÔNG còn phiên sống nào giữ tài khoản, và người dùng không bấm
+// Dừng. Trường hợp này xảy ra khi timer thất lạc (restore lỗi, event-loop nghẽn,
+// hoặc bản build cũ để lại phiên hẹn giờ mồ côi) → tạo ĐÚNG MỘT phiên mới.
+function recoverStaleAutoScanSchedules(now = Date.now()) {
+  for (const [id, session] of autoScanRegistry.entries()) {
+    const hasLiveOwner = Boolean(findAccountConflict(session.account.email, session));
+    if (!isStaleScheduledSession(session, { now, hasLiveOwner })) continue;
+    console.log(`[AUTOSCAN] stale schedule recovery | session=${id} | account=${session.account.name} | status=${session.status} | nextRunTime=${session.nextRunTime}`);
+    addLog({
+      timestamp: formatVN(new Date()),
+      account: session.account.name,
+      msg: `♻️ Phát hiện lịch Auto-Scan quá hạn không có phiên chạy — tự khôi phục`,
+      level: 'warn',
+    });
+    autoScanRegistry.clearTimer(id);
+    restartAutoScanSession(id);
+  }
+}
+
+// Quét định kỳ lịch hẹn mắc kẹt (timer thất lạc hoặc không bao giờ nổ).
+const STALE_SCHEDULE_CHECK_MS = 60 * 1000;
+setInterval(() => {
+  try { recoverStaleAutoScanSchedules(); } catch (e) { console.error('[AUTOSCAN] Lỗi khôi phục lịch mắc kẹt:', e.message); }
+}, STALE_SCHEDULE_CHECK_MS);
 
 // Khôi phục các phiên Auto-Scan từ lần chạy trước (nếu server bị restart hoặc từ Firebase)
 async function loadAndRestoreAutoScans() {

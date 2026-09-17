@@ -238,6 +238,38 @@ class AutoCourseSession extends EventEmitter {
     return this._phase === PHASE_RUNNING || this.status === 'paused';
   }
 
+  // Chốt "được phép tiếp tục" cho MỌI điểm nối async. Một callback đến muộn chỉ
+  // được phép chạm state/khoá học nếu:
+  //   - phiên chưa bị chốt kết thúc (_phase !== finished)
+  //   - chưa bị người dùng/hệ thống dừng (_stopped)
+  //   - CHƯA rơi vào bất kỳ trạng thái hẹn giờ nào (daily-limit / date-limit /
+  //     time-window / next-day) — đây là bất biến của ff02e8c
+  //   - không ở trạng thái kết thúc (completed / stopped / error)
+  //   - đúng thế hệ khoá học/run đang chạy (chống callback của run cũ)
+  // `courseRunId === undefined` dùng cho các tác vụ không gắn với một khóa cụ thể.
+  _isRunActive(courseRunId = undefined) {
+    if (this._phase !== PHASE_RUNNING) return false;
+    if (this._stopped) return false;
+    if (SCHEDULED_STATUSES.has(this.status)) return false;
+    if (TERMINAL_STATUSES.has(this.status)) return false;
+    if (courseRunId !== undefined && courseRunId !== null && this._activeCourseRunId !== courseRunId) {
+      return false;
+    }
+    return true;
+  }
+
+  // Chuyển phiên sang trạng thái hẹn giờ một cách NGUYÊN TỬ: đặt status, chốt vòng
+  // đời finished, vô hiệu thế hệ run hiện tại. Từ thời điểm này mọi callback async
+  // còn treo sẽ bị _isRunActive() từ chối → không thể ghi đè status hay học tiếp.
+  _enterScheduledStatus(status) {
+    if (!SCHEDULED_STATUSES.has(status)) return false;
+    if (!this._setStatus(status)) return false;
+    this._activeCourseRunId = null;
+    this._courseRunGeneration += 1;
+    this._finishPhase();
+    return true;
+  }
+
   // Chuyển trạng thái làm việc (logging-in / scanning / studying).
   // Không được ghi đè 'paused': người dùng đã bấm Tạm dừng thì phiên phải ở
   // 'paused' cho tới khi resume(), chỉ cập nhật trạng thái sẽ quay về sau đó.
@@ -331,11 +363,17 @@ class AutoCourseSession extends EventEmitter {
     return -2;
   }
 
+  // Phát hiện (thuần, không side effect) — ngoài khung giờ học tổng quát?
+  _isOutsideTimeWindow() {
+    if ((this.options.timeWindows || []).length === 0) return false;
+    return this._msRemainingInWindow() === -2;
+  }
+
   // Nếu ngoài khung giờ học → chuyển trạng thái 'time-window' để server hẹn giờ chạy lại.
   // Trả về true nếu đã kích hoạt time-window (caller phải return/thoát).
   _hitTimeWindowLimit() {
-    if (this._msRemainingInWindow() !== -2) return false;
-    this._setStatus('time-window');
+    if (!this._isOutsideTimeWindow()) return false;
+    this._enterScheduledStatus('time-window');
     this.log(`⏰ Ngoài khung giờ học cho phép — tạm nghỉ, hẹn giờ tự chạy lại vào khung giờ tiếp theo`, 'warn');
     this.emit('status', this.getStatus());
     return true;
@@ -366,7 +404,7 @@ class AutoCourseSession extends EventEmitter {
   _hitDailyLimit() {
     this._rolloverDailyCounter();
     if (this.dailyStudiedMinutes < this.options.dailyMaxMinutes) return false;
-    this._setStatus('daily-limit');
+    this._enterScheduledStatus('daily-limit');
     this.log(`🛑 Đã đạt giới hạn học tối đa trong ngày (${this._formatMinutes(this.options.dailyMaxMinutes)}) → Hẹn ${this.options.newDayStartTime || '06:00'} sáng ngày học tiếp theo tiếp tục!`, 'warn');
     this.emit('status', this.getStatus());
     return true;
@@ -374,6 +412,16 @@ class AutoCourseSession extends EventEmitter {
 
   _hitSchedulingLimit() {
     return this._hitDailyLimit() || this._hitTimeShiftLimit() || this._hitTimeWindowLimit();
+  }
+
+  // Xem trước giới hạn lịch mà KHÔNG đổi trạng thái. Dùng để caller kịp lưu tiến
+  // độ (F5 để Odoo chốt checkpoint) TRƯỚC khi phiên chốt sang trạng thái hẹn giờ.
+  _peekSchedulingLimit() {
+    this._rolloverDailyCounter();
+    if (this.dailyStudiedMinutes >= this.options.dailyMaxMinutes) return 'daily-limit';
+    if (this._isOutsideTimeShift()) return 'date-limit';
+    if (this._isOutsideTimeWindow()) return 'time-window';
+    return null;
   }
 
   _allConfiguredCoursesCompleted() {
@@ -388,13 +436,17 @@ class AutoCourseSession extends EventEmitter {
 
   async _verifyAllConfiguredCoursesCompleted() {
     if (!this.context || this.coursesConfig.length === 0) return false;
+    if (!this._isRunActive()) return false;
     for (const config of this.coursesConfig) {
+      if (!this._isRunActive()) return false;
       let result = null;
       try {
         result = await this._scanCourseDetailsForCheckpoint(config.courseUrl, true);
       } catch (err) {
         this.log(`⚠️ Không thể xác minh trạng thái cấp khóa [${config.courseUrl}]: ${String(err.message).split('\n')[0]}`, 'warn');
       }
+      // I/O vừa xong có thể đã bị vượt qua bởi trạng thái hẹn giờ / dừng / đổi run.
+      if (!this._isRunActive()) return false;
       const websiteCompleted = Boolean(result && result.courseLevelCompleted === true);
       const existing = this.courseProgress[config.courseUrl] || {};
       this.courseProgress[config.courseUrl] = {
@@ -423,12 +475,16 @@ class AutoCourseSession extends EventEmitter {
   async _initializeSurplusMode() {
     if (this.surplusExhausted) return false;
     if (this.surplusMode && this._surplusLessonPools && this._surplusLessonPools.size > 0) return true;
+    if (!this._isRunActive()) return false;
     if (!(await this._verifyAllConfiguredCoursesCompleted())) return false;
+    if (!this._isRunActive()) return false;
 
     const eligible = [];
     for (const config of this.coursesConfig) {
+      if (!this._isRunActive()) return false;
       let result = null;
       try { result = await this._scanCourseDetailsForCheckpoint(config.courseUrl, true); } catch { /* handled below */ }
+      if (!this._isRunActive()) return false;
       if (!result || result.courseLevelCompleted !== true) continue;
       const lessons = Array.isArray(result.allLessons)
         ? result.allLessons.filter(lesson => lesson && lesson.url
@@ -457,6 +513,7 @@ class AutoCourseSession extends EventEmitter {
 
   async _checkpointSurplusCourse(courseUrl) {
     if (!this.page || this._stopped) return null;
+    if (!this._isRunActive()) return null;
     try {
       await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
       await this._fakeVisibilityAPI();
@@ -464,8 +521,10 @@ class AutoCourseSession extends EventEmitter {
     } catch (err) {
       this.log(`⚠️ Surplus checkpoint refresh failed: ${String(err.message).split('\n')[0]}`, 'warn');
     }
+    if (!this._isRunActive()) return null;
     let result = null;
     try { result = await this._scanCourseDetailsForCheckpoint(courseUrl, true); } catch { /* retry next lesson */ }
+    if (!this._isRunActive()) return null;
     if (result && Array.isArray(result.allLessons)) {
       const lessons = result.allLessons.filter(lesson => lesson && lesson.url
         && !this._surplusUnusableLessons.has(`${courseUrl}|${lesson.url}`)
@@ -483,8 +542,9 @@ class AutoCourseSession extends EventEmitter {
     this._setStatus('surplus-study');
     this.emit('status', this.getStatus());
     this._surplusLessonPools = this._surplusLessonPools || new Map();
-    while (!this._stopped && this.surplusStudiedMinutes < this._generateSurplusTargetOnce()) {
+    while (!this._stopped && this._isRunActive() && this.surplusStudiedMinutes < this._generateSurplusTargetOnce()) {
       await this._checkPaused();
+      if (!this._isRunActive()) return false;
       if (this._hitSchedulingLimit()) return false;
       this._rolloverDailyCounter();
       const dailyRemainingMs = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes) * 60000;
@@ -518,6 +578,8 @@ class AutoCourseSession extends EventEmitter {
       } catch (err) {
         this.log(`⚠️ Surplus lesson unavailable [${lesson.title || lesson.url}]: ${String(err.message).split('\n')[0]}`, 'warn');
       }
+      // Mở bài là I/O dài — phiên có thể đã hẹn giờ/kết thúc trong lúc chờ.
+      if (!this._isRunActive()) return false;
       if (!opened) {
         this._surplusUnusableLessons.add(`${courseUrl}|${lesson.url}`);
         lessons.splice(lessonIndex, 1);
@@ -533,6 +595,8 @@ class AutoCourseSession extends EventEmitter {
       const remainingSurplusMs = Math.max(0, this.surplusTargetMinutes - this.surplusStudiedMinutes) * 60000;
       const studyMs = Math.min(lessonMinutes * 60000, remainingSurplusMs, dailyRemainingMs);
       const activeMs = await this._waitForActiveStudyTime(studyMs);
+      // Vứt bỏ kết quả nếu phiên đã hẹn giờ/dừng/đổi run trong lúc treo.
+      if (!this._isRunActive()) return false;
       const studiedMinutes = activeMs / 60000;
       // Giữ NGUYÊN số phút thực — không kẹp về mục tiêu, không làm tròn lên.
       this.surplusStudiedMinutes += studiedMinutes;
@@ -544,6 +608,7 @@ class AutoCourseSession extends EventEmitter {
       lessons.splice(lessonIndex, 1);
       if (lessons.length === 0) this.surplusEligibleCourses = this.surplusEligibleCourses.filter(url => url !== courseUrl);
       await this._checkpointSurplusCourse(courseUrl);
+      if (!this._isRunActive()) return false;
       if (this.surplusStudiedMinutes >= this.surplusTargetMinutes) {
         this.log('✅ Surplus target completed', 'success');
         this.surplusMode = false;
@@ -561,7 +626,9 @@ class AutoCourseSession extends EventEmitter {
       && this.surplusStudiedMinutes >= this.surplusTargetMinutes;
     const exhausted = this.surplusExhausted === true;
     if (!targetReached && !exhausted) return false;
+    if (!this._isRunActive()) return false;
     const verified = await this._verifyAllConfiguredCoursesCompleted();
+    if (!this._isRunActive()) return false;
     if (!verified) {
       // Chỉ hẹn lại surplus mode khi chưa kiệt khẩu — phiên exhausted không
       // được quay lại học surplus nữa (đã không còn bài để học).
@@ -598,10 +665,12 @@ class AutoCourseSession extends EventEmitter {
   // phiên đăng nhập. Chỉ progress 100% của đúng URL bài mới được coi là xong.
   async _verifyLessonProgressFromCourse(courseUrl, lessonUrl) {
     if (!this.context) return { completed: false, progressPercent: null };
+    if (!this._isRunActive()) return { completed: false, progressPercent: null };
     let verifyPage = null;
     try {
       verifyPage = await this.context.newPage();
       const result = await scanCourseDetails(verifyPage, courseUrl);
+      if (!this._isRunActive()) return { completed: false, progressPercent: null };
       if (!result || !Array.isArray(result.allLessons)) {
         return { completed: false, progressPercent: null };
       }
@@ -623,11 +692,14 @@ class AutoCourseSession extends EventEmitter {
     }
   }
 
+  // Bất biến thế hệ run: callback chỉ hợp lệ khi phiên chưa kết thúc/hẹn giờ VÀ
+  // vẫn đúng thế hệ khóa học đang chạy (xem _isRunActive).
   _isCurrentCourseRun(courseRunId) {
-    return !this._stopped && this._activeCourseRunId === courseRunId;
+    return this._isRunActive(courseRunId);
   }
 
   _setCourseFinalizationState(courseUrl, state) {
+    if (!this._isRunActive()) return;
     if (!this.courseProgress[courseUrl]) return;
     this.courseProgress[courseUrl].finalizationState = state;
     this.emit('status', this.getStatus());
@@ -655,6 +727,12 @@ class AutoCourseSession extends EventEmitter {
     preserveCurrentPage = false,
     continueStudying = false,
   }) {
+    // Callback đến muộn sau khi đã hẹn giờ / dừng / đổi run → vứt bỏ TRƯỚC khi log
+    // hay chạm courseProgress ("Re-checking…"/"continuing…" không được xuất hiện
+    // sau khi phiên đã sang daily-limit/date-limit/time-window/next-day).
+    if (!this._isCurrentCourseRun(courseRunId)) {
+      return { confirmed: false, stale: true, scanResult: null };
+    }
     this.log('🔍 Re-checking course progress after checkpoint', 'info');
     let verifiedScan = null;
     for (let attempt = 1; attempt <= 2 && this._isCurrentCourseRun(courseRunId); attempt++) {
@@ -777,7 +855,7 @@ class AutoCourseSession extends EventEmitter {
 
     while (activeElapsedMs < target && !this._stopped) {
       await this._checkPaused();
-      if (this._stopped) break;
+      if (this._stopped || SCHEDULED_STATUSES.has(this.status)) break;
       if (this._msRemainingInWindow() === -2 || !this._checkCustomShifts().inShift) break;
 
       const stepMs = Math.min(1000, target - activeElapsedMs);
@@ -852,12 +930,12 @@ class AutoCourseSession extends EventEmitter {
     let remaining = Math.max(0, Number(durationMs) || 0);
     while (remaining > 0 && !this._stopped) {
       await this._checkPaused();
-      if (this._stopped) return false;
+      if (this._stopped || SCHEDULED_STATUSES.has(this.status)) return false;
       const step = Math.min(250, remaining);
       await new Promise(resolve => setTimeout(resolve, step));
       remaining -= step;
     }
-    return !this._stopped;
+    return !this._stopped && !SCHEDULED_STATUSES.has(this.status);
   }
 
   async _recreatePage() {
@@ -1130,6 +1208,16 @@ class AutoCourseSession extends EventEmitter {
     return calcMsRemainingInShift(now, shiftsToday);
   }
 
+  // Phát hiện (thuần, không side effect) — ngoài Ca học theo quy tắc ngày cụ thể?
+  _isOutsideTimeShift() {
+    const customRules = this.options.customTimeRules || [];
+    if (!customRules || customRules.length === 0) return false;
+    const now = new Date();
+    const shiftsToday = getShiftsForDate(now, customRules);
+    if (!shiftsToday || shiftsToday.length === 0) return false;
+    return !calcMsRemainingInShift(now, shiftsToday).inShift;
+  }
+
   _hitTimeShiftLimit() {
     const customRules = this.options.customTimeRules || [];
     if (!customRules || customRules.length === 0) return false;
@@ -1142,7 +1230,7 @@ class AutoCourseSession extends EventEmitter {
 
     if (!shiftStatus.inShift) {
       const nextRun = getNextShiftStart(now, customRules, this.options.allowedDateRanges || [], this.options.newDayStartTime || '06:00');
-      this._setStatus('date-limit');
+      this._enterScheduledStatus('date-limit');
       const vnTimeStr = now.toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
       const vnNextStr = nextRun.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
 
@@ -1493,6 +1581,7 @@ class AutoCourseSession extends EventEmitter {
           let courseCompletedAtCheckpoint = false;
 
           const enterCourseFinalization = () => {
+            if (!this._isCurrentCourseRun(courseRunId)) return;
             const lessonRemainingMs = Math.max(0, durationMs - elapsedMs);
             courseFinalizationPlan = createCourseFinalizationPlan(
               courseFinalizationPlan,
@@ -1515,14 +1604,19 @@ class AutoCourseSession extends EventEmitter {
             }
           };
 
-          const verifyCurrentCheckpoint = async (refreshPage) => {
+          const verifyCurrentCheckpoint = async (refreshPage, continueStudying = true) => {
+            // Callback muộn sau khi phiên đã hẹn giờ/kết thúc hoặc đã đổi run phải bị
+            // vứt bỏ hoàn toàn — không log, không quét, không ghi courseProgress.
+            if (!this._isCurrentCourseRun(courseRunId)) {
+              return { confirmed: false, stale: true, scanResult: null };
+            }
             const verifyArgs = {
               courseUrl: cConfig.courseUrl,
               targetMinutes,
               courseTitle: scanResult.courseTitle,
               courseRunId,
               preserveCurrentPage: true,
-              continueStudying: true,
+              continueStudying,
             };
             if (!refreshPage) {
               this._setCourseFinalizationState(cConfig.courseUrl, COURSE_FINALIZATION_STATES.CHECKPOINT);
@@ -1549,7 +1643,7 @@ class AutoCourseSession extends EventEmitter {
               this.log('⏰ Hết giờ khung học — F5 lưu checkpoint và tạm nghỉ...', 'warn');
               try {
                 await this.page.reload({ waitUntil: 'load', timeout: 60000 });
-                await verifyCurrentCheckpoint(false);
+                await verifyCurrentCheckpoint(false, false);
               } catch { /* ignore */ }
               this._hitTimeWindowLimit();
               return;
@@ -1658,22 +1752,27 @@ class AutoCourseSession extends EventEmitter {
               break;
             }
 
-            if (activeWaitMs < waitStep && !this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
+            // Giới hạn lịch: LƯU TIẾN ĐỘ TRƯỚC (F5 để Odoo chốt checkpoint) rồi mới
+            // chốt sang trạng thái hẹn giờ. Từ lúc _enterScheduledStatus() chạy,
+            // mọi callback async còn treo đều bị _isRunActive() từ chối.
+            if (activeWaitMs < waitStep && !this._allConfiguredCoursesCompleted() && this._peekSchedulingLimit()) {
               if (courseFinalizationPlan) break;
               try {
                 await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-                await verifyCurrentCheckpoint(false);
+                await verifyCurrentCheckpoint(false, false);
               } catch { /* ignore */ }
+              this._hitSchedulingLimit();
               return;
             }
 
             // Ghi nhận phần vừa học trước, sau đó mới hẹn tiếp ca/ngày kế tiếp.
-            if (!this._allConfiguredCoursesCompleted() && this._hitSchedulingLimit()) {
+            if (!this._allConfiguredCoursesCompleted() && this._peekSchedulingLimit()) {
               if (courseFinalizationPlan) break;
               try {
                 await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-                await verifyCurrentCheckpoint(false);
+                await verifyCurrentCheckpoint(false, false);
               } catch { /* ignore */ }
+              this._hitSchedulingLimit();
               return;
             }
 
@@ -1888,13 +1987,13 @@ class AutoCourseSession extends EventEmitter {
         const incompleteCourses = this.coursesConfig.filter(c => !this.courseProgress[c.courseUrl]?.completed);
         if (this.surplusMode || (!allWebsiteCoursesCompleted && incompleteCourses.length === 0)) {
           if (this._hitSchedulingLimit()) return;
-          this._setStatus('next-day');
+          this._enterScheduledStatus('next-day');
           this.log('⏭️ Course targets are met locally, but website has not confirmed all courses at 100%; waiting for the next verification run', 'warn');
         } else if (incompleteCourses.length > 0) {
           // Bắt lại đúng loại lịch hẹn nếu ca/khung/ngân sách ngày vừa kết thúc
           // trong lúc xử lý bài cuối cùng của lượt quét.
           if (this._hitSchedulingLimit()) return;
-          this._setStatus('next-day');
+          this._enterScheduledStatus('next-day');
           this.log(`⏭️ Đã quét hết lượt hôm nay nhưng còn ${incompleteCourses.length}/${this.coursesConfig.length} khóa chưa đạt mục tiêu thời gian → Hẹn ${this.options.newDayStartTime || '06:00'} ngày học tiếp theo quét và treo tiếp!`, 'warn');
         } else {
           this._setStatus('completed');
@@ -1905,6 +2004,11 @@ class AutoCourseSession extends EventEmitter {
     } catch (err) {
       if (this._stopped) {
         this.status = 'stopped';
+        this.emit('status', this.getStatus());
+      } else if (SCHEDULED_STATUSES.has(this.status)) {
+        // Phiên đã chốt sang trạng thái hẹn giờ: một lỗi đến muộn KHÔNG được biến
+        // nó thành 'error' (sẽ mất lịch hẹn) và cũng không được hồi sinh việc học.
+        console.log(`[AUTOSCAN] bỏ qua lỗi muộn sau khi đã hẹn giờ | session=${this.id} | status=${this.status} | ${err.message}`);
         this.emit('status', this.getStatus());
       } else {
         this.status = 'error';

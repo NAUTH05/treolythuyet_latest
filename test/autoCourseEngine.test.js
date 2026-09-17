@@ -12,6 +12,8 @@ const {
   AUTO_COURSE_STATUSES,
   TERMINAL_STATUSES,
   SCHEDULED_STATUSES,
+  PHASE_RUNNING,
+  PHASE_FINISHED,
 } = require('../autoCourseEngine');
 const { extractSlideIdFromUrl, getNextShiftStart } = require('../courseScanner');
 
@@ -71,6 +73,7 @@ test('course checkpoint refreshes before re-scan and trusts refreshed Web Odoo p
     completed: false,
     finalizationState: COURSE_FINALIZATION_STATES.TARGET_REACHED,
   };
+  session._phase = PHASE_RUNNING;
   session._activeCourseRunId = 7;
   session.page = {
     reload: async () => { events.push('reload'); },
@@ -112,6 +115,7 @@ test('final checkpoint below target never resumes the old course or marks it com
     completed: false,
     finalizationState: COURSE_FINALIZATION_STATES.TARGET_REACHED,
   };
+  session._phase = PHASE_RUNNING;
   session._activeCourseRunId = 9;
   session.page = {
     reload: async () => {},
@@ -150,6 +154,7 @@ test('checkpoint below target can explicitly continue the current lesson', async
     completed: false,
     finalizationState: COURSE_FINALIZATION_STATES.CHECKPOINT,
   };
+  session._phase = PHASE_RUNNING;
   session._activeCourseRunId = 10;
   session.page = {
     reload: async () => { events.push('reload'); },
@@ -192,6 +197,7 @@ test('stale checkpoint callback cannot update a course after switching runs', as
     completed: false,
     finalizationState: COURSE_FINALIZATION_STATES.TARGET_REACHED,
   };
+  session._phase = PHASE_RUNNING;
   session._activeCourseRunId = 11;
   session.page = {
     reload: async () => {},
@@ -271,6 +277,8 @@ test('lấy đúng slide ID là cụm số cuối URL thay vì số trong slug',
 
 test('xác minh chéo đúng tiến độ của bài từ trang khóa học', async () => {
   const session = new AutoCourseSession('test', { name: 'Test' });
+  session._phase = PHASE_RUNNING;
+  session.status = 'studying';
   let verifyPageClosed = false;
   session.context = {
     newPage: async () => ({
@@ -647,6 +655,7 @@ test('surplus initialization builds an eligible pool dynamically and preserves t
   ];
   const session = new AutoCourseSession('surplus-init', { name: 'Init' }, courses);
   session.context = {};
+  session._phase = PHASE_RUNNING;
   session._verifyAllConfiguredCoursesCompleted = async () => true;
   session._scanCourseDetailsForCheckpoint = async (url) => ({
     courseLevelCompleted: url !== courses[1].courseUrl,
@@ -664,6 +673,7 @@ test('surplus initialization exhausts cleanly when all completed courses have no
   const courseUrl = 'https://x/slides/course-1';
   const session = new AutoCourseSession('surplus-empty', { name: 'Empty' }, [{ courseUrl }]);
   session.context = {};
+  session._phase = PHASE_RUNNING;
   session._verifyAllConfiguredCoursesCompleted = async () => true;
   session._scanCourseDetailsForCheckpoint = async () => ({ courseLevelCompleted: true, allLessons: [] });
   assert.equal(await session._initializeSurplusMode(), false);
@@ -677,6 +687,7 @@ test('surplus initialization exhausts cleanly when all completed courses have no
 function makeSurplusStudySession({ id, courses, lessonsByCourse, lessonMinutesByUrl = new Map(), failingLessonUrls = [] }) {
   const session = new AutoCourseSession(id, { name: id }, courses);
   session.context = {};
+  session._phase = PHASE_RUNNING;
   const gotoCounts = new Map();
   const studyCallsMs = [];
   let currentUrl = 'about:blank';
@@ -814,6 +825,7 @@ test('surplus lessons that cannot open are marked unusable once and exhaust clea
 
 test('exhausted surplus defers completion on failed verification without re-entering surplus', async () => {
   const session = new AutoCourseSession('surplus-defer-exhausted', { name: 'Defer' });
+  session._phase = PHASE_RUNNING;
   session.surplusTargetMinutes = 40;
   session.surplusStudiedMinutes = 31;
   session.surplusExhausted = true;
@@ -827,10 +839,271 @@ test('exhausted surplus defers completion on failed verification without re-ente
 
 test('target-reached surplus defers completion by re-arming surplus mode', async () => {
   const session = new AutoCourseSession('surplus-defer-target', { name: 'Defer' });
+  session._phase = PHASE_RUNNING;
   session.surplusTargetMinutes = 40;
   session.surplusStudiedMinutes = 40;
   session._verifyAllConfiguredCoursesCompleted = async () => false;
 
   assert.equal(await session._finalizeSurplusCompletion(), false);
   assert.equal(session.surplusMode, true);
+});
+
+// ============ BẤT BIẾN VÒNG ĐỜI KHI VÀO TRẠNG THÁI HẸN GIỜ ============
+// ff02e8c: một khi phiên đã hẹn giờ, callback async còn treo không được chạm
+// state/khoá học, và đối tượng phiên phải chốt PHASE_FINISHED.
+
+// 1. Daily limit trong lúc học.
+test('daily limit trong lúc học chốt PHASE_FINISHED và vô hiệu thế hệ run', () => {
+  const session = new AutoCourseSession(
+    'limit-lesson',
+    { name: 'Limit', email: 'l@x.vn' },
+    [{ courseUrl: 'https://x/slides/course-1', targetMinutes: 60 }],
+    { dailyMaxMinutes: 60 },
+  );
+  session._phase = PHASE_RUNNING;
+  session._activeCourseRunId = 3;
+  session.status = 'studying';
+  session.dailyDate = session._vnDateStr();
+  session.dailyStudiedMinutes = 60;
+
+  assert.equal(session._peekSchedulingLimit(), 'daily-limit');
+  assert.equal(session._hitSchedulingLimit(), true);
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.isFinished(), true);
+  assert.equal(session.isRunning(), false);
+  assert.equal(session._activeCourseRunId, null, 'thế hệ run hiện tại bị vô hiệu');
+  assert.equal(session.ownsAccountSession(), false, 'phiên hẹn giờ không còn chiếm tài khoản');
+});
+
+// 2. Daily limit trong lúc chờ checkpoint.
+test('checkpoint hoàn tất sau daily-limit bị vứt bỏ, không ghi đè tiến độ hay học tiếp', async () => {
+  const courseUrl = 'https://x/slides/course-1';
+  const session = new AutoCourseSession(
+    'limit-checkpoint',
+    { name: 'Limit', email: 'l@x.vn' },
+    [{ courseUrl, targetMinutes: 60 }],
+    { dailyMaxMinutes: 60 },
+  );
+  session._phase = PHASE_RUNNING;
+  session._activeCourseRunId = 8;
+  session.status = 'studying';
+  session.dailyDate = session._vnDateStr();
+  session.dailyStudiedMinutes = 59;
+  session.courseProgress[courseUrl] = {
+    title: 'Course',
+    targetMinutes: 60,
+    studiedMinutes: 10,
+    completed: false,
+    finalizationState: COURSE_FINALIZATION_STATES.NORMAL_STUDY,
+  };
+  const logs = [];
+  session.on('log', entry => logs.push(entry.msg));
+  session._scanCourseDetailsForCheckpoint = async () => {
+    // Giới hạn ngày đạt được trong lúc I/O đang chờ.
+    session.dailyStudiedMinutes = 60;
+    session._hitDailyLimit();
+    return {
+      courseTitle: 'Course',
+      actualStudiedMinutes: 59,
+      totalLessons: 3,
+      uncompletedLessons: [{ progressPercent: 90 }],
+      allLessons: [],
+      courseLevelCompleted: false,
+    };
+  };
+
+  const result = await session._verifyCourseProgressAfterCheckpoint({
+    courseUrl,
+    targetMinutes: 60,
+    courseTitle: 'Course',
+    courseRunId: 8,
+    continueStudying: true,
+  });
+
+  assert.equal(result.stale, true);
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.courseProgress[courseUrl].studiedMinutes, 10, 'tiến độ muộn không được ghi đè');
+  assert.equal(
+    session.courseProgress[courseUrl].finalizationState,
+    COURSE_FINALIZATION_STATES.NORMAL_STUDY,
+    'không được đổi finalization state sau khi hẹn giờ',
+  );
+  assert.equal(
+    logs.some(msg => msg.includes('continuing the current lesson')),
+    false,
+    'không được log "continuing the current lesson" sau daily-limit',
+  );
+});
+
+// 3. Daily limit trong lúc xác minh cấp website.
+test('xác minh cấp khóa hoàn tất sau daily-limit bị vứt bỏ, không đánh dấu websiteCourseCompleted', async () => {
+  const courseUrl = 'https://x/slides/course-1';
+  const session = new AutoCourseSession(
+    'limit-webverify',
+    { name: 'Limit', email: 'l@x.vn' },
+    [{ courseUrl, targetMinutes: 60 }],
+    { dailyMaxMinutes: 60 },
+  );
+  session.context = {};
+  session._phase = PHASE_RUNNING;
+  session.status = 'studying';
+  session.dailyDate = session._vnDateStr();
+  session.dailyStudiedMinutes = 60;
+  session._scanCourseDetailsForCheckpoint = async () => {
+    session._hitDailyLimit();
+    return { courseLevelCompleted: true, courseTitle: 'Course', courseProgressPercent: 100, totalLessons: 0, allLessons: [] };
+  };
+
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), false);
+  assert.equal(session.courseProgress[courseUrl], undefined, 'kết quả xác minh muộn không được ghi vào tiến độ');
+});
+
+// 4. Daily limit trong lúc học surplus.
+test('daily limit trong lúc treo surplus không credit phút và không checkpoint', async () => {
+  const courseUrl = 'https://x/slides/course-a';
+  const lessonUrl = 'https://x/slides/slide/course-a/lesson-a1-101';
+  const session = new AutoCourseSession(
+    'limit-surplus',
+    { name: 'Limit', email: 'l@x.vn' },
+    [{ courseUrl, targetMinutes: 1 }],
+    { dailyMaxMinutes: 30 },
+  );
+  session._phase = PHASE_RUNNING;
+  session.surplusMode = true;
+  session.surplusTargetMinutes = 30;
+  session.surplusEligibleCourses = [courseUrl];
+  session._surplusLessonPools = new Map([[courseUrl, [{ title: 'A1', url: lessonUrl }]]]);
+  session.page = {
+    url: () => lessonUrl,
+    goto: async () => {},
+    waitForTimeout: async () => {},
+    evaluate: async () => null,
+  };
+  let checkpointed = false;
+  session._checkpointSurplusCourse = async () => { checkpointed = true; return null; };
+  session._waitForActiveStudyTime = async () => {
+    session.dailyStudiedMinutes = 30;
+    session._hitDailyLimit();
+    return 1000; // kết quả treo trả về muộn — phải bị vứt bỏ
+  };
+
+  const result = await session._runSurplusStudy();
+
+  assert.equal(result, false);
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.surplusStudiedMinutes, 0, 'phút học muộn không được credit');
+  assert.equal(checkpointed, false, 'không checkpoint sau khi đã hẹn giờ');
+});
+
+// 5/7. Callback checkpoint đến muộn không thể đổi status hẹn giờ.
+test('callback checkpoint đến muộn không thể đổi trạng thái hẹn giờ hay mở lại việc học', async () => {
+  const courseUrl = 'https://x/slides/course-1';
+  const session = new AutoCourseSession(
+    'late-status',
+    { name: 'Late', email: 'l@x.vn' },
+    [{ courseUrl, targetMinutes: 60 }],
+  );
+  session._phase = PHASE_RUNNING;
+  session._activeCourseRunId = 4;
+  session.status = 'studying';
+  session._enterScheduledStatus('daily-limit');
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.isFinished(), true);
+
+  let scanned = false;
+  session._scanCourseDetailsForCheckpoint = async () => { scanned = true; return null; };
+  const result = await session._verifyCourseProgressAfterCheckpoint({
+    courseUrl,
+    targetMinutes: 60,
+    courseTitle: 'Course',
+    courseRunId: 4,
+  });
+
+  assert.equal(result.stale, true);
+  assert.equal(scanned, false);
+  assert.equal(session.status, 'daily-limit', 'status hẹn giờ không bị thay đổi');
+  assert.equal(session.isRunning(), false);
+});
+
+// 6. Callback xác minh cấp khóa đến muộn không thể mở lại việc học.
+test('xác minh cấp khóa đến muộn không thể mở lại việc học', async () => {
+  const courseUrl = 'https://x/slides/course-1';
+  const session = new AutoCourseSession(
+    'late-verify',
+    { name: 'Late', email: 'l@x.vn' },
+    [{ courseUrl, targetMinutes: 60 }],
+  );
+  session.context = {};
+  session._phase = PHASE_RUNNING;
+  session.status = 'studying';
+  session._enterScheduledStatus('daily-limit');
+  let scanned = false;
+  session._scanCourseDetailsForCheckpoint = async () => {
+    scanned = true;
+    return { courseLevelCompleted: true, allLessons: [] };
+  };
+
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), false);
+  assert.equal(scanned, false);
+});
+
+// 7. Mọi trạng thái hẹn giờ đều chốt PHASE_FINISHED.
+test('mọi trạng thái hẹn giờ đều chốt PHASE_FINISHED và không còn chiếm tài khoản', () => {
+  for (const status of SCHEDULED_STATUSES) {
+    const session = new AutoCourseSession(`sched-${status}`, { name: 'S', email: 's@x.vn' });
+    session._phase = PHASE_RUNNING;
+    session._activeCourseRunId = 1;
+    session.status = 'studying';
+    assert.equal(session._enterScheduledStatus(status), true);
+    assert.equal(session.status, status);
+    assert.equal(session.isFinished(), true);
+    assert.equal(session.isRunning(), false);
+    assert.equal(session.ownsAccountSession(), false);
+  }
+});
+
+// 9. Đối tượng phiên cũ đã chốt không bao giờ start() lại.
+test('đối tượng phiên cũ đã chốt không bao giờ chạy lại', async () => {
+  const session = new AutoCourseSession('old-restart', { name: 'Old', email: 'o@x.vn' }, []);
+  session._phase = PHASE_RUNNING;
+  session._enterScheduledStatus('daily-limit');
+  const warns = [];
+  session.on('log', entry => { if (entry.level === 'warn') warns.push(entry.msg); });
+
+  await session.start();
+
+  assert.equal(session.status, 'daily-limit', 'phiên cũ không được chạy lại');
+  assert.equal(warns.some(msg => msg.includes('trùng lặp')), true);
+  assert.equal(session._phase, PHASE_FINISHED);
+});
+
+test('phiên bị Dừng không được hồi sinh thành trạng thái hẹn giờ bởi callback muộn', async () => {
+  const session = new AutoCourseSession('stopped-no-revive', { name: 'Stopped', email: 's@x.vn' }, []);
+  session._phase = PHASE_RUNNING;
+  session.status = 'studying';
+  await session.cancel();
+  assert.equal(session.status, 'stopped');
+
+  session.dailyDate = session._vnDateStr();
+  session.dailyStudiedMinutes = session.options.dailyMaxMinutes;
+  assert.equal(session._hitDailyLimit(), true);
+  assert.equal(session.status, 'stopped', 'daily-limit không được hồi sinh phiên đã Dừng');
+  assert.equal(SCHEDULED_STATUSES.has(session.status), false);
+  assert.equal(session.isFinished(), true);
+});
+
+test('_isRunActive từ chối mọi trạng thái hẹn giờ và thế hệ run lệch', () => {
+  const session = new AutoCourseSession('active-guard', { name: 'G', email: 'g@x.vn' });
+  session._phase = PHASE_RUNNING;
+  session._activeCourseRunId = 7;
+  session.status = 'studying';
+  assert.equal(session._isRunActive(7), true);
+  assert.equal(session._isRunActive(8), false, 'sai thế hệ run');
+  for (const status of SCHEDULED_STATUSES) {
+    session.status = status;
+    assert.equal(session._isRunActive(7), false, `phải từ chối ${status}`);
+  }
+  session.status = 'studying';
+  session._phase = PHASE_FINISHED;
+  assert.equal(session._isRunActive(7), false, 'phải từ chối phiên đã finished');
 });
