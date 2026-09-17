@@ -1649,6 +1649,8 @@ function saveAutoScanState() {
         scheduledStartAt: s.options.scheduledStartAt || null,
         scheduledStartDate: s.options.scheduledStartDate || null,
         courseProgress: s.courseProgress,
+        discoveredCourses: s.discoveredCourses || [],
+        knownCourseKeys: s.knownCourseKeys || [],
         surplusMode: s.surplusMode === true,
         surplusCurrentCourseIndex: s.surplusCurrentCourseIndex || 0,
         surplusCourseStates: s.surplusCourseStates || {},
@@ -1843,6 +1845,8 @@ function restartAutoScanSession(sessionId) {
       dailyStudiedMinutes: previous.dailyStudiedMinutes,
       dailyDate: previous.dailyDate, // engine tự reset bộ đếm khi thấy sang ngày mới
       courseProgress: previous.courseProgress,
+      discoveredCourses: previous.discoveredCourses,
+      knownCourseKeys: previous.knownCourseKeys,
       surplusMode: previous.surplusMode,
       surplusCurrentCourseIndex: previous.surplusCurrentCourseIndex,
       surplusCourseStates: previous.surplusCourseStates,
@@ -1908,6 +1912,8 @@ async function loadAndRestoreAutoScans() {
       dailyStudiedMinutes: saved.dailyStudiedMinutes || 0,
       dailyDate: saved.dailyDate,
       courseProgress: saved.courseProgress || {},
+      discoveredCourses: saved.discoveredCourses || [],
+      knownCourseKeys: saved.knownCourseKeys || [],
       surplusMode: saved.surplusMode === true,
       surplusCurrentCourseIndex: saved.surplusCurrentCourseIndex || 0,
       surplusCourseStates: saved.surplusCourseStates || {},
@@ -2044,9 +2050,9 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
 
 app.post('/api/auto-scan/start', async (req, res) => {
   const { courses, allowedDateRanges, dailyMaxMinutes, newDayStartTime, randomStartEnabled, randomStartFrom, randomStartTo, refreshInterval, stealth, stealthInterval, timeWindows, customTimeRules, accountIndices, initialDailyMinutesToggle, initialDailyMinutes } = req.body;
-  if (!courses || !Array.isArray(courses) || courses.length === 0) {
-    return res.status(400).json({ error: 'Cần nhập ít nhất 1 khóa học' });
-  }
+  // Khóa học KHÔNG còn bắt buộc: engine tự phát hiện từ /slides/all?my=1 sau login.
+  // `courses` chỉ còn là fallback tương thích cho tài liệu Firestore cũ.
+  const initialCourses = Array.isArray(courses) ? courses : [];
 
   const allAccounts = loadAccounts();
   const requestedIndices = Array.isArray(accountIndices) ? accountIndices : [];
@@ -2110,7 +2116,7 @@ app.post('/api/auto-scan/start', async (req, res) => {
     }
 
     const sessionId = autoScanRegistry.nextSessionId(acc.name);
-    const autoSession = createAutoScanSession(sessionId, acc, courses, {
+    const autoSession = createAutoScanSession(sessionId, acc, initialCourses, {
       headless: true,
       dailyMaxMinutes: dailyMaxMinutes || 480,
       allowedDateRanges: allowedDateRanges || [],
@@ -2185,6 +2191,8 @@ app.post('/api/auto-scan/resume/:id', async (req, res) => {
       dailyStudiedMinutes: autoSession.dailyStudiedMinutes,
       dailyDate: autoSession.dailyDate,
       courseProgress: autoSession.courseProgress,
+      discoveredCourses: autoSession.discoveredCourses,
+      knownCourseKeys: autoSession.knownCourseKeys,
       surplusMode: autoSession.surplusMode,
       surplusCurrentCourseIndex: autoSession.surplusCurrentCourseIndex,
       surplusCourseStates: autoSession.surplusCourseStates,

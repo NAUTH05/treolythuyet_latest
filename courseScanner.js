@@ -514,20 +514,31 @@ async function scanMyCoursesCompletion(page, myCoursesUrl) {
         if (!link) continue;
         const titleEl = card.querySelector('h1, h2, h3, h4, h5, .card-title, [class*="title"]') || link;
         const title = String(titleEl.textContent || '').trim().replace(/\s+/g, ' ');
-        if (!title || seen.has(title)) continue;
-        seen.add(title);
+        if (!title) continue;
+
+        let href = link.getAttribute('href');
+        try { href = href ? new URL(href, location.origin).href : null; } catch { /* keep */ }
+        // Định danh chính: pathname của URL khóa (KHÔNG dùng title làm key).
+        let coursePath = null;
+        try { coursePath = href ? new URL(href).pathname.replace(/\/+$/, '') : null; } catch { /* keep */ }
+        const identity = coursePath || `title:${normalizeLooseText(title)}`;
+        if (seen.has(identity)) continue;
+        seen.add(identity);
 
         const normalized = normalizeLooseText(card.textContent);
         const completed = looksCompleted(normalized);
-        let href = link.getAttribute('href');
-        try { href = href ? new URL(href, location.origin).href : null; } catch { /* keep */ }
+        // % tiến độ hiển thị trên thẻ (nếu có), tránh nhầm với năm/số khác.
+        const percentMatch = String(card.textContent || '').match(/(\d{1,3})\s*%/);
 
         results.push({
           title,
           url: href,
+          coursePath,
+          orderIndex: results.length,
           completed,
-          state: completed ? 'completed' : 'unknown',
-          source: completed ? 'my_courses_completed_badge' : null,
+          state: completed ? 'completed' : 'incomplete',
+          progressPercent: completed ? 100 : (percentMatch ? Math.min(100, parseInt(percentMatch[1], 10)) : null),
+          source: completed ? 'my_courses_completed_badge' : 'my_courses_listed_incomplete',
         });
       }
 

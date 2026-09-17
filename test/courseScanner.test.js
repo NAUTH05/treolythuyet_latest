@@ -247,4 +247,32 @@ test('My Courses: thẻ có "Completed" → completed', async () => {
   assert.equal(results[0].completed, true);
   assert.equal(results[0].state, 'completed');
   assert.equal(results[0].source, 'my_courses_completed_badge');
+  assert.equal(results[0].coursePath, '/slides/course-1');
+  assert.equal(results[0].orderIndex, 0);
+  assert.equal(results[0].progressPercent, 100);
+});
+
+test('My Courses: thẻ KHÔNG có Completed → incomplete, giữ đúng thứ tự website', async () => {
+  const mkCard = (title, href, completed) => {
+    const h5 = new FakeNode({ tagName: 'h5', textContent: title });
+    const link = new FakeNode({ tagName: 'a', attrs: { href }, children: [h5] });
+    const children = [link];
+    if (completed) children.push(new FakeNode({ tagName: 'span', className: 'badge', textContent: '✔ Completed' }));
+    return new FakeNode({ tagName: 'div', className: 'card', children });
+  };
+  const root = new FakeNode({
+    tagName: 'div',
+    children: [
+      mkCard('Khóa A', '/slides/course-a', true),
+      mkCard('Khóa B', '/slides/course-b', false),
+      mkCard('Khóa C', '/slides/course-c', false),
+    ],
+  });
+
+  const results = await scanMyCoursesCompletion(scannerPage(makeDocument({ root })), 'https://x/slides/all?my=1');
+  assert.equal(results.length, 3);
+  assert.deepEqual(results.map(r => r.orderIndex), [0, 1, 2]);
+  assert.deepEqual(results.map(r => r.coursePath), ['/slides/course-a', '/slides/course-b', '/slides/course-c']);
+  assert.deepEqual(results.map(r => r.state), ['completed', 'incomplete', 'incomplete']);
+  assert.equal(results[1].source, 'my_courses_listed_incomplete');
 });

@@ -17,6 +17,48 @@ const {
 } = require('../autoCourseEngine');
 const { extractSlideIdFromUrl, getNextShiftStart } = require('../courseScanner');
 
+// Giả lập kết quả auto-discovery từ /slides/all?my=1 cho unit test. Cập nhật
+// discoveredCourses/coursesConfig/_discoveryValid giống _discoverCourses() thật.
+function installDiscovery(session, courses, { completed = true } = {}) {
+  const apply = () => {
+    const normalized = courses.map((c, index) => {
+      const isCompleted = typeof c.completed === 'boolean' ? c.completed : completed;
+      return {
+        courseUrl: c.courseUrl,
+        title: c.title || c.courseUrl,
+        orderIndex: index,
+        completed: isCompleted,
+        completionState: isCompleted ? 'completed' : 'incomplete',
+        progressPercent: isCompleted ? 100 : (c.progressPercent ?? null),
+        recordedMinutes: null,
+        discoveredAt: '2026-01-01T00:00:00.000Z',
+        source: 'test-discovery',
+      };
+    });
+    session.discoveredCourses = normalized;
+    session.coursesConfig = normalized.map(c => ({
+      courseUrl: c.courseUrl,
+      title: c.title,
+      orderIndex: c.orderIndex,
+      targetHours: 0,
+      targetMinutes: 0,
+    }));
+    session._discoveryValid = true;
+    for (const c of normalized) {
+      session.courseProgress[c.courseUrl] = {
+        ...(session.courseProgress[c.courseUrl] || {}),
+        title: c.title,
+        websiteCourseCompleted: c.completed,
+        websiteCourseCompletionState: c.completionState,
+      };
+    }
+    return normalized;
+  };
+  apply();
+  session._discoverCourses = async () => apply();
+  return session;
+}
+
 test('không hoàn thành khóa chỉ vì mọi bài hiển thị 100% khi chưa đủ giờ mục tiêu', () => {
   assert.equal(courseReachedTarget(63 * 60, 51 * 60 + 8, true), false);
 });
@@ -582,11 +624,12 @@ test('Auto-Scan start remains alive after the production transient login scenari
       [],
       { loginRetryIntervalMs: 1, loginPostSubmitGraceMs: 0, loginPostSubmitTimeoutMs: 20 },
     );
+    installDiscovery(session, [{ courseUrl: '/slides/course-1', title: 'Course 1', completed: true }]);
     await session.start();
     assert.equal(session.status, 'completed');
     assert.equal(session.id, 'production-regression');
     assert.equal(launchCount, 1, 'recovery must not launch a duplicate browser/session');
-    assert.equal(pages.length, 2, 'recovery may recreate the page within the existing session');
+    assert.ok(pages.length >= 2, 'recovery may recreate the page within the existing session (discovery adds pages too)');
   } finally {
     chromium.launch = originalLaunch;
   }
@@ -715,6 +758,9 @@ function makeSurplusSession({
     evaluate: async () => null,
     $: async () => null,
   };
+
+  // Surplus chỉ chạy khi mọi khóa đã Completed → discovery mặc định completed.
+  installDiscovery(session, courses);
 
   return { session, gotoCounts, studyCallsMs, studyOrder, website };
 }
@@ -1482,6 +1528,8 @@ test('final surplus verification: UNKNOWN + đủ target → hoàn thành, khôn
     scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'unknown' }) },
     myCourses: [],
   });
+  // Discovery tươi xác nhận mọi khóa Completed → hoàn tất.
+  installDiscovery(session, [{ courseUrl: c1, completed: true }]);
   session._surplusStateFor(c1).completed = true;
   assert.equal(await session._finalizeSurplusCompletion(), true);
   assert.equal(session.surplusMode, false);
@@ -1492,6 +1540,8 @@ test('final surplus verification: website tường minh incomplete → defer', a
   const session = makeGateSession('final-incomplete', [{ courseUrl: c1, targetMinutes: 60 }], {
     scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'incomplete', percent: 82 }) },
   });
+  // Discovery tươi vẫn còn khóa chưa Completed → KHÔNG hoàn tất.
+  installDiscovery(session, [{ courseUrl: c1, completed: false }]);
   session._surplusStateFor(c1).completed = true;
   assert.equal(await session._finalizeSurplusCompletion(), false);
   assert.equal(session.surplusMode, false);

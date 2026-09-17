@@ -417,8 +417,10 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
 
   const handleStartAutoScan = async () => {
     const validCourses = courses.filter(c => c.courseUrl.trim());
-    if (validCourses.length === 0 || selectedAccounts.size === 0) {
-      toast('Vui lòng nhập ít nhất 1 URL khóa học và chọn tài khoản', 'error');
+    // Khóa học KHÔNG còn bắt buộc: hệ thống tự phát hiện từ /slides/all?my=1 sau
+    // khi đăng nhập. Danh sách thủ công chỉ còn là tuỳ chọn/tương thích.
+    if (selectedAccounts.size === 0) {
+      toast('Vui lòng chọn ít nhất 1 tài khoản', 'error');
       return;
     }
 
@@ -569,7 +571,12 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
 
           {/* Courses List Form */}
           <div className="form-group">
-            <label>Danh sách khóa học cần quét & treo</label>
+            <label>Danh sách khóa học thủ công (tuỳ chọn)</label>
+            <p className="muted" style={{ fontSize: 12, marginTop: -4, marginBottom: 8 }}>
+              Hệ thống TỰ ĐỘNG phát hiện mọi khóa học của tài khoản từ website
+              (/slides/all?my=1) và ưu tiên hoàn thành khóa chưa xong. Có thể để trống
+              danh sách này — chỉ nhập thủ công khi muốn ghim thêm URL.
+            </p>
             {courses.map((c, idx) => (
               <div key={idx} className="box-card">
                 <div className="box-card-header">

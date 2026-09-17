@@ -82,6 +82,9 @@ function applyAutoScanRestoreState(session, restoreState = {}) {
     const idx = Number(restoreState.surplusCurrentCourseIndex);
     session.surplusCurrentCourseIndex = Number.isInteger(idx) && idx >= 0 ? idx : 0;
   }
+  // Auto-discovered course list + known keys (website discovery state).
+  if (Array.isArray(restoreState.discoveredCourses)) session.discoveredCourses = restoreState.discoveredCourses;
+  if (Array.isArray(restoreState.knownCourseKeys)) session.knownCourseKeys = [...new Set(restoreState.knownCourseKeys)];
   if (restoreState.scheduledStartAt) session.options.scheduledStartAt = restoreState.scheduledStartAt;
   if (restoreState.scheduledStartDate) session.options.scheduledStartDate = restoreState.scheduledStartDate;
   return session;

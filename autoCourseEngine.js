@@ -200,6 +200,12 @@ class AutoCourseSession extends EventEmitter {
     }
 
     this.courseProgress = {}; // courseUrl -> { studiedMinutes, targetMinutes, completed, websiteCourseCompleted }
+    // ── AUTO-DISCOVERY ──
+    // Danh sách khóa tự động phát hiện từ /slides/all?my=1 (website là nguồn
+    // chân lý). `coursesConfig` thủ công chỉ còn là fallback tương thích.
+    this.discoveredCourses = Array.isArray(options.discoveredCourses) ? options.discoveredCourses : [];
+    this.knownCourseKeys = Array.isArray(options.knownCourseKeys) ? [...new Set(options.knownCourseKeys)] : [];
+    this._discoveryValid = false;
     this.surplusMode = Boolean(options.surplusMode);
     // Trạng thái surplus theo TỪNG KHÓA (nguồn chân lý mới). Xem _surplusStateFor().
     this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(options.surplusCourseStates);
@@ -440,7 +446,10 @@ class AutoCourseSession extends EventEmitter {
 
   _allConfiguredCoursesCompleted() {
     return this.coursesConfig.length > 0
-      && this.coursesConfig.every(course => this.courseProgress[course.courseUrl]?.completed === true);
+      && this.coursesConfig.every(course => {
+        const cp = this.courseProgress[course.courseUrl];
+        return cp?.completed === true || cp?.websiteCourseCompleted === true;
+      });
   }
 
   _allConfiguredCoursesWebsiteCompleted() {
@@ -707,6 +716,147 @@ class AutoCourseSession extends EventEmitter {
     return true;
   }
 
+  // ── AUTO-DISCOVERY: website là nguồn chân lý về danh sách/hoàn thành khóa ──
+
+  _canonicalCourseUrl(rawUrl, title) {
+    if (rawUrl) {
+      try { return new URL(rawUrl, BASE_URL).pathname.replace(/\/+$/, ''); } catch { /* fall through */ }
+    }
+    return `my-courses:${AutoCourseSession._normalizedTitle(title) || 'unknown'}`;
+  }
+
+  // Phát hiện danh sách khóa hiện tại của tài khoản từ /slides/all?my=1.
+  // Trả về mảng chuẩn hoá theo thứ tự website, hoặc null nếu không phát hiện được
+  // (KHÔNG coi "không phát hiện" là "đã hoàn thành").
+  async _discoverCourses({ log = true } = {}) {
+    this._discoveryValid = false;
+    if (!this.context) return null;
+    if (!this._isRunActive()) return null;
+
+    let verifyPage = null;
+    let raw = null;
+    try {
+      verifyPage = await this.context.newPage();
+      raw = await scanMyCoursesCompletion(verifyPage, MY_COURSES_URL);
+    } catch (err) {
+      this.log(`⚠️ Course discovery failed: ${String(err.message).split('\n')[0]}`, 'warn');
+    } finally {
+      if (verifyPage) { try { await verifyPage.close(); } catch { /* ignore */ } }
+    }
+    if (!this._isRunActive()) return null;
+    if (!Array.isArray(raw) || raw.length === 0) {
+      if (log) this.log('⚠️ Website course discovery returned no courses', 'warn');
+      return null;
+    }
+
+    const seen = new Set();
+    const normalized = [];
+    for (const item of raw) {
+      if (!item || !item.title) continue;
+      // Định danh bền vững = path canonical; URL để ĐIỀU HƯỚNG phải là absolute.
+      const identity = item.coursePath || this._canonicalCourseUrl(item.url, item.title);
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      let absoluteUrl = item.url || null;
+      if (!absoluteUrl && item.coursePath) {
+        try { absoluteUrl = new URL(item.coursePath, BASE_URL).href; } catch { absoluteUrl = item.coursePath; }
+      }
+      normalized.push({
+        courseUrl: absoluteUrl || identity,
+        coursePath: identity,
+        title: item.title,
+        orderIndex: normalized.length,
+        completed: item.completed === true,
+        completionState: item.completed === true ? 'completed' : (item.state === 'completed' ? 'completed' : 'incomplete'),
+        progressPercent: Number.isFinite(Number(item.progressPercent)) ? Number(item.progressPercent) : null,
+        recordedMinutes: Number.isFinite(Number(item.recordedMinutes)) ? Number(item.recordedMinutes) : null,
+        discoveredAt: new Date().toISOString(),
+        source: item.source || 'my_courses',
+      });
+    }
+    if (normalized.length === 0) {
+      if (log) this.log('⚠️ Website course discovery returned no usable courses', 'warn');
+      return null;
+    }
+
+    this.discoveredCourses = normalized;
+    // Khóa học dùng cho NORMAL/SURPLUS pass = khóa phát hiện được, theo đúng thứ
+    // tự website, KHÔNG còn phụ thuộc targetHours/targetMinutes thủ công.
+    this.coursesConfig = normalized.map(c => ({
+      courseUrl: c.courseUrl,
+      title: c.title,
+      orderIndex: c.orderIndex,
+      targetHours: 0,
+      targetMinutes: 0,
+    }));
+
+    for (const c of normalized) {
+      const existing = this.courseProgress[c.courseUrl] || {};
+      this.courseProgress[c.courseUrl] = {
+        ...existing,
+        title: c.title,
+        discoveredOrderIndex: c.orderIndex,
+        websiteCourseCompleted: c.completed,
+        websiteCourseCompletionState: c.completionState,
+        websiteCourseProgressPercent: c.progressPercent,
+        lastDiscoveredAt: c.discoveredAt,
+        source: c.source,
+      };
+    }
+
+    this._discoveryValid = true;
+    this._detectNewCourses(normalized, log);
+    return normalized;
+  }
+
+  // Phát hiện khóa MỚI chưa từng thấy để log và đánh thức NORMAL.
+  _detectNewCourses(normalized, log = true) {
+    const keys = normalized.map(c => c.courseUrl);
+    // Lần phát hiện ĐẦU TIÊN là baseline (mọi khóa đều "mới") → không log ồn ào.
+    const isBaseline = this.knownCourseKeys.length === 0;
+    const newlyDiscovered = normalized.filter(c => !this.knownCourseKeys.includes(c.courseUrl));
+    if (log && !isBaseline) {
+      for (const c of newlyDiscovered) {
+        this.log('🆕 New course detected', 'warn');
+        this.log(`   Course: ${c.title}`, 'warn');
+        this.log(`   Website order: ${c.orderIndex + 1}/${normalized.length}`, 'warn');
+        this.log(`   Status: ${c.completed ? 'Completed' : 'In Progress'}`, 'warn');
+      }
+      if (newlyDiscovered.some(c => !c.completed)) {
+        this.log('↩️ Returning account to NORMAL study priority', 'warn');
+      }
+    }
+    this.knownCourseKeys = [...new Set([...this.knownCourseKeys, ...keys])];
+    return { newlyDiscovered, isBaseline };
+  }
+
+  _allDiscoveredCoursesCompleted() {
+    return this._discoveryValid
+      && this.discoveredCourses.length > 0
+      && this.discoveredCourses.every(c => c.completed === true);
+  }
+
+  _logDiscovery(discovered) {
+    const list = discovered || this.discoveredCourses || [];
+    this.log('🔎 Discovering website courses...', 'info');
+    this.log(`✅ Found ${list.length} course${list.length === 1 ? '' : 's'}`, 'success');
+    list.forEach((c, idx) => {
+      const status = c.completed ? 'Completed' : (c.progressPercent != null ? `In Progress - ${c.progressPercent}%` : 'In Progress');
+      this.log(`${idx + 1}/${list.length} [${status}]`, c.completed ? 'success' : 'warn');
+      this.log(`   ${c.title}`, c.completed ? 'info' : 'warn');
+    });
+  }
+
+  // Xác minh TƯƠI danh sách khóa + trạng thái hoàn thành website. Trả về:
+  //   true  → mọi khóa hiện tại đều Completed
+  //   false → còn khóa chưa hoàn thành
+  //   null  → không phát hiện được (coi là chưa xác định, KHÔNG hoàn tất)
+  async _verifyAllCurrentCoursesCompleted({ log = false } = {}) {
+    const discovered = await this._discoverCourses({ log });
+    if (!discovered) return null;
+    return this._allDiscoveredCoursesCompleted();
+  }
+
   // ── SURPLUS: trạng thái theo TỪNG KHÓA ──
 
   _surplusStateFor(courseUrl) {
@@ -913,7 +1063,9 @@ class AutoCourseSession extends EventEmitter {
   // nguyên tiến độ đã persist để resume đúng khóa.
   async _initializeSurplusMode() {
     if (!this._isRunActive()) return false;
-    if (!(await this._verifyAllConfiguredCoursesCompleted())) return false;
+    // Surplus chỉ được bắt đầu khi MỌI khóa hiện tại của website đã Completed.
+    const allCompleted = await this._verifyAllCurrentCoursesCompleted({ log: false });
+    if (allCompleted !== true) return false;
     if (!this._isRunActive()) return false;
 
     this._ensureSurplusCourseStates();
@@ -1188,14 +1340,14 @@ class AutoCourseSession extends EventEmitter {
 
   async _finalizeSurplusCompletion() {
     // Chỉ hoàn tất khi TOÀN BỘ khóa đã xử lý xong surplus pass (đạt target hoặc
-    // kiệt khẩu). `unknown` của gate cấp khóa không gây lặp vô hạn.
+    // kiệt khẩu) VÀ lần phát hiện TƯƠI xác nhận mọi khóa hiện tại đều Completed.
     if (!this._surplusPassProcessed()) return false;
     if (!this._isRunActive()) return false;
-    this.log('🔎 Final verification after surplus pass', 'info');
-    const verified = await this._verifyAllConfiguredCoursesCompleted();
+    this.log('🔎 Final website course discovery...', 'info');
+    const allCompleted = await this._verifyAllCurrentCoursesCompleted({ log: false });
     if (!this._isRunActive()) return false;
-    if (!verified) {
-      this.log('⚠️ Surplus pass finished, but final all-course verification failed; deferring completion', 'warn');
+    if (allCompleted !== true) {
+      this.log('⚠️ Surplus pass finished, but website still has incomplete courses or discovery failed; deferring completion', 'warn');
       return false;
     }
     this.surplusMode = false;
@@ -1650,6 +1802,9 @@ class AutoCourseSession extends EventEmitter {
       refreshInterval: this.options.refreshInterval || 15,
       dailyDate: this.dailyDate,
       courseProgress: this.courseProgress,
+      discoveredCourses: this.discoveredCourses,
+      knownCourseKeys: this.knownCourseKeys,
+      discoveryValid: this._discoveryValid,
       surplusMode: this.surplusMode,
       surplusCurrentCourseIndex: this.surplusCurrentCourseIndex,
       surplusCourseStates: this.surplusCourseStates,
@@ -1881,25 +2036,35 @@ class AutoCourseSession extends EventEmitter {
       this._startStealthLoop();
       await this.login();
 
-      let surplusHandled = false;
-      if (this.surplusMode) {
-        // A restored surplus session must still pass the website-level gate.
-        if (await this._initializeSurplusMode()) {
-          surplusHandled = true;
-          await this._runSurplusStudy();
-        } else if (!this.surplusExhausted) {
-          this.surplusMode = false;
-          this.log('⚠️ Restored surplus state failed the all-course 100% verification; returning to normal course mode', 'warn');
-        }
+      // 1) AUTO-DISCOVER danh sách khóa hiện tại từ website (nguồn chân lý).
+      const discovery = await this._discoverCourses({ log: false });
+      if (!discovery) {
+        this.log('⚠️ Could not discover website courses — scheduling next run', 'warn');
+        if (this._hitSchedulingLimit()) return;
+        this._enterScheduledStatus('next-day');
+        this.emit('status', this.getStatus());
+        return;
       }
+      this._logDiscovery(discovery);
 
-      // Vòng lặp qua các khóa học được cấu hình
-      for (let cIdx = 0; cIdx < this.coursesConfig.length && !surplusHandled; cIdx++) {
+      // 2) NORMAL PASS có ưu tiên tuyệt đối so với surplus: chỉ học khóa CHƯA
+      // Completed. Nếu mọi khóa đã Completed thì bỏ qua toàn bộ normal pass.
+      const normalPassNeeded = !this._allDiscoveredCoursesCompleted();
+      if (normalPassNeeded) this.surplusMode = false;
+      else this.log('✅ All current website courses are Completed', 'success');
+
+      // Vòng lặp qua các khóa phát hiện được, theo đúng thứ tự website.
+      for (let cIdx = 0; cIdx < this.coursesConfig.length; cIdx++) {
+        if (!normalPassNeeded) break;
         if (this._stopped) break;
         await this._checkPaused();
         if (this._hitSchedulingLimit()) return;
 
         const cConfig = this.coursesConfig[cIdx];
+        if (this.courseProgress[cConfig.courseUrl]?.websiteCourseCompleted === true) {
+          this.log(`⏭️ NORMAL Course ${cIdx + 1}/${this.coursesConfig.length} already Completed — skipping`, 'info');
+          continue;
+        }
         this.currentCourseIndex = cIdx;
         const courseRunId = ++this._courseRunGeneration;
         this._activeCourseRunId = courseRunId;
@@ -2507,7 +2672,31 @@ class AutoCourseSession extends EventEmitter {
           }
         }
 
-        if (!courseFinalizedThisRun && targetMinutes === 0 && courseReachedTarget(targetMinutes, courseStudiedMins, true)) {
+        // 3) Re-check COURSE-level website completion sau khi học xong các bài.
+        // Badge website là thẩm quyền — KHÔNG suy ra hoàn thành từ việc mọi bài
+        // hiển thị 100%.
+        if (!this._stopped && this._isRunActive()) {
+          this.log('🔄 Re-checking website course status...', 'info');
+          const recheck = await this._scanCourseDetailsForCheckpoint(cConfig.courseUrl, true);
+          if (!this._isRunActive()) return;
+          if (recheck) {
+            const siteState = AutoCourseSession._courseCompletionStateOf(recheck);
+            this.courseProgress[cConfig.courseUrl] = {
+              ...this.courseProgress[cConfig.courseUrl],
+              title: recheck.courseTitle || scanResult.courseTitle,
+              websiteCourseCompleted: siteState === 'completed',
+              websiteCourseCompletionState: siteState,
+              websiteCourseProgressPercent: recheck.courseProgressPercent ?? null,
+            };
+            if (siteState === 'completed') {
+              this.log(`✅ NORMAL Course ${cIdx + 1}/${this.coursesConfig.length} completed`, 'success');
+              this.log('   Website confirms: Completed', 'success');
+              if (cIdx + 1 < this.coursesConfig.length) this.log(`➡️ Moving to Course ${cIdx + 2}/${this.coursesConfig.length}`, 'info');
+            } else {
+              this.log(`⏳ NORMAL Course ${cIdx + 1}/${this.coursesConfig.length} website status: ${siteState} — sẽ quét lại`, 'warn');
+            }
+          }
+        } else if (!this._stopped && targetMinutes === 0 && courseReachedTarget(targetMinutes, courseStudiedMins, true)) {
           this.courseProgress[cConfig.courseUrl].completed = true;
         }
       }
@@ -2518,60 +2707,64 @@ class AutoCourseSession extends EventEmitter {
       } else if (SCHEDULED_STATUSES.has(this.status) || this.status === 'paused') {
         // Giữ nguyên trạng thái giới hạn / tạm dừng — không ghi đè thành completed!
         this.emit('status', this.getStatus());
-      } else if (surplusHandled && await this._finalizeSurplusCompletion()) {
-        this._setStatus('completed');
-        this.log('✅ Account fully completed', 'success');
-        this.log('➡️ Moving account to complete queue', 'success');
-        this.emit('status', this.getStatus());
       } else {
-        const allWebsiteCoursesCompleted = this.coursesConfig.length === 0
-          || await this._verifyAllConfiguredCoursesCompleted();
-        // Surplus pass chỉ bắt đầu khi mọi target thường đã đạt VÀ pass chưa xử lý xong.
-        const surplusPassPending = this.coursesConfig.length > 0
-          && allWebsiteCoursesCompleted
-          && !this.surplusMode
-          && !this._surplusPassProcessed();
-        if (surplusPassPending) {
-          await this._initializeSurplusMode();
-          if (this.surplusMode) {
+        // 3) Sau NORMAL pass: phát hiện LẠI danh sách khóa (bắt khóa mới/đổi trạng thái).
+        const afterNormal = await this._discoverCourses({ log: false });
+        if (!afterNormal) {
+          this.log('⏭️ Could not rediscover website courses — scheduling next run', 'warn');
+          if (this._hitSchedulingLimit()) return;
+          this._enterScheduledStatus('next-day');
+          this.emit('status', this.getStatus());
+          return;
+        }
+
+        if (!this._allDiscoveredCoursesCompleted()) {
+          const remaining = this.discoveredCourses.filter(c => !c.completed).length;
+          this.log(`⏭️ Normal courses still incomplete (${remaining}/${this.discoveredCourses.length}) — scheduling next run`, 'warn');
+          if (this._hitSchedulingLimit()) return;
+          this._enterScheduledStatus('next-day');
+          this.emit('status', this.getStatus());
+          return;
+        }
+
+        this.log('✅ All current website courses are Completed', 'success');
+
+        // 4) SURPLUS PASS — chỉ khi MỌI khóa hiện tại đã Completed.
+        if (!this._surplusPassProcessed()) {
+          if (await this._initializeSurplusMode()) {
             await this._runSurplusStudy();
           }
           if (SCHEDULED_STATUSES.has(this.status) || this.status === 'paused') {
             this.emit('status', this.getStatus());
             return;
           }
-          if (await this._finalizeSurplusCompletion()) {
-            this._setStatus('completed');
-            this.log('✅ Account fully completed', 'success');
-            this.log('➡️ Moving account to complete queue', 'success');
-            this.emit('status', this.getStatus());
-            return;
-          }
         }
-        // Pass đã xử lý xong (restore/khôi phục) → xác minh lần cuối rồi hoàn tất.
-        if (allWebsiteCoursesCompleted && this._surplusPassProcessed()) {
-          if (await this._finalizeSurplusCompletion()) {
-            this._setStatus('completed');
-            this.log('✅ Account fully completed', 'success');
-            this.log('➡️ Moving account to complete queue', 'success');
-            this.emit('status', this.getStatus());
-            return;
-          }
-        }
-        const incompleteCourses = this.coursesConfig.filter(c => !this.courseProgress[c.courseUrl]?.completed);
-        if (this.surplusMode || (!allWebsiteCoursesCompleted && incompleteCourses.length === 0)) {
+
+        // 5) PHÁT HIỆN LẦN CUỐI trước khi vào complete queue (chống khóa mới).
+        const finalDiscovery = await this._discoverCourses({ log: false });
+        if (!finalDiscovery) {
+          this.log('⏭️ Final course discovery failed — scheduling next run', 'warn');
           if (this._hitSchedulingLimit()) return;
           this._enterScheduledStatus('next-day');
-          this.log('⏭️ Course targets are met locally, but website has not confirmed all courses at 100%; waiting for the next verification run', 'warn');
-        } else if (incompleteCourses.length > 0) {
-          // Bắt lại đúng loại lịch hẹn nếu ca/khung/ngân sách ngày vừa kết thúc
-          // trong lúc xử lý bài cuối cùng của lượt quét.
+          this.emit('status', this.getStatus());
+          return;
+        }
+        if (!this._allDiscoveredCoursesCompleted()) {
+          this.log('↩️ New/incomplete course detected at final verification — returning to NORMAL priority', 'warn');
           if (this._hitSchedulingLimit()) return;
           this._enterScheduledStatus('next-day');
-          this.log(`⏭️ Đã quét hết lượt hôm nay nhưng còn ${incompleteCourses.length}/${this.coursesConfig.length} khóa chưa đạt mục tiêu thời gian → Hẹn ${this.options.newDayStartTime || '06:00'} ngày học tiếp theo quét và treo tiếp!`, 'warn');
-        } else {
+          this.emit('status', this.getStatus());
+          return;
+        }
+
+        if (await this._finalizeSurplusCompletion()) {
           this._setStatus('completed');
-          this.log(`🎉 Tất cả các khóa học đã đạt mục tiêu và treo xong!`, 'success');
+          this.log('✅ Account fully completed', 'success');
+          this.log('➡️ Moving account to complete queue', 'success');
+        } else {
+          this.log('⏭️ Surplus pass not finished — scheduling next run', 'warn');
+          if (this._hitSchedulingLimit()) return;
+          this._enterScheduledStatus('next-day');
         }
         this.emit('status', this.getStatus());
       }
