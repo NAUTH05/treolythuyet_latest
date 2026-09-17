@@ -9,6 +9,7 @@ const AUTO_STATUS = {
   studying:     { text: 'Đang treo học', badge: 'badge-running' },
   'surplus-study': { text: 'Đang học surplus', badge: 'badge-running' },
   paused:       { text: 'Tạm dừng', badge: 'badge-idle' },
+  'scheduled-start': { text: 'Đã hẹn lịch', badge: 'badge-logging-in' },
   'date-limit': { text: 'Ngày nghỉ — đã hẹn lịch', badge: 'badge-logging-in' },
   'daily-limit':{ text: 'Đủ giờ hôm nay — đã hẹn lịch', badge: 'badge-logging-in' },
   'time-window':{ text: 'Ngoài khung giờ — đã hẹn lịch', badge: 'badge-logging-in' },
@@ -19,7 +20,7 @@ const AUTO_STATUS = {
 };
 
 const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying', 'surplus-study']);
-const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window', 'next-day']);
+const SCHEDULED_STATUSES = new Set(['scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day']);
 const DONE_STATUSES = new Set(['completed', 'stopped', 'error']);
 
 function formatVNDateTime(iso) {
@@ -56,6 +57,12 @@ function AutoScanCard({ scan, toast }) {
   const isScheduled = SCHEDULED_STATUSES.has(scan.status);
   const isPaused = scan.status === 'paused';
   const courses = Object.entries(scan.courseProgress || {});
+  // Khóa học chỉ có số liệu SAU khi auto-discovery chạy (sau khi login). Trước
+  // đó totalCourses = 0 → hiển thị "Chưa quét", KHÔNG bịa 1/1.
+  const totalCourses = scan.totalCourses
+    || (Array.isArray(scan.discoveredCourses) ? scan.discoveredCourses.length : 0);
+  const hasCourseData = totalCourses > 0;
+  const currentCourseNo = Math.min((scan.currentCourseIndex || 0) + 1, totalCourses || 1);
 
   const [showEditModal, setShowEditModal] = useState(false);
   const [editHours, setEditHours] = useState('');
@@ -143,7 +150,7 @@ function AutoScanCard({ scan, toast }) {
       </div>
 
       <div className="autoscan-meta">
-        <span>Khóa học: <strong>{Math.min((scan.currentCourseIndex || 0) + 1, scan.totalCourses || 1)}/{scan.totalCourses || 1}</strong></span>
+        <span>Khóa học: <strong>{hasCourseData ? `${currentCourseNo}/${totalCourses}` : 'Chưa quét'}</strong></span>
         <span>
           Hôm nay: <strong>{formatMinutes(scan.dailyStudiedMinutes)} / {formatMinutes(dailyMax)}</strong>
           <button
@@ -157,7 +164,7 @@ function AutoScanCard({ scan, toast }) {
           </button>
         </span>
         {isScheduled && scan.nextRunTime && (
-          <span>Tự chạy lại: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
+          <span>{scan.status === 'scheduled-start' ? 'Chờ đến giờ hẹn' : 'Tự chạy lại'}: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
         )}
         {scan.randomStartEnabled && scan.scheduledStartAt && (
           <span>Hẹn chạy hôm nay: <strong>{formatVNDateTime(scan.scheduledStartAt)}</strong></span>
@@ -302,6 +309,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
   const activeScans = scanList.filter(s => !DONE_STATUSES.has(s.status));
   const doneScans = scanList.filter(s => DONE_STATUSES.has(s.status));
   const activeCount = scanList.filter(s => ACTIVE_STATUSES.has(s.status) || s.status === 'paused').length;
+  const scheduledCount = scanList.filter(s => SCHEDULED_STATUSES.has(s.status)).length;
 
   const handleSelectPreset = (presetId) => {
     setSelectedPresetId(presetId);
@@ -877,6 +885,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
             Tiến độ Auto-Scan
             {activeCount > 0 && <span className="count-pill">{activeCount} hoạt động</span>}
+            {scheduledCount > 0 && <span className="count-pill">{scheduledCount} đã hẹn</span>}
           </span>
           {doneScans.length > 0 && (
             <button className="btn btn-xs btn-danger" onClick={handleClearCompleted}>

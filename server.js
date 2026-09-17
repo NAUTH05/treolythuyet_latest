@@ -5,10 +5,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { BotSession } = require('./bot');
-const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES } = require('./autoCourseEngine');
+const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES, SCHEDULED_START_STATUS } = require('./autoCourseEngine');
 const { AutoCourseRegistry } = require('./autoCourseRegistry');
 const { isStaleScheduledSession, restartScheduledSession, applyAutoScanRestoreState } = require('./autoScanRecovery');
-const { planAutoScanStart, findBlockingAutoScanSession, describeAutoScanBlocker, buildAutoScanStartResponse } = require('./autoScanStart');
+const { planAutoScanStart, findBlockingAutoScanSession, describeAutoScanBlocker, buildAutoScanStartResponse, applyScheduledStart } = require('./autoScanStart');
+const { autoScanSnapshot, createAutoScanBroadcaster } = require('./autoScanBroadcast');
 const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
@@ -1675,6 +1676,10 @@ function saveAutoScanState() {
   }
 }
 
+// Một nguồn duy nhất phát trạng thái Auto-Scan ra mọi client. Dùng hàm này thay
+// vì tự ghép payload ở từng chỗ để luồng live và `init` luôn cùng shape.
+const emitAutoScanStatus = createAutoScanBroadcaster(io);
+
 // Hẹn giờ an toàn với delay dài (registry tự chia bước 12h tránh tràn int32),
 // và bảo đảm mỗi sessionId chỉ có duy nhất 1 timer đang chờ.
 function scheduleAutoScanTimer(sessionId, fireAt, fn, reason = 'timer') {
@@ -1770,7 +1775,7 @@ function createAutoScanSession(sessionId, account, courses, options, restoreStat
     if (AUTO_TERMINAL_STATUSES.has(status.status) && !autoSession.completedAt) {
       autoSession.completedAt = new Date().toISOString();
     }
-    io.emit('autoscan-status', { ...status, nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
+    emitAutoScanStatus(autoSession);
     saveAutoScanState();
     // Chạm giới hạn ngày / ngày nghỉ / hết khung giờ học → tự hẹn giờ chạy lại (giống Queue thủ công)
     if (AUTO_SCHEDULED_STATUSES.has(status.status)) {
@@ -1825,7 +1830,7 @@ function scheduleAutoScanResume(autoSession) {
     msg: `⏰ Auto-Scan hẹn tự chạy lại lúc ${formatVN(resumeAt)}`,
     level: 'info',
   });
-  io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime });
+  emitAutoScanStatus(autoSession);
   saveAutoScanState();
   scheduleAutoScanTimer(autoSession.id, resumeAt, () => restartAutoScanSession(autoSession.id), 'resume');
 }
@@ -1939,6 +1944,22 @@ async function loadAndRestoreAutoScans() {
         level: 'info',
       });
       active++;
+    } else if (saved.status === SCHEDULED_START_STATUS) {
+      // Lịch random-start còn ở tương lai: giữ NGUYÊN scheduled-start (không hạ
+      // về idle) và khôi phục timer. Nếu giờ hẹn đã qua, startAutoScanWhenFree
+      // sẽ tự khởi động engine. Không hạ phase/không gọi start() sớm.
+      const fireAt = saved.nextRunTime
+        ? new Date(saved.nextRunTime)
+        : (s.options.scheduledStartAt ? new Date(s.options.scheduledStartAt) : null);
+      if (fireAt && !Number.isNaN(fireAt.getTime())) s.nextRunTime = fireAt.toISOString();
+      logHistory.push({
+        timestamp: formatVN(new Date()),
+        account: saved.account.name,
+        msg: `⏰ Server restart — khôi phục lịch hẹn Auto-Scan ${s.nextRunTime ? `→ ${formatVN(new Date(s.nextRunTime))}` : '(chưa rõ giờ)'}`,
+        level: 'info',
+      });
+      scheduleAutoScanTimer(saved.id, Date.now() + RESTORE_START_DELAY_MS, () => startAutoScanWhenFree(s, 'khôi-phục-lịch'), 'restore-scheduled-start');
+      active++;
     } else if (saved.status === 'idle' || saved.status === 'logging-in' || saved.status === 'scanning' || saved.status === 'studying' || saved.status === 'surplus-study') {
       logHistory.push({
         timestamp: formatVN(new Date()),
@@ -2003,11 +2024,14 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
   // hồi sinh qua một timer cũ).
   if (!autoScanRegistry.isCurrent(autoSession)) return;
   if (autoSession.status === 'stopped' || autoSession._stopped) return;
+  // Random-start trong tương lai: phiên đã được chấp nhận nên phải mang trạng
+  // thái HẸN LỊCH (`scheduled-start`), KHÔNG để `idle` ("chờ khởi động"). Engine
+  // vẫn ở PHASE_NEW — chỉ được đánh thức khi timer nổ.
   if (autoSession.options.randomStartEnabled && autoSession.options.scheduledStartAt) {
     const scheduledAt = new Date(autoSession.options.scheduledStartAt);
-    if (!Number.isNaN(scheduledAt.getTime()) && scheduledAt.getTime() > Date.now() + 500) {
-      autoSession.nextRunTime = scheduledAt.toISOString();
+    if (applyScheduledStart(autoSession, scheduledAt)) {
       scheduleAutoScanTimer(autoSession.id, scheduledAt, () => startAutoScanWhenFree(autoSession, 'random-scheduled'), 'scheduled-start');
+      emitAutoScanStatus(autoSession);
       saveAutoScanState();
       return;
     }
@@ -2029,7 +2053,7 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
       msg: `⏳ Tài khoản đang chạy ${conflict} — chờ 5 phút rồi thử khởi động Auto-Scan lại...`,
       level: 'warn',
     });
-    io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime });
+    emitAutoScanStatus(autoSession);
     saveAutoScanState();
     scheduleAutoScanTimer(autoSession.id, retryAt, () => startAutoScanWhenFree(autoSession, 'thử-lại'), 'retry');
     return;
@@ -2038,8 +2062,12 @@ function startAutoScanWhenFree(autoSession, trigger = 'không-rõ') {
   // Giành khóa tài khoản NGAY tại đây (đồng bộ, không await giữa kiểm tra và
   // ghi nhận) → hai request/timer đồng thời chỉ có một phiên mở browser.
   autoScanRegistry.claimAccount(autoSession.account.email, autoSession);
+  // Rời trạng thái hẹn lịch: engine sắp chạy nên status không còn là scheduled-start.
+  if (autoSession.status === SCHEDULED_START_STATUS) autoSession.status = 'idle';
   autoSession.nextRunTime = null;
   console.log(`[AUTOSCAN] start | session=${autoSession.id} | account=${autoSession.account.name} | trigger=${trigger} | khóa=${autoSession.coursesConfig.length}`);
+  // Phát ngay để thẻ xuất hiện tức thì, không phụ thuộc engine kịp emit.
+  emitAutoScanStatus(autoSession);
   autoSession.start()
     .catch(err => {
       addLog({ timestamp: formatVN(new Date()), account: autoSession.account.name, msg: `❌ Lỗi Auto-Scan: ${err.message}`, level: 'error' });
@@ -2231,7 +2259,7 @@ app.post('/api/auto-scan/pause/:id', async (req, res) => {
   const paused = autoSession.pause();
   if (!paused) return res.status(400).json({ error: 'Không thể tạm dừng (phiên không đang hoạt động)' });
 
-  io.emit('autoscan-status', autoSession.getStatus());
+  emitAutoScanStatus(autoSession);
   return respondAfterStateSync(res, saveAutoScanState(), { ok: true });
 });
 
@@ -2249,7 +2277,7 @@ app.post('/api/auto-scan/resume/:id', async (req, res) => {
   if (autoSession.isRunning()) {
     // Phiên còn đang chạy → tiếp tục ngay tại chỗ
     autoSession.resume();
-    io.emit('autoscan-status', autoSession.getStatus());
+    emitAutoScanStatus(autoSession);
   } else {
     // Phiên tạm dừng được khôi phục sau server restart (vòng lặp đã chết)
     // → tạo lại phiên mới cùng ID từ tiến độ đã lưu (giống Queue thủ công resume sau restart)
@@ -2293,7 +2321,7 @@ app.post('/api/auto-scan/stop/:id', async (req, res) => {
   autoScanRegistry.releaseAccount(autoSession);
   autoSession.nextRunTime = null;
   if (!autoSession.completedAt) autoSession.completedAt = new Date().toISOString();
-  io.emit('autoscan-status', { ...autoSession.getStatus(), nextRunTime: null, completedAt: autoSession.completedAt });
+  emitAutoScanStatus(autoSession);
   addLog({
     timestamp: formatVN(new Date()),
     account: autoSession.account.name,
@@ -2747,7 +2775,8 @@ io.on('connection', (socket) => {
   }
   const autoScanList = [];
   for (const [id, autoSession] of autoScanRegistry.entries()) {
-    autoScanList.push({ ...autoSession.getStatus(), nextRunTime: autoSession.nextRunTime || null, completedAt: autoSession.completedAt || null });
+    const snapshot = autoScanSnapshot(autoSession);
+    if (snapshot) autoScanList.push(snapshot);
   }
   socket.emit('init', {
     sessions: sessionList,

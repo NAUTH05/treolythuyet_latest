@@ -19,7 +19,7 @@
 //  là phiên mồ côi / lịch quá hạn → dọn được, không được chặn start mãi mãi.
 // ============================================================
 
-const { SCHEDULED_STATUSES, TERMINAL_STATUSES, PHASE_RUNNING } = require('./autoCourseEngine');
+const { SCHEDULED_STATUSES, TERMINAL_STATUSES, SCHEDULED_START_STATUS, PHASE_RUNNING } = require('./autoCourseEngine');
 
 // Chuẩn hoá một "khoá tài khoản" về number nếu là số (kể cả chuỗi số), ngược lại
 // giữ nguyên chuỗi đã trim. Nhờ vậy 7 và "7" được coi là cùng một tài khoản.
@@ -111,6 +111,18 @@ function hasFutureNextRun(session, now) {
   return Number.isFinite(at) && at > now;
 }
 
+// Đưa một phiên MỚI (phase vẫn PHASE_NEW) sang trạng thái `scheduled-start`.
+// KHÔNG chạm tới `_phase`/`start()`: engine chỉ thực sự chạy khi timer nổ.
+// Trả về true nếu lịch còn ở tương lai (đủ ngưỡng an toàn) và đã áp dụng.
+function applyScheduledStart(session, scheduledAt, { now = Date.now(), thresholdMs = 500 } = {}) {
+  if (!session) return false;
+  const at = scheduledAt instanceof Date ? scheduledAt : new Date(scheduledAt);
+  if (Number.isNaN(at.getTime()) || at.getTime() <= now + thresholdMs) return false;
+  session.status = SCHEDULED_START_STATUS;
+  session.nextRunTime = at.toISOString();
+  return true;
+}
+
 // Tìm phiên KHÁC đang thật sự giữ tài khoản (đang chạy / tạm dừng).
 function findLiveAccountOwner(registry, email, exclude = null) {
   if (!registry || !email || typeof registry.values !== 'function') return null;
@@ -184,6 +196,7 @@ function describeAutoScanBlocker(session, verdict) {
       return 'đã có phiên Auto-Scan đang tạm dừng';
     case 'scheduled':
     case 'waiting':
+      if (status === SCHEDULED_START_STATUS) return 'đã có phiên Auto-Scan đã hẹn lịch';
       return `đã có phiên Auto-Scan ${status}`;
     case 'live-owner':
       return 'tài khoản đang được một phiên Auto-Scan khác sử dụng';
@@ -274,6 +287,8 @@ module.exports = {
   normalizeAccountKey,
   resolveRequestedAccounts,
   isAutoScanSessionActive,
+  hasFutureNextRun,
+  applyScheduledStart,
   findLiveAccountOwner,
   classifyAutoScanBlocker,
   findBlockingAutoScanSession,

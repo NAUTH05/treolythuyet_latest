@@ -84,7 +84,7 @@ const COURSE_FINALIZATION_STATES = Object.freeze({
 // Dashboard phải hiểu được toàn bộ danh sách này (xem test frontendStatusContract).
 const AUTO_COURSE_STATUSES = [
   'idle', 'logging-in', 'scanning', 'studying', 'paused',
-  'surplus-study', 'date-limit', 'daily-limit', 'time-window', 'next-day',
+  'surplus-study', 'scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day',
   'completed', 'stopped', 'error',
 ];
 
@@ -92,7 +92,12 @@ const AUTO_COURSE_STATUSES = [
 const TERMINAL_STATUSES = new Set(['completed', 'stopped', 'error']);
 
 // Trạng thái server sẽ tự hẹn giờ chạy lại.
-const SCHEDULED_STATUSES = new Set(['date-limit', 'daily-limit', 'time-window', 'next-day']);
+// `scheduled-start`: phiên đã được người dùng chấp nhận, đang chờ tới
+// scheduledStartAt (random distributed start) rồi engine mới chạy. KHÁC với
+// idle ("chờ khởi động") và KHÁC với các giới hạn ngày/ca/khung giờ ở trên.
+// Vẫn là trạng thái không-kết-thúc nên được stale recovery xử lý khi timer mất.
+const SCHEDULED_STATUSES = new Set(['scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day']);
+const SCHEDULED_START_STATUS = 'scheduled-start';
 
 // Giai đoạn vòng đời của đối tượng phiên (khác với `status` hiển thị):
 //   new      → chưa từng gọi start(), chưa chiếm tài khoản Odoo
@@ -2828,6 +2833,7 @@ module.exports = {
   AUTO_COURSE_STATUSES,
   TERMINAL_STATUSES,
   SCHEDULED_STATUSES,
+  SCHEDULED_START_STATUS,
   PHASE_NEW,
   PHASE_RUNNING,
   PHASE_FINISHED,
