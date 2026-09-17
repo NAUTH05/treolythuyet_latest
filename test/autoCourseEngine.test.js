@@ -638,214 +638,425 @@ test('surplus gate ignores local target completion without website course-level 
   assert.equal(session._allConfiguredCoursesWebsiteCompleted(), false);
 });
 
-test('surplus target is generated once and remains within 15-60 minutes', () => {
-  const session = new AutoCourseSession('surplus-target', { name: 'Target' });
-  session._randomBetween = () => 37;
-  assert.equal(session._generateSurplusTargetOnce(), 37);
-  session._randomBetween = () => 15;
-  assert.equal(session._generateSurplusTargetOnce(), 37);
-  assert.equal(session.getStatus().surplusTargetMinutes, 37);
-});
+// ── SURPLUS MỚI: tuần tự theo khóa, mục tiêu RNG mỗi khóa, xác minh website ──
 
-test('surplus initialization builds an eligible pool dynamically and preserves target', async () => {
-  const courses = [
-    { courseUrl: 'https://x/slides/course-1', targetMinutes: 1 },
-    { courseUrl: 'https://x/slides/course-2', targetMinutes: 1 },
-    { courseUrl: 'https://x/slides/course-3', targetMinutes: 1 },
-  ];
-  const session = new AutoCourseSession('surplus-init', { name: 'Init' }, courses);
-  session.context = {};
+// Mô phỏng website: mỗi khóa có tổng phút + danh sách bài với progressPercent.
+// Học một block sẽ tăng progress bài và tổng phút khóa (trừ khi confirmOnStudy=false).
+function makeSurplusSession({
+  id,
+  courses,
+  website,
+  failingLessonUrls = [],
+  confirmOnStudy = true,
+  rngSequence = null,
+  dailyMaxMinutes = 480,
+  progressPerMinute = 4,
+}) {
+  const session = new AutoCourseSession(id, { name: id }, courses, { dailyMaxMinutes });
   session._phase = PHASE_RUNNING;
-  session._verifyAllConfiguredCoursesCompleted = async () => true;
-  session._scanCourseDetailsForCheckpoint = async (url) => ({
-    courseLevelCompleted: url !== courses[1].courseUrl,
-    courseTitle: url,
-    allLessons: url === courses[1].courseUrl ? [] : [{ title: 'Lesson', url: `${url}/lesson-1` }],
-  });
-  session.surplusTargetMinutes = 47;
-  assert.equal(await session._initializeSurplusMode(), true);
-  assert.equal(session.surplusMode, true);
-  assert.deepEqual(session.surplusEligibleCourses, [courses[0].courseUrl, courses[2].courseUrl]);
-  assert.equal(session.surplusTargetMinutes, 47);
-});
-
-test('surplus initialization exhausts cleanly when all completed courses have no lessons', async () => {
-  const courseUrl = 'https://x/slides/course-1';
-  const session = new AutoCourseSession('surplus-empty', { name: 'Empty' }, [{ courseUrl }]);
   session.context = {};
-  session._phase = PHASE_RUNNING;
-  session._verifyAllConfiguredCoursesCompleted = async () => true;
-  session._scanCourseDetailsForCheckpoint = async () => ({ courseLevelCompleted: true, allLessons: [] });
-  assert.equal(await session._initializeSurplusMode(), false);
-  assert.equal(session.surplusExhausted, true);
-  assert.equal(session.surplusMode, false);
-  assert.equal(session.surplusTargetMinutes, null);
-});
-
-// ── Surplus hardening: mục tiêu RNG chỉ là mức mong muốn TỐI ĐA ──
-
-function makeSurplusStudySession({ id, courses, lessonsByCourse, lessonMinutesByUrl = new Map(), failingLessonUrls = [] }) {
-  const session = new AutoCourseSession(id, { name: id }, courses);
-  session.context = {};
-  session._phase = PHASE_RUNNING;
+  session._fakeVisibilityAPI = async () => {};
   const gotoCounts = new Map();
   const studyCallsMs = [];
-  let currentUrl = 'about:blank';
+  const studyOrder = [];
+  let currentLessonUrl = null;
+  let rngIndex = 0;
 
-  session._verifyAllConfiguredCoursesCompleted = async () => true;
-  // Checkpoint rescan luôn trả về ĐẦY ĐỦ danh sách bài — buộc engine phải tự
-  // lọc bớt bài đã học/bỏ được, nếu không sẽ treo lặp cùng một bài.
-  session._scanCourseDetailsForCheckpoint = async (url) => ({
-    courseLevelCompleted: true,
-    courseTitle: url,
-    allLessons: (lessonsByCourse.get(url) || []).map(lesson => ({ ...lesson })),
-  });
-  session._fakeVisibilityAPI = async () => {};
+  const courseOfLesson = (url) => Object.keys(website).find(cu => (website[cu].lessons || []).some(l => l.url === url));
+  const snapshot = (courseUrl) => {
+    const course = website[courseUrl];
+    if (!course) return null;
+    return {
+      courseTitle: course.title || courseUrl,
+      actualStudiedMinutes: Math.round(course.minutes * 1000) / 1000,
+      courseCompletionState: 'completed',
+      courseLevelCompleted: true,
+      courseCompletionSource: 'test-fixture',
+      totalLessons: course.lessons.length,
+      allLessons: course.lessons.map(l => ({ ...l, isCompleted: l.progressPercent >= 100 })),
+      uncompletedLessons: course.lessons.filter(l => l.progressPercent < 100).map(l => ({ ...l, isCompleted: false })),
+    };
+  };
+
+  session._scanCourseDetailsForCheckpoint = async (courseUrl) => snapshot(courseUrl);
+  session._randomBetween = (min) => {
+    if (rngSequence && rngSequence.length > 0) {
+      const value = rngSequence[Math.min(rngIndex++, rngSequence.length - 1)];
+      return value;
+    }
+    return min;
+  };
   session._waitForActiveStudyTime = async (ms) => {
     studyCallsMs.push(ms);
+    if (currentLessonUrl) studyOrder.push(currentLessonUrl);
+    if (confirmOnStudy && currentLessonUrl) {
+      const courseUrl = courseOfLesson(currentLessonUrl);
+      if (courseUrl) {
+        const course = website[courseUrl];
+        const lesson = course.lessons.find(l => l.url === currentLessonUrl);
+        if (lesson) {
+          const addMinutes = ms / 60000;
+          course.minutes += addMinutes;
+          lesson.progressPercent = Math.min(100, lesson.progressPercent + addMinutes * progressPerMinute);
+        }
+      }
+    }
     return ms;
   };
-  session._randomBetween = (min) => min;
   session.page = {
-    url: () => currentUrl,
+    url: () => currentLessonUrl || 'about:blank',
     goto: async (url) => {
       gotoCounts.set(url, (gotoCounts.get(url) || 0) + 1);
-      if (failingLessonUrls.includes(url)) {
-        currentUrl = 'about:blank';
-        throw new Error('net::ERR_CONNECTION_REFUSED');
-      }
-      currentUrl = url;
+      if (failingLessonUrls.includes(url)) throw new Error('net::ERR_CONNECTION_REFUSED');
+      currentLessonUrl = url;
     },
     waitForTimeout: async () => {},
     reload: async () => {},
-    evaluate: async () => {
-      const minutes = lessonMinutesByUrl.get(currentUrl);
-      return minutes != null
-        ? { hours: 0, minutes, seconds: 0, totalMinutes: minutes, source: 'test' }
-        : null;
-    },
+    evaluate: async () => null,
+    $: async () => null,
   };
 
-  return { session, gotoCounts, studyCallsMs };
+  return { session, gotoCounts, studyCallsMs, studyOrder, website };
 }
 
-test('surplus exhaustion keeps real studied minutes, never reopens lessons, never shrinks the target', async () => {
-  const courses = [
-    { courseUrl: 'https://x/slides/course-a', targetMinutes: 1 },
-    { courseUrl: 'https://x/slides/course-b', targetMinutes: 1 },
-    { courseUrl: 'https://x/slides/course-c', targetMinutes: 1 },
-  ];
-  const lessonsByCourse = new Map([
-    [courses[0].courseUrl, [{ title: 'A1', url: 'https://x/slides/slide/course-a/lesson-a1-101' }]],
-    [courses[1].courseUrl, [{ title: 'B1', url: 'https://x/slides/slide/course-b/lesson-b1-201' }]],
-    [courses[2].courseUrl, [{ title: 'C1', url: 'https://x/slides/slide/course-c/lesson-c1-301' }]],
-  ]);
-  const lessonMinutesByUrl = new Map([
-    ['https://x/slides/slide/course-a/lesson-a1-101', 10],
-    ['https://x/slides/slide/course-b/lesson-b1-201', 8],
-    ['https://x/slides/slide/course-c/lesson-c1-301', 13],
-  ]);
-  const { session, gotoCounts } = makeSurplusStudySession({ id: 'surplus-exhaust', courses, lessonsByCourse, lessonMinutesByUrl });
-  session.surplusTargetMinutes = 52;
-
-  assert.equal(await session._initializeSurplusMode(), true);
-  assert.equal(await session._runSurplusStudy(), false);
-
-  assert.equal(session.surplusExhausted, true, 'no studyable lessons remain → exhausted');
-  assert.equal(session.surplusMode, false);
-  assert.equal(session.surplusStudiedMinutes, 31, 'keeps the real 31 studied minutes — never reports 52/52');
-  assert.equal(session.surplusTargetMinutes, 52, 'the RNG target is never regenerated or shrunk');
-  for (const [url] of lessonMinutesByUrl) {
-    assert.equal(gotoCounts.get(url), 1, `lesson ${url} must be opened exactly once`);
+function makeWebsite(courses, { minutes = 60, lessons } = {}) {
+  const website = {};
+  for (const c of courses) {
+    website[c.courseUrl] = {
+      title: c.courseUrl,
+      minutes,
+      lessons: lessons || [{ title: 'Lesson 1', url: `${c.courseUrl}/lesson-1`, progressPercent: 0 }],
+    };
   }
-  assert.equal(await session._finalizeSurplusCompletion(), true, 'exhaustion completes exactly like reaching the target');
-  assert.equal(session.surplusMode, false);
+  return website;
+}
+
+test('surplus target per-course is generated once and stays within 15-60 minutes', () => {
+  const c1 = 'https://x/slides/course-1';
+  const session = new AutoCourseSession('surplus-target', { name: 'Target' }, [{ courseUrl: c1 }]);
+  const state = session._surplusStateFor(c1);
+  session._randomBetween = () => 37;
+  assert.equal(session._surplusTargetFor(state), 37);
+  session._randomBetween = () => 60;
+  assert.equal(session._surplusTargetFor(state), 37, 'không regenerate');
+  assert.ok(state.targetMinutes >= 15 && state.targetMinutes <= 60);
 });
 
-test('surplus stops exactly at the RNG target without finishing the current lesson', async () => {
+test('surplus pass xử lý khóa TUẦN TỰ theo coursesConfig, không chọn ngẫu nhiên', async () => {
   const courses = [
-    { courseUrl: 'https://x/slides/course-a', targetMinutes: 1 },
-    { courseUrl: 'https://x/slides/course-b', targetMinutes: 1 },
-    { courseUrl: 'https://x/slides/course-c', targetMinutes: 1 },
+    { courseUrl: 'https://x/slides/course-1', targetMinutes: 30 },
+    { courseUrl: 'https://x/slides/course-2', targetMinutes: 30 },
+    { courseUrl: 'https://x/slides/course-3', targetMinutes: 30 },
   ];
-  const lessonsByCourse = new Map([
-    [courses[0].courseUrl, [{ title: 'A1', url: 'https://x/slides/slide/course-a/lesson-a1-101' }]],
-    [courses[1].courseUrl, [{ title: 'B1', url: 'https://x/slides/slide/course-b/lesson-b1-201' }]],
-    [courses[2].courseUrl, [{ title: 'C1', url: 'https://x/slides/slide/course-c/lesson-c1-301' }]],
-  ]);
-  const lessonMinutesByUrl = new Map([
-    ['https://x/slides/slide/course-a/lesson-a1-101', 25],
-    ['https://x/slides/slide/course-b/lesson-b1-201', 20],
-    ['https://x/slides/slide/course-c/lesson-c1-301', 30],
-  ]);
-  const { session, gotoCounts, studyCallsMs } = makeSurplusStudySession({ id: 'surplus-exact-stop', courses, lessonsByCourse, lessonMinutesByUrl });
-  session.surplusTargetMinutes = 50;
-
+  const { session, studyOrder } = makeSurplusSession({
+    id: 'surplus-seq',
+    courses,
+    website: makeWebsite(courses),
+    rngSequence: [15, 15, 15],
+  });
   assert.equal(await session._initializeSurplusMode(), true);
   assert.equal(await session._runSurplusStudy(), true);
 
-  assert.equal(session.surplusStudiedMinutes, 50, 'studies exactly 25 + 20 + 5 = 50 minutes');
-  assert.equal(session.surplusExhausted, false, 'enough lesson time exists → no exhaustion');
-  assert.equal(session.surplusMode, false);
-  assert.deepEqual(
-    studyCallsMs,
-    [25 * 60 * 1000, 20 * 60 * 1000, 5 * 60 * 1000],
-    'the last lesson is studied for only the 5 remaining minutes, not its full 30'
-  );
-  for (const [url] of lessonMinutesByUrl) {
-    assert.equal(gotoCounts.get(url), 1, `lesson ${url} must be opened exactly once`);
-  }
-  assert.equal(await session._finalizeSurplusCompletion(), true);
+  const courseOf = (lessonUrl) => courses.find(c => lessonUrl.startsWith(c.courseUrl)).courseUrl;
+  const order = [...new Set(studyOrder.map(courseOf))];
+  assert.deepEqual(order, [courses[0].courseUrl, courses[1].courseUrl, courses[2].courseUrl], 'đúng thứ tự 1 → 2 → 3');
+  assert.equal(session.surplusCurrentCourseIndex, 3);
 });
 
-test('surplus lessons that cannot open are marked unusable once and exhaust cleanly', async () => {
-  const courseUrl = 'https://x/slides/course-a';
-  const url1 = 'https://x/slides/slide/course-a/lesson-a1-101';
-  const url2 = 'https://x/slides/slide/course-a/lesson-a2-102';
-  const { session, gotoCounts } = makeSurplusStudySession({
-    id: 'surplus-unusable',
-    courses: [{ courseUrl, targetMinutes: 1 }],
-    lessonsByCourse: new Map([[courseUrl, [{ title: 'A1', url: url1 }, { title: 'A2', url: url2 }]]]),
-    failingLessonUrls: [url1, url2],
+test('mỗi khóa nhận mục tiêu RNG riêng, sinh một lần và persist', async () => {
+  const courses = [
+    { courseUrl: 'https://x/slides/course-1', targetMinutes: 30 },
+    { courseUrl: 'https://x/slides/course-2', targetMinutes: 30 },
+  ];
+  const { session } = makeSurplusSession({
+    id: 'surplus-rng',
+    courses,
+    website: makeWebsite(courses),
+    rngSequence: [18, 27],
   });
-  session.surplusTargetMinutes = 20;
-
   assert.equal(await session._initializeSurplusMode(), true);
-  assert.equal(await session._runSurplusStudy(), false);
+  await session._runSurplusStudy();
 
+  assert.equal(session.surplusCourseStates[courses[0].courseUrl].targetMinutes, 18);
+  assert.equal(session.surplusCourseStates[courses[1].courseUrl].targetMinutes, 27);
+});
+
+test('khóa completed cấp khóa với bài 0%/70% vẫn surplus-eligible; bài 100% bị bỏ qua', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = {
+    [c1]: {
+      title: 'Course 1',
+      minutes: 60,
+      lessons: [
+        { title: 'L0', url: `${c1}/l0`, progressPercent: 0 },
+        { title: 'L70', url: `${c1}/l70`, progressPercent: 70 },
+        { title: 'L100', url: `${c1}/l100`, progressPercent: 100 },
+      ],
+    },
+  };
+  const { session, gotoCounts } = makeSurplusSession({
+    id: 'surplus-eligible',
+    courses: [{ courseUrl: c1, targetMinutes: 60 }],
+    website,
+    rngSequence: [15],
+  });
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  assert.equal(session.surplusCourseStates[c1].confirmedMinutes, 15);
+  assert.equal(gotoCounts.get(`${c1}/l100`) || 0, 0, 'bài 100% không bao giờ được chọn');
+  assert.ok((gotoCounts.get(`${c1}/l0`) || 0) + (gotoCounts.get(`${c1}/l70`) || 0) > 0);
+});
+
+test('local wait KHÔNG thay đổi website thì KHÔNG được credit là surplus thành công', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = { [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L', url: `${c1}/l1`, progressPercent: 0 }] } };
+  const { session } = makeSurplusSession({
+    id: 'surplus-noconfirm',
+    courses: [{ courseUrl: c1, targetMinutes: 60 }],
+    website,
+    rngSequence: [15],
+    confirmOnStudy: false,
+  });
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  const state = session.surplusCourseStates[c1];
+  assert.equal(state.confirmedMinutes, 0, 'không credit');
+  assert.ok(state.localActiveMinutes > 0, 'vẫn ghi nhận local active (chưa xác nhận)');
+  assert.equal(state.exhausted, true, 'bài bị đánh dấu unusable sau số lần tối đa → khóa kiệt khẩu');
+  assert.deepEqual(state.unusableLessons, [`${c1}/l1`]);
+});
+
+test('lesson progress tăng xác nhận surplus dù thời gian khóa bị capped', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = { [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L', url: `${c1}/l1`, progressPercent: 70 }] } };
+  const { session } = makeSurplusSession({
+    id: 'surplus-lesson-confirm',
+    courses: [{ courseUrl: c1, targetMinutes: 60 }],
+    website,
+    rngSequence: [15],
+  });
+  // Tổng thời gian khóa đứng yên, chỉ tiến độ bài tăng.
+  session._waitForActiveStudyTime = async (ms) => {
+    website[c1].lessons[0].progressPercent = Math.min(100, website[c1].lessons[0].progressPercent + 5);
+    return ms;
+  };
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  const state = session.surplusCourseStates[c1];
+  assert.ok(state.confirmedMinutes > 0, 'xác nhận qua tiến độ bài');
+  assert.equal(state.verifiedMinutes, 60, 'thời gian khóa vẫn capped ở 60');
+});
+
+test('_classifySurplusProgress: thời gian khóa tăng HOẶC tiến độ bài tăng đều xác nhận', () => {
+  const session = new AutoCourseSession('classify', { name: 'C' });
+  const before = { courseMinutes: 60, lessonPercent: 70, lessonCompleted: false };
+  assert.equal(session._classifySurplusProgress(before, { courseMinutes: 65, lessonPercent: 70, lessonCompleted: false }, 5).confirmed, true);
+  assert.equal(session._classifySurplusProgress(before, { courseMinutes: 60, lessonPercent: 80, lessonCompleted: false }, 5).via, 'lesson_progress');
+  assert.equal(session._classifySurplusProgress(before, { courseMinutes: 60, lessonPercent: 70, lessonCompleted: false }, 5).confirmed, false);
+});
+
+test('block cuối chỉ học đúng phần còn thiếu', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = { [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L', url: `${c1}/l1`, progressPercent: 0 }] } };
+  const { session, studyCallsMs } = makeSurplusSession({
+    id: 'surplus-partial',
+    courses: [{ courseUrl: c1, targetMinutes: 60 }],
+    website,
+    rngSequence: [16],
+  });
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  assert.deepEqual(studyCallsMs, [5 * 60000, 5 * 60000, 5 * 60000, 1 * 60000]);
+  assert.equal(session.surplusCourseStates[c1].confirmedMinutes, 16);
+});
+
+test('kiệt khẩu theo TỪNG KHÓA: target 30, chỉ xác nhận được 11', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = { [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L', url: `${c1}/l1`, progressPercent: 0 }] } };
+  const { session } = makeSurplusSession({
+    id: 'surplus-course-exhaust',
+    courses: [{ courseUrl: c1, targetMinutes: 60 }],
+    website,
+    rngSequence: [30],
+  });
+  session._waitForActiveStudyTime = async (ms) => {
+    const capacity = Math.max(0, 11 - (website[c1].minutes - 60));
+    const add = Math.min(ms / 60000, capacity);
+    website[c1].minutes += add;
+    website[c1].lessons[0].progressPercent = Math.min(100, website[c1].lessons[0].progressPercent + add * 4);
+    return ms;
+  };
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  const state = session.surplusCourseStates[c1];
+  assert.equal(state.targetMinutes, 30);
+  assert.equal(state.confirmedMinutes, 11, 'giữ đúng 11 phút thực đã xác nhận');
+  assert.equal(state.exhausted, true);
+  assert.equal(state.completed, false, 'không fake đủ 30');
+});
+
+test('bài không mở được bị đánh dấu unusable và chuyển sang bài kế tiếp', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const url1 = `${c1}/l1`;
+  const url2 = `${c1}/l2`;
+  const website = {
+    [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L1', url: url1, progressPercent: 0 }, { title: 'L2', url: url2, progressPercent: 0 }] },
+  };
+  const { session, gotoCounts } = makeSurplusSession({
+    id: 'surplus-unusable-next',
+    courses: [{ courseUrl: c1, targetMinutes: 60 }],
+    website,
+    rngSequence: [15],
+    failingLessonUrls: [url1],
+  });
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  assert.equal(gotoCounts.get(url1), 1, 'bài lỗi chỉ thử một lần');
+  assert.ok(session.surplusCourseStates[c1].unusableLessons.includes(url1));
+  assert.ok(gotoCounts.get(url2) > 0, 'chuyển sang bài kế tiếp');
+});
+
+test('tất cả khóa kiệt khẩu vẫn hoàn tất surplus pass sạch sẽ', async () => {
+  const courses = [
+    { courseUrl: 'https://x/c1', targetMinutes: 30 },
+    { courseUrl: 'https://x/c2', targetMinutes: 30 },
+  ];
+  const website = {};
+  for (const c of courses) {
+    website[c.courseUrl] = { title: c.courseUrl, minutes: 30, lessons: [{ title: 'L', url: `${c.courseUrl}/l1`, progressPercent: 100 }] };
+  }
+  const { session } = makeSurplusSession({ id: 'surplus-allexhaust', courses, website, rngSequence: [15, 15] });
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(await session._runSurplusStudy(), true);
+  assert.equal(session._surplusPassProcessed(), true);
   assert.equal(session.surplusExhausted, true);
-  assert.equal(session.surplusMode, false);
-  assert.equal(session.surplusStudiedMinutes, 0, 'nothing was studyable — real number stays 0');
-  assert.equal(session.surplusTargetMinutes, 20);
-  assert.equal(session._surplusUnusableLessons.size, 2);
-  assert.equal(gotoCounts.get(url1), 1, 'an unusable lesson must never be retried');
-  assert.equal(gotoCounts.get(url2), 1, 'an unusable lesson must never be retried');
+});
+
+test('_finalizeSurplusCompletion chỉ true khi mọi khóa đã xử lý xong surplus', async () => {
+  const courses = [
+    { courseUrl: 'https://x/c1', targetMinutes: 30 },
+    { courseUrl: 'https://x/c2', targetMinutes: 30 },
+  ];
+  const website = {};
+  for (const c of courses) {
+    website[c.courseUrl] = { title: c.courseUrl, minutes: 30, lessons: [{ title: 'L', url: `${c.courseUrl}/l1`, progressPercent: 100 }] };
+  }
+  const { session } = makeSurplusSession({ id: 'surplus-final', courses, website, rngSequence: [15, 15] });
+  assert.equal(await session._finalizeSurplusCompletion(), false, 'chưa xử lý khóa nào');
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
   assert.equal(await session._finalizeSurplusCompletion(), true);
 });
 
-test('exhausted surplus defers completion on failed verification without re-entering surplus', async () => {
-  const session = new AutoCourseSession('surplus-defer-exhausted', { name: 'Defer' });
-  session._phase = PHASE_RUNNING;
-  session.surplusTargetMinutes = 40;
-  session.surplusStudiedMinutes = 31;
-  session.surplusExhausted = true;
-  session.surplusMode = false;
-  session._verifyAllConfiguredCoursesCompleted = async () => false;
-
-  assert.equal(await session._finalizeSurplusCompletion(), false);
-  assert.equal(session.surplusMode, false, 'an exhausted session must not re-enter surplus mode');
-  assert.equal(session.surplusStudiedMinutes, 31, 'real studied minutes survive the deferral');
+test('mục tiêu RNG per-course sống sót qua restart', () => {
+  const c1 = 'https://x/c1';
+  const session = new AutoCourseSession('surplus-persist', { name: 'P' }, [{ courseUrl: c1 }]);
+  session.surplusCourseStates = {
+    [c1]: {
+      courseUrl: c1,
+      targetMinutes: 27,
+      confirmedMinutes: 12,
+      localActiveMinutes: 0,
+      verifiedMinutes: 72,
+      completed: false,
+      exhausted: false,
+      unusableLessons: [],
+      studiedLessons: [],
+      lessonAttempts: {},
+    },
+  };
+  const restored = new AutoCourseSession('surplus-persist-2', { name: 'P' }, [{ courseUrl: c1 }], {
+    surplusCourseStates: session.surplusCourseStates,
+    surplusCurrentCourseIndex: 0,
+  });
+  assert.equal(restored.surplusCourseStates[c1].targetMinutes, 27);
+  assert.equal(restored.surplusCourseStates[c1].confirmedMinutes, 12);
+  assert.equal(restored.surplusCourseStates[c1].verifiedMinutes, 72);
 });
 
-test('target-reached surplus defers completion by re-arming surplus mode', async () => {
-  const session = new AutoCourseSession('surplus-defer-target', { name: 'Defer' });
+test('daily limit trong Course 2 giữ state và resume đúng Course 2', async () => {
+  const courses = [
+    { courseUrl: 'https://x/c1', targetMinutes: 30 },
+    { courseUrl: 'https://x/c2', targetMinutes: 30 },
+    { courseUrl: 'https://x/c3', targetMinutes: 30 },
+  ];
+  const website = makeWebsite(courses, { minutes: 30 });
+  const { session } = makeSurplusSession({
+    id: 'surplus-daily',
+    courses,
+    website,
+    rngSequence: [10, 30, 30],
+    dailyMaxMinutes: 12,
+  });
+  session.dailyDate = session._vnDateStr();
+  await session._initializeSurplusMode();
+  await session._runSurplusStudy();
+
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.surplusCurrentCourseIndex, 1, 'dừng ở Course 2');
+  const c2State = session.surplusCourseStates[courses[1].courseUrl];
+  assert.equal(c2State.targetMinutes, 30, 'target Course 2 không đổi');
+  assert.equal(c2State.confirmedMinutes, 2, 'giữ 2/30 đã xác nhận');
+
+  // Restart: khôi phục state per-course và resume đúng Course 2.
+  const restored = new AutoCourseSession('surplus-daily-2', { name: 'D' }, courses, {
+    surplusMode: true,
+    dailyMaxMinutes: 12,
+    surplusCourseStates: session.surplusCourseStates,
+    surplusCurrentCourseIndex: session.surplusCurrentCourseIndex,
+  });
+  restored._phase = PHASE_RUNNING;
+  restored.context = session.context;
+  restored._scanCourseDetailsForCheckpoint = session._scanCourseDetailsForCheckpoint;
+  restored._fakeVisibilityAPI = async () => {};
+  restored.page = session.page;
+  restored._randomBetween = () => 30;
+  restored.dailyStudiedMinutes = 0;
+  restored._ensureSurplusCourseStates();
+  assert.equal(restored.surplusCurrentCourseIndex, 1);
+  assert.equal(restored.surplusCourseStates[courses[1].courseUrl].targetMinutes, 30);
+  assert.equal(restored.surplusCourseStates[courses[1].courseUrl].confirmedMinutes, 2);
+
+  restored._waitForActiveStudyTime = async (ms) => ms;
+  const resumed = [];
+  const originalStudy = restored._studySurplusLesson.bind(restored);
+  restored._studySurplusLesson = async (idx, config, state, lesson) => {
+    resumed.push(config.courseUrl);
+    return { outcome: 'unavailable' };
+  };
+  await restored._runSurplusStudy();
+  assert.equal(resumed[0], courses[1].courseUrl, 'resume bắt đầu từ Course 2');
+  assert.ok(!resumed.includes(courses[0].courseUrl), 'không quay lại Course 1');
+});
+
+test('migrate state surplus account-level cũ sang per-course không seed confirmedMinutes', () => {
+  const c1 = 'https://x/c1';
+  const session = new AutoCourseSession('surplus-legacy', { name: 'L' }, [{ courseUrl: c1 }], {
+    surplusTargetMinutes: 45,
+    surplusStudiedMinutes: 30,
+    surplusExhausted: false,
+  });
   session._phase = PHASE_RUNNING;
-  session.surplusTargetMinutes = 40;
-  session.surplusStudiedMinutes = 40;
+  session._ensureSurplusCourseStates();
+  assert.equal(session.surplusCourseStates[c1].targetMinutes, null, 'mục tiêu per-course được sinh mới');
+  assert.equal(session.surplusCourseStates[c1].confirmedMinutes, 0, 'số phút local cũ KHÔNG được coi là confirmed');
+});
+
+test('surplus pass xử lý xong nhưng final verification fail → defer, không re-arm', async () => {
+  const c1 = 'https://x/c1';
+  const session = new AutoCourseSession('surplus-defer-final', { name: 'Defer' }, [{ courseUrl: c1 }]);
+  session._phase = PHASE_RUNNING;
+  session._surplusStateFor(c1).completed = true;
   session._verifyAllConfiguredCoursesCompleted = async () => false;
 
   assert.equal(await session._finalizeSurplusCompletion(), false);
-  assert.equal(session.surplusMode, true);
+  assert.equal(session.surplusMode, false);
 });
 
 // ============ BẤT BIẾN VÒNG ĐỜI KHI VÀO TRẠNG THÁI HẸN GIỜ ============
@@ -961,38 +1172,60 @@ test('xác minh cấp khóa hoàn tất sau daily-limit bị vứt bỏ, không 
 // 4. Daily limit trong lúc học surplus.
 test('daily limit trong lúc treo surplus không credit phút và không checkpoint', async () => {
   const courseUrl = 'https://x/slides/course-a';
-  const lessonUrl = 'https://x/slides/slide/course-a/lesson-a1-101';
-  const session = new AutoCourseSession(
-    'limit-surplus',
-    { name: 'Limit', email: 'l@x.vn' },
-    [{ courseUrl, targetMinutes: 1 }],
-    { dailyMaxMinutes: 30 },
-  );
-  session._phase = PHASE_RUNNING;
-  session.surplusMode = true;
-  session.surplusTargetMinutes = 30;
-  session.surplusEligibleCourses = [courseUrl];
-  session._surplusLessonPools = new Map([[courseUrl, [{ title: 'A1', url: lessonUrl }]]]);
-  session.page = {
-    url: () => lessonUrl,
-    goto: async () => {},
-    waitForTimeout: async () => {},
-    evaluate: async () => null,
-  };
+  const lessonUrl = `${courseUrl}/lesson-a1-101`;
+  const website = { [courseUrl]: { title: 'Course A', minutes: 60, lessons: [{ title: 'A1', url: lessonUrl, progressPercent: 0 }] } };
+  const { session } = makeSurplusSession({
+    id: 'limit-surplus',
+    courses: [{ courseUrl, targetMinutes: 60 }],
+    website,
+    rngSequence: [15],
+  });
   let checkpointed = false;
-  session._checkpointSurplusCourse = async () => { checkpointed = true; return null; };
+  session._checkpointAndCaptureSurplusEvidence = async () => { checkpointed = true; return null; };
   session._waitForActiveStudyTime = async () => {
-    session.dailyStudiedMinutes = 30;
+    session.dailyStudiedMinutes = session.options.dailyMaxMinutes;
     session._hitDailyLimit();
-    return 1000; // kết quả treo trả về muộn — phải bị vứt bỏ
+    return 5 * 60000; // kết quả treo trả về muộn — phải bị vứt bỏ
   };
 
+  await session._initializeSurplusMode();
   const result = await session._runSurplusStudy();
 
   assert.equal(result, false);
   assert.equal(session.status, 'daily-limit');
-  assert.equal(session.surplusStudiedMinutes, 0, 'phút học muộn không được credit');
+  assert.equal(session.surplusCourseStates[courseUrl].confirmedMinutes, 0, 'phút học muộn không được credit');
   assert.equal(checkpointed, false, 'không checkpoint sau khi đã hẹn giờ');
+});
+
+test('stale surplus run sau async navigation (page.goto) không mutate progress', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = { [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L', url: `${c1}/l1`, progressPercent: 0 }] } };
+  const { session } = makeSurplusSession({ id: 'surplus-stale-nav', courses: [{ courseUrl: c1, targetMinutes: 60 }], website, rngSequence: [15] });
+  session.page.goto = async () => {
+    session.dailyStudiedMinutes = session.options.dailyMaxMinutes;
+    session._hitDailyLimit();
+  };
+  await session._initializeSurplusMode();
+  const result = await session._runSurplusStudy();
+  assert.equal(result, false);
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.surplusCourseStates[c1].confirmedMinutes, 0);
+});
+
+test('stale surplus run sau checkpoint không mutate progress', async () => {
+  const c1 = 'https://x/slides/course-1';
+  const website = { [c1]: { title: 'C1', minutes: 60, lessons: [{ title: 'L', url: `${c1}/l1`, progressPercent: 0 }] } };
+  const { session } = makeSurplusSession({ id: 'surplus-stale-checkpoint', courses: [{ courseUrl: c1, targetMinutes: 60 }], website, rngSequence: [15] });
+  session._checkpointAndCaptureSurplusEvidence = async () => {
+    session.dailyStudiedMinutes = session.options.dailyMaxMinutes;
+    session._hitDailyLimit();
+    return null;
+  };
+  await session._initializeSurplusMode();
+  const result = await session._runSurplusStudy();
+  assert.equal(result, false);
+  assert.equal(session.status, 'daily-limit');
+  assert.equal(session.surplusCourseStates[c1].confirmedMinutes, 0);
 });
 
 // 5/7. Callback checkpoint đến muộn không thể đổi status hẹn giờ.
@@ -1210,42 +1443,37 @@ test('gate: một khóa dưới target → không bao giờ vào surplus', async
   assert.equal(await session._verifyAllConfiguredCoursesCompleted(), false);
 });
 
-test('production fixture: 3781/3780 + bài ôn tập 70% + UNKNOWN → surplus bắt đầu, RNG sinh đúng một lần', async () => {
+test('production fixture: 3781/3780 + bài ôn tập 70% → surplus tuần tự, mục tiêu mỗi khóa', async () => {
   const courses = [
     { courseUrl: 'https://x/c1', targetMinutes: 840 },
     { courseUrl: 'https://x/c2', targetMinutes: 840 },
     { courseUrl: 'https://x/c3', targetMinutes: 840 },
     { courseUrl: 'https://x/c4', targetMinutes: 840 },
   ];
-  const lesson = (url, title, progressPercent = 100) => ({ url, title, progressPercent, isCompleted: progressPercent >= 100 });
-  const review = lesson('https://x/c4/review-999', 'Ôn tập', 70);
-  const session = makeGateSession('gate-production', courses, {
-    scans: {
-      [courses[0].courseUrl]: courseScan({ title: 'C1', actual: 900, state: 'completed', percent: 100, lessons: [lesson('https://x/c1/l1', 'L1')] }),
-      [courses[1].courseUrl]: courseScan({ title: 'C2', actual: 900, state: 'completed', percent: 100, lessons: [lesson('https://x/c2/l1', 'L1')] }),
-      [courses[2].courseUrl]: courseScan({ title: 'C3', actual: 900, state: 'completed', percent: 100, lessons: [lesson('https://x/c3/l1', 'L1')] }),
-      [courses[3].courseUrl]: courseScan({
-        title: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
-        actual: 3781,
-        state: 'unknown',
-        lessons: [lesson('https://x/c4/l1', 'L1'), review],
-        uncompleted: [review],
-      }),
+  const website = {
+    [courses[0].courseUrl]: { title: 'C1', minutes: 900, lessons: [{ title: 'L', url: 'https://x/c1/l1', progressPercent: 100 }] },
+    [courses[1].courseUrl]: { title: 'C2', minutes: 900, lessons: [{ title: 'L', url: 'https://x/c2/l1', progressPercent: 100 }] },
+    [courses[2].courseUrl]: { title: 'C3', minutes: 900, lessons: [{ title: 'L', url: 'https://x/c3/l1', progressPercent: 100 }] },
+    [courses[3].courseUrl]: {
+      title: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
+      minutes: 3781,
+      lessons: [
+        { title: 'L1', url: 'https://x/c4/l1', progressPercent: 100 },
+        { title: 'Ôn tập', url: 'https://x/c4/review-999', progressPercent: 70 },
+      ],
     },
-    myCourses: [
-      { title: 'C1', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
-      { title: 'C2', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
-      { title: 'C3', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
-      { title: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
-    ],
-  });
-  session._randomBetween = () => 47;
+  };
+  const { session, gotoCounts } = makeSurplusSession({ id: 'surplus-prod', courses, website, rngSequence: [47] });
 
   assert.equal(await session._initializeSurplusMode(), true);
-  assert.equal(session.surplusMode, true);
-  assert.equal(session.surplusTargetMinutes, 47);
-  assert.equal(session._generateSurplusTargetOnce(), 47, 'RNG không được sinh lại');
-  assert.equal(session.surplusEligibleCourses.length, 4, 'bài ôn tập 70% không loại khóa khỏi surplus');
+  assert.equal(await session._runSurplusStudy(), true);
+
+  for (const c of courses) {
+    assert.equal(session.surplusCourseStates[c.courseUrl].targetMinutes, 47, 'mỗi khóa có mục tiêu RNG riêng');
+  }
+  assert.ok(session.surplusCourseStates[courses[3].courseUrl].confirmedMinutes > 0, 'bài ôn tập 70% được học surplus');
+  assert.equal(gotoCounts.get('https://x/c4/l1') || 0, 0, 'bài 100% không bao giờ được chọn');
+  assert.equal(session._surplusPassProcessed(), true);
 });
 
 test('final surplus verification: UNKNOWN + đủ target → hoàn thành, không lặp vô hạn', async () => {
@@ -1254,8 +1482,7 @@ test('final surplus verification: UNKNOWN + đủ target → hoàn thành, khôn
     scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'unknown' }) },
     myCourses: [],
   });
-  session.surplusTargetMinutes = 40;
-  session.surplusStudiedMinutes = 40;
+  session._surplusStateFor(c1).completed = true;
   assert.equal(await session._finalizeSurplusCompletion(), true);
   assert.equal(session.surplusMode, false);
 });
@@ -1265,10 +1492,9 @@ test('final surplus verification: website tường minh incomplete → defer', a
   const session = makeGateSession('final-incomplete', [{ courseUrl: c1, targetMinutes: 60 }], {
     scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'incomplete', percent: 82 }) },
   });
-  session.surplusTargetMinutes = 40;
-  session.surplusStudiedMinutes = 40;
+  session._surplusStateFor(c1).completed = true;
   assert.equal(await session._finalizeSurplusCompletion(), false);
-  assert.equal(session.surplusMode, true);
+  assert.equal(session.surplusMode, false);
 });
 
 test('RNG surplus vẫn cố định 15-60 phút', () => {

@@ -10,7 +10,7 @@
 //  thái kết thúc, và phiên đã Dừng thì không được hồi sinh.
 // ============================================================
 
-const { SCHEDULED_STATUSES, TERMINAL_STATUSES, PHASE_RUNNING } = require('./autoCourseEngine');
+const { AutoCourseSession, SCHEDULED_STATUSES, TERMINAL_STATUSES, PHASE_RUNNING } = require('./autoCourseEngine');
 
 // Có phải trạng thái server tự hẹn giờ chạy lại (không phải kết thúc)?
 function isScheduledAutoScan(session) {
@@ -73,6 +73,15 @@ function applyAutoScanRestoreState(session, restoreState = {}) {
     session.surplusEligibleCourses = [...new Set(restoreState.surplusEligibleCourses)];
   }
   if (restoreState.surplusExhausted != null) session.surplusExhausted = restoreState.surplusExhausted === true;
+  // Trạng thái surplus per-course (nguồn chân lý mới): khôi phục để resume đúng
+  // khóa/mục tiêu/tiến độ. normalize chịu được document Firestore cũ.
+  if (restoreState.surplusCourseStates && typeof restoreState.surplusCourseStates === 'object') {
+    session.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(restoreState.surplusCourseStates);
+  }
+  if (restoreState.surplusCurrentCourseIndex != null) {
+    const idx = Number(restoreState.surplusCurrentCourseIndex);
+    session.surplusCurrentCourseIndex = Number.isInteger(idx) && idx >= 0 ? idx : 0;
+  }
   if (restoreState.scheduledStartAt) session.options.scheduledStartAt = restoreState.scheduledStartAt;
   if (restoreState.scheduledStartDate) session.options.scheduledStartDate = restoreState.scheduledStartDate;
   return session;

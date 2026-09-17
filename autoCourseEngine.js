@@ -15,6 +15,16 @@ const LOGIN_RETRY_BASE_MS = 15000;
 const LOGIN_RETRY_MAX_MS = 5 * 60 * 1000;
 const MAX_CONCURRENT_LOGINS = 3;
 
+// ── SURPLUS (học thừa) ──
+// Mỗi khóa được cấp MỘT mục tiêu RNG riêng trong khoảng 15-60 phút. Khóa được
+// xử lý TUẦN TỰ theo đúng thứ tự coursesConfig, không chọn ngẫu nhiên.
+const SURPLUS_TARGET_MIN_MINUTES = 15;
+const SURPLUS_TARGET_MAX_MINUTES = 60;
+const SURPLUS_MIN_BLOCK_MINUTES = 5;
+// Số lần tối đa một bài được thử mà website KHÔNG xác nhận trước khi bị đánh dấu
+// không dùng được (chống lặp vô hạn).
+const SURPLUS_MAX_UNCONFIRMED_ATTEMPTS = 2;
+
 class LoginLimiter {
   constructor(max = MAX_CONCURRENT_LOGINS, { logger = () => {} } = {}) {
     this.max = Math.max(1, Number(max) || MAX_CONCURRENT_LOGINS);
@@ -191,18 +201,21 @@ class AutoCourseSession extends EventEmitter {
 
     this.courseProgress = {}; // courseUrl -> { studiedMinutes, targetMinutes, completed, websiteCourseCompleted }
     this.surplusMode = Boolean(options.surplusMode);
+    // Trạng thái surplus theo TỪNG KHÓA (nguồn chân lý mới). Xem _surplusStateFor().
+    this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(options.surplusCourseStates);
+    this.surplusCurrentCourseIndex = Number.isInteger(options.surplusCurrentCourseIndex) && options.surplusCurrentCourseIndex >= 0
+      ? options.surplusCurrentCourseIndex
+      : 0;
+    // Trường legacy (account-level) — chỉ giữ để tương thích Firestore cũ/hiển thị.
     this.surplusTargetMinutes = Number.isFinite(Number(options.surplusTargetMinutes))
-      ? Math.max(15, Math.min(60, Number(options.surplusTargetMinutes)))
+      ? Math.max(SURPLUS_TARGET_MIN_MINUTES, Math.min(SURPLUS_TARGET_MAX_MINUTES, Number(options.surplusTargetMinutes)))
       : null;
     this.surplusStudiedMinutes = Math.max(0, Number(options.surplusStudiedMinutes) || 0);
     this.surplusEligibleCourses = Array.isArray(options.surplusEligibleCourses)
       ? [...new Set(options.surplusEligibleCourses)]
       : [];
     this.surplusExhausted = options.surplusExhausted === true;
-    this._surplusUnusableLessons = new Set();
-    // Bài đã học xong trong surplus phase này — không được mở lại trong cùng
-    // phase (chống treo lặp cùng một bài để "gấp" đủ phút mục tiêu).
-    this._surplusStudiedLessons = new Set();
+    this._surplusLegacyMigrated = false;
     this._stopped = false;
     this._phase = PHASE_NEW;
     this._stealthTimer = null;
@@ -459,6 +472,38 @@ class AutoCourseSession extends EventEmitter {
       .toLowerCase();
   }
 
+  // Chuẩn hoá surplusCourseStates từ Firestore (object) — chịu được document cũ
+  // thiếu trường/định dạng lạ, không bao giờ ném lỗi.
+  static _normalizeSurplusCourseStates(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+    const normalized = {};
+    for (const [courseUrl, state] of Object.entries(raw)) {
+      if (!courseUrl || !state || typeof state !== 'object') continue;
+      // LƯU Ý: Number(null) === 0 → phải phân biệt null/rỗng với 0, nếu không mục
+      // tiêu chưa sinh sẽ bị kẹp thành 15 mỗi lần normalize.
+      const rawTarget = state.targetMinutes;
+      const target = (rawTarget == null || rawTarget === '') ? NaN : Number(rawTarget);
+      normalized[courseUrl] = {
+        courseUrl,
+        title: state.title || null,
+        targetMinutes: Number.isFinite(target) && target > 0
+          ? Math.max(SURPLUS_TARGET_MIN_MINUTES, Math.min(SURPLUS_TARGET_MAX_MINUTES, target))
+          : null,
+        confirmedMinutes: Math.max(0, Number(state.confirmedMinutes) || 0),
+        localActiveMinutes: Math.max(0, Number(state.localActiveMinutes) || 0),
+        verifiedMinutes: state.verifiedMinutes == null ? null : Math.max(0, Number(state.verifiedMinutes) || 0),
+        completed: state.completed === true,
+        exhausted: state.exhausted === true,
+        unusableLessons: Array.isArray(state.unusableLessons) ? [...new Set(state.unusableLessons.filter(Boolean))] : [],
+        studiedLessons: Array.isArray(state.studiedLessons) ? [...new Set(state.studiedLessons.filter(Boolean))] : [],
+        lessonAttempts: (state.lessonAttempts && typeof state.lessonAttempts === 'object' && !Array.isArray(state.lessonAttempts))
+          ? { ...state.lessonAttempts }
+          : {},
+      };
+    }
+    return normalized;
+  }
+
   _titlesLikelyMatch(a, b) {
     const left = AutoCourseSession._normalizedTitle(a);
     const right = AutoCourseSession._normalizedTitle(b);
@@ -662,185 +707,495 @@ class AutoCourseSession extends EventEmitter {
     return true;
   }
 
-  _generateSurplusTargetOnce() {
-    if (this.surplusTargetMinutes == null) {
-      this.surplusTargetMinutes = this._randomBetween(15, 60);
-      this.log(`Surplus target for this account: ${this.surplusTargetMinutes} minutes`, 'info');
+  // ── SURPLUS: trạng thái theo TỪNG KHÓA ──
+
+  _surplusStateFor(courseUrl) {
+    if (!courseUrl) return null;
+    if (!this.surplusCourseStates || typeof this.surplusCourseStates !== 'object') this.surplusCourseStates = {};
+    if (!this.surplusCourseStates[courseUrl]) {
+      this.surplusCourseStates[courseUrl] = {
+        courseUrl,
+        title: this.courseProgress[courseUrl]?.title || null,
+        targetMinutes: null,
+        confirmedMinutes: 0,
+        localActiveMinutes: 0,
+        verifiedMinutes: null,
+        completed: false,
+        exhausted: false,
+        unusableLessons: [],
+        studiedLessons: [],
+        lessonAttempts: {},
+      };
     }
-    return this.surplusTargetMinutes;
+    return this.surplusCourseStates[courseUrl];
   }
 
+  _markSurplusLessonUnusable(state, lessonUrl) {
+    if (state && lessonUrl && !state.unusableLessons.includes(lessonUrl)) {
+      state.unusableLessons.push(lessonUrl);
+    }
+  }
+
+  // Khởi tạo/chuẩn hoá trạng thái surplus per-course. MIGRATE state cũ account-level
+  // (surplusTargetMinutes/surplusStudiedMinutes/surplusExhausted) mà không seed
+  // confirmedMinutes từ số phút LOCAL chưa được website xác nhận.
+  _ensureSurplusCourseStates() {
+    this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(this.surplusCourseStates);
+    const hasPerCourse = Object.keys(this.surplusCourseStates).length > 0;
+    if (!hasPerCourse && !this._surplusLegacyMigrated
+      && (this.surplusTargetMinutes != null || this.surplusStudiedMinutes > 0 || this.surplusExhausted === true)) {
+      this._surplusLegacyMigrated = true;
+      this.log('♻️ Migrating legacy account-level surplus state to per-course state', 'warn');
+      this.log(`   Legacy target: ${this.surplusTargetMinutes ?? 'none'} | legacy studied local (unverified): ${Math.round(this.surplusStudiedMinutes)}m | legacy exhausted: ${this.surplusExhausted === true}`, 'warn');
+      this.surplusCurrentCourseIndex = 0;
+    }
+
+    for (const config of this.coursesConfig) {
+      this._surplusStateFor(config.courseUrl);
+    }
+    const total = this.coursesConfig.length;
+    if (!Number.isInteger(this.surplusCurrentCourseIndex) || this.surplusCurrentCourseIndex < 0) {
+      this.surplusCurrentCourseIndex = 0;
+    }
+    if (this.surplusCurrentCourseIndex > total) this.surplusCurrentCourseIndex = total;
+    this._syncLegacySurplusAggregates();
+  }
+
+  // Cập nhật trường legacy (tổng hợp) để Dashboard/Firestore cũ vẫn đọc được.
+  _syncLegacySurplusAggregates() {
+    const states = Object.values(this.surplusCourseStates || {});
+    const totalTarget = states.reduce((sum, s) => sum + (s.targetMinutes || 0), 0);
+    const totalConfirmed = states.reduce((sum, s) => sum + (s.confirmedMinutes || 0), 0);
+    this.surplusTargetMinutes = totalTarget > 0 ? Math.round(totalTarget) : this.surplusTargetMinutes;
+    this.surplusStudiedMinutes = totalConfirmed > 0 ? Math.round(totalConfirmed) : this.surplusStudiedMinutes;
+    this.surplusEligibleCourses = states.filter(s => !s.exhausted && !s.completed).map(s => s.courseUrl);
+    this.surplusExhausted = this.coursesConfig.length > 0
+      && this.coursesConfig.every(c => this.surplusCourseStates[c.courseUrl]?.exhausted === true);
+  }
+
+  // Mục tiêu RNG 15-60 phút CHO ĐÚNG KHÓA NÀY — sinh một lần, persist, không
+  // bao giờ regenerate vì F5/checkpoint/restart/daily-limit/scheduling.
+  _surplusTargetFor(state) {
+    if (state.targetMinutes == null) {
+      state.targetMinutes = this._randomBetween(SURPLUS_TARGET_MIN_MINUTES, SURPLUS_TARGET_MAX_MINUTES);
+      this.log(`🎲 Surplus target for this course: ${state.targetMinutes} minutes`, 'info');
+    }
+    return state.targetMinutes;
+  }
+
+  // Còn khóa nào chưa xử lý xong surplus pass không?
+  _surplusPassProcessed() {
+    if (this.coursesConfig.length === 0) return true;
+    if (!this.surplusCourseStates || Object.keys(this.surplusCourseStates).length === 0) return false;
+    return this.coursesConfig.every(config => {
+      const state = this.surplusCourseStates[config.courseUrl];
+      return Boolean(state) && (state.completed === true || state.exhausted === true);
+    });
+  }
+
+  // Trích bằng chứng website (thời gian khóa + tiến độ bài) từ kết quả scan.
+  _extractSurplusEvidence(scan, lessonUrl) {
+    if (!scan) return null;
+    const lessons = Array.isArray(scan.allLessons) ? scan.allLessons : [];
+    let lesson = null;
+    if (lessonUrl) {
+      try {
+        const expectedPath = new URL(lessonUrl).pathname;
+        lesson = lessons.find(item => {
+          try { return new URL(item.url).pathname === expectedPath; } catch { return false; }
+        }) || null;
+      } catch { lesson = null; }
+    }
+    const percent = lesson && Number.isFinite(Number(lesson.progressPercent))
+      ? Number(lesson.progressPercent)
+      : null;
+    return {
+      courseMinutes: Math.max(0, Number(scan.actualStudiedMinutes) || 0),
+      lessonPercent: percent,
+      lessonCompleted: lesson ? (lesson.isCompleted === true || (percent != null && percent >= 100)) : false,
+      courseTitle: scan.courseTitle || null,
+    };
+  }
+
+  async _captureSurplusCourseScan(courseUrl) {
+    if (!this.context) return null;
+    if (!this._isRunActive()) return null;
+    try {
+      return await this._scanCourseDetailsForCheckpoint(courseUrl, true);
+    } catch (err) {
+      this.log(`⚠️ Surplus course scan failed: ${String(err.message).split('\n')[0]}`, 'warn');
+      return null;
+    }
+  }
+
+  async _captureSurplusEvidence(courseUrl, lessonUrl) {
+    const scan = await this._captureSurplusCourseScan(courseUrl);
+    if (!this._isRunActive()) return null;
+    return this._extractSurplusEvidence(scan, lessonUrl);
+  }
+
+  // F5 trang bài học để Odoo chốt checkpoint, rồi quét lại bằng chứng website.
+  async _checkpointAndCaptureSurplusEvidence(courseUrl, lessonUrl) {
+    if (this.page && !this._stopped) {
+      try {
+        await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this._fakeVisibilityAPI();
+        await this.page.waitForTimeout(7000);
+      } catch (err) {
+        this.log(`⚠️ Surplus checkpoint refresh failed: ${String(err.message).split('\n')[0]}`, 'warn');
+      }
+    }
+    if (!this._isRunActive()) return null;
+    return this._captureSurplusEvidence(courseUrl, lessonUrl);
+  }
+
+  // Phân loại một block surplus dựa trên bằng chứng website BEFORE/AFTER. Thời
+  // gian local KHÔNG tự động là bằng chứng thành công.
+  _classifySurplusProgress(before, after, activeMinutes) {
+    if (!before || !after) return { confirmed: false, via: 'none', creditedMinutes: 0 };
+    const courseDelta = (after.courseMinutes || 0) - (before.courseMinutes || 0);
+    const lessonDelta = (after.lessonPercent != null && before.lessonPercent != null)
+      ? after.lessonPercent - before.lessonPercent
+      : 0;
+    const lessonCompletedNow = after.lessonCompleted === true && before.lessonCompleted !== true;
+    // Ưu tiên số phút WEBSITE thực ghi nhận khi có tín hiệu thời gian khóa.
+    if (courseDelta > 0) {
+      return { confirmed: true, via: 'course_time', creditedMinutes: courseDelta };
+    }
+    // Tổng thời gian khóa có thể bị "capped" sau khi đạt mục tiêu, nhưng tiến độ
+    // bài học vẫn tăng → vẫn là bằng chứng hợp lệ; khi đó credit thời gian local
+    // của block (được coi là đã học).
+    if (lessonDelta > 0 || lessonCompletedNow) {
+      return { confirmed: true, via: 'lesson_progress', creditedMinutes: Math.max(0, Number(activeMinutes) || 0) };
+    }
+    return { confirmed: false, via: 'none', creditedMinutes: 0 };
+  }
+
+  _logSurplusVerification(before, after, verdict) {
+    const beforeP = before && before.lessonPercent != null ? `${before.lessonPercent}%` : 'unknown';
+    const afterP = after && after.lessonPercent != null ? `${after.lessonPercent}%` : 'unknown';
+    const beforeM = before ? before.courseMinutes : '?';
+    const afterM = after ? after.courseMinutes : '?';
+    this.log('📊 Website surplus verification', 'info');
+    this.log(`   Lesson progress: ${beforeP} → ${afterP}`, 'info');
+    this.log(`   Course recorded time: ${beforeM} → ${afterM} min`, 'info');
+    const confirmed = verdict && verdict.confirmed;
+    const suffix = confirmed && verdict.via === 'lesson_progress' ? ' via lesson progress' : '';
+    this.log(`   Result: ${confirmed ? `CONFIRMED${suffix}` : 'NOT CONFIRMED'}`, confirmed ? 'success' : 'warn');
+  }
+
+  // Các bài CHƯA XONG (<100%) còn học được của một khóa. Trả null nếu không quét
+  // được (khác với mảng rỗng = không còn bài).
+  _extractUnfinishedLessons(scan, state) {
+    if (!scan || !Array.isArray(scan.allLessons)) return null;
+    const unusable = new Set(state.unusableLessons || []);
+    const studied = new Set(state.studiedLessons || []);
+    return scan.allLessons.filter(lesson => lesson && lesson.url
+      && !unusable.has(lesson.url)
+      && !studied.has(lesson.url)
+      && Number.isFinite(Number(lesson.progressPercent))
+      && Number(lesson.progressPercent) < 100);
+  }
+
+  _logSurplusSummary() {
+    const total = this.coursesConfig.length;
+    this.log('📊 Surplus summary', 'info');
+    this.coursesConfig.forEach((config, idx) => {
+      const state = this.surplusCourseStates[config.courseUrl] || {};
+      const target = state.targetMinutes ?? 0;
+      const confirmed = Math.round(state.confirmedMinutes || 0);
+      const status = state.completed ? 'target reached' : state.exhausted ? 'exhausted' : 'incomplete';
+      this.log(`   Course ${idx + 1}/${total}: ${confirmed}/${target} min — ${status}`, 'info');
+    });
+  }
+
+  // Vào surplus pass: gate website cấp khóa đã đạt, dựng state per-course, giữ
+  // nguyên tiến độ đã persist để resume đúng khóa.
   async _initializeSurplusMode() {
-    if (this.surplusExhausted) return false;
-    if (this.surplusMode && this._surplusLessonPools && this._surplusLessonPools.size > 0) return true;
     if (!this._isRunActive()) return false;
     if (!(await this._verifyAllConfiguredCoursesCompleted())) return false;
     if (!this._isRunActive()) return false;
 
-    // Dùng lại kết quả vừa xác minh; nếu chưa có (restore surplus) thì quét mới.
-    let evaluations = Array.isArray(this._lastCourseEvaluations) ? this._lastCourseEvaluations : [];
-    if (evaluations.length === 0) {
-      evaluations = [];
-      for (const config of this.coursesConfig) {
-        if (!this._isRunActive()) return false;
-        evaluations.push(await this._evaluateConfiguredCourse(config));
-        if (!this._isRunActive()) return false;
-      }
-    }
-
-    const eligible = [];
-    for (const evaluation of evaluations) {
-      if (!this._isRunActive()) return false;
-      // `incomplete` (bằng chứng tường minh) không được học surplus. `completed` và
-      // `unknown` đều có thể cung cấp bài học surplus — target thời gian đã được
-      // _verifyAllConfiguredCoursesCompleted() xác nhận trước đó.
-      if (evaluation.state === 'incomplete') continue;
-      const lessons = (evaluation.allLessons || []).filter(lesson => lesson && lesson.url
-        && !this._surplusUnusableLessons.has(`${evaluation.courseUrl}|${lesson.url}`)
-        && !this._surplusStudiedLessons.has(`${evaluation.courseUrl}|${lesson.url}`));
-      if (lessons.length === 0) continue;
-      eligible.push({ courseUrl: evaluation.courseUrl, title: evaluation.title, lessons });
-    }
-
-    this.surplusEligibleCourses = eligible.map(item => item.courseUrl);
-    this._surplusLessonPools = new Map(eligible.map(item => [item.courseUrl, item.lessons]));
-    if (eligible.length === 0) {
-      this.surplusExhausted = true;
-      this.log('⚠️ All courses are 100%, but no usable surplus lessons remain; ending surplus cleanly', 'warn');
-      return false;
-    }
-
-    this._generateSurplusTargetOnce();
+    this._ensureSurplusCourseStates();
     this.surplusMode = true;
     this.log('➡️ Entering surplus-study phase', 'success');
-    this.log(`Eligible surplus courses: ${eligible.length}/${this.coursesConfig.length}`, 'info');
+    this.log(`   Courses: ${this.coursesConfig.length} | resume index: ${this.surplusCurrentCourseIndex}`, 'info');
     this.emit('status', this.getStatus());
     return true;
   }
 
-  async _checkpointSurplusCourse(courseUrl) {
-    if (!this.page || this._stopped) return null;
-    if (!this._isRunActive()) return null;
-    try {
-      await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-      await this._fakeVisibilityAPI();
-      await this.page.waitForTimeout(7000);
-    } catch (err) {
-      this.log(`⚠️ Surplus checkpoint refresh failed: ${String(err.message).split('\n')[0]}`, 'warn');
-    }
-    if (!this._isRunActive()) return null;
-    let result = null;
-    try { result = await this._scanCourseDetailsForCheckpoint(courseUrl, true); } catch { /* retry next lesson */ }
-    if (!this._isRunActive()) return null;
-    if (result && Array.isArray(result.allLessons)) {
-      const lessons = result.allLessons.filter(lesson => lesson && lesson.url
-        && !this._surplusUnusableLessons.has(`${courseUrl}|${lesson.url}`)
-        && !this._surplusStudiedLessons.has(`${courseUrl}|${lesson.url}`));
-      if (lessons.length > 0) this._surplusLessonPools.set(courseUrl, lessons);
-      else this._surplusLessonPools.delete(courseUrl);
-    }
-    this.log('✅ Checkpoint completed', 'success');
-    this.emit('status', this.getStatus());
-    return result;
-  }
-
+  // Điều khiển surplus pass TUẦN TỰ theo this.coursesConfig: 1 → 2 → 3 → 4.
+  // Không chọn ngẫu nhiên khóa. Resume từ surplusCurrentCourseIndex đã persist.
   async _runSurplusStudy() {
     if (!this.surplusMode) return true;
     this._setStatus('surplus-study');
     this.emit('status', this.getStatus());
-    this._surplusLessonPools = this._surplusLessonPools || new Map();
-    while (!this._stopped && this._isRunActive() && this.surplusStudiedMinutes < this._generateSurplusTargetOnce()) {
+    this._ensureSurplusCourseStates();
+
+    const total = this.coursesConfig.length;
+    this.log('🔁 Starting surplus pass', 'info');
+    this.log(`   Courses: ${total}`, 'info');
+    this.log('   Strategy: sequential', 'info');
+    this.log(`   RNG: per-course ${SURPLUS_TARGET_MIN_MINUTES}-${SURPLUS_TARGET_MAX_MINUTES} minutes`, 'info');
+
+    for (let cIdx = this.surplusCurrentCourseIndex; cIdx < total; cIdx++) {
+      if (!this._isRunActive()) return false;
       await this._checkPaused();
       if (!this._isRunActive()) return false;
-      if (this._hitSchedulingLimit()) return false;
-      this._rolloverDailyCounter();
-      const dailyRemainingMs = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes) * 60000;
-      if (dailyRemainingMs <= 0) { this._hitDailyLimit(); return false; }
-
-      const available = this.surplusEligibleCourses.filter(url => (this._surplusLessonPools.get(url) || []).length > 0);
-      if (available.length === 0) {
-        // Mục tiêu surplus chỉ là mức mong muốn TỐI ĐA. Khi website không còn
-        // bài học được nữa thì kết thúc bằng kiệt khẩu (exhaustion): giữ nguyên
-        // số phút thực đã học, không regenerate mục tiêu, không reset tiến độ.
-        this.surplusExhausted = true;
-        this.surplusMode = false;
-        this.log('⚠️ Surplus target cannot be fully satisfied', 'warn');
-        this.log(`🎲 Surplus target: ${this.surplusTargetMinutes} minutes`, 'warn');
-        this.log(`📚 Surplus actually studied: ${Math.round(this.surplusStudiedMinutes)} minutes`, 'warn');
-        this.log('🚫 No eligible studyable lessons remain', 'warn');
-        this.log('✅ Ending surplus phase due to exhaustion', 'success');
-        this.emit('status', this.getStatus());
-        return false;
-      }
-      const courseUrl = available[this._randomBetween(0, available.length - 1)];
-      const lessons = this._surplusLessonPools.get(courseUrl) || [];
-      const lessonIndex = this._randomBetween(0, lessons.length - 1);
-      const lesson = lessons[lessonIndex];
-      let opened = false;
-      try {
-        await this.page.goto(lesson.url, { waitUntil: 'load', timeout: 60000 });
-        await this._fakeVisibilityAPI();
-        await this.page.waitForTimeout(3500);
-        opened = this._isOnUrl(lesson.url);
-      } catch (err) {
-        this.log(`⚠️ Surplus lesson unavailable [${lesson.title || lesson.url}]: ${String(err.message).split('\n')[0]}`, 'warn');
-      }
-      // Mở bài là I/O dài — phiên có thể đã hẹn giờ/kết thúc trong lúc chờ.
-      if (!this._isRunActive()) return false;
-      if (!opened) {
-        this._surplusUnusableLessons.add(`${courseUrl}|${lesson.url}`);
-        lessons.splice(lessonIndex, 1);
-        if (lessons.length === 0) this.surplusEligibleCourses = this.surplusEligibleCourses.filter(url => url !== courseUrl);
+      this.surplusCurrentCourseIndex = cIdx;
+      const config = this.coursesConfig[cIdx];
+      const state = this._surplusStateFor(config.courseUrl);
+      if (state.completed || state.exhausted) {
+        this.log(`⏭️ Surplus Course ${cIdx + 1}/${total} already ${state.exhausted ? 'exhausted' : 'completed'} — skipping`, 'info');
         continue;
       }
 
-      let lessonMinutes = 5;
-      try {
-        const timer = await readDomTimer(this.page);
-        if (timer && timer.totalMinutes > 0) lessonMinutes = Math.max(5, timer.totalMinutes);
-      } catch { /* default minimum checkpoint duration */ }
-      const remainingSurplusMs = Math.max(0, this.surplusTargetMinutes - this.surplusStudiedMinutes) * 60000;
-      const studyMs = Math.min(lessonMinutes * 60000, remainingSurplusMs, dailyRemainingMs);
-      const activeMs = await this._waitForActiveStudyTime(studyMs);
-      // Vứt bỏ kết quả nếu phiên đã hẹn giờ/dừng/đổi run trong lúc treo.
-      if (!this._isRunActive()) return false;
-      const studiedMinutes = activeMs / 60000;
-      // Giữ NGUYÊN số phút thực — không kẹp về mục tiêu, không làm tròn lên.
-      this.surplusStudiedMinutes += studiedMinutes;
-      this.dailyStudiedMinutes += studiedMinutes;
-      this.log(`Surplus study: ${Math.round(this.surplusStudiedMinutes)}/${this.surplusTargetMinutes} minutes`, 'info');
-      // Tiêu thụ bài vừa học: bài này không được mở lại trong surplus phase
-      // hiện tại (kể cả sau khi checkpoint rescan trả về full danh sách bài).
-      this._surplusStudiedLessons.add(`${courseUrl}|${lesson.url}`);
-      lessons.splice(lessonIndex, 1);
-      if (lessons.length === 0) this.surplusEligibleCourses = this.surplusEligibleCourses.filter(url => url !== courseUrl);
-      await this._checkpointSurplusCourse(courseUrl);
-      if (!this._isRunActive()) return false;
-      if (this.surplusStudiedMinutes >= this.surplusTargetMinutes) {
-        this.log('✅ Surplus target completed', 'success');
-        this.surplusMode = false;
-        return true;
-      }
-      if (this._hitDailyLimit()) return false;
+      const outcome = await this._runSurplusCourseBlock(cIdx, config, state);
+      if (outcome === 'scheduled' || outcome === 'stopped') return false;
+
+      this.surplusCurrentCourseIndex = cIdx + 1;
+      this._syncLegacySurplusAggregates();
+      this.emit('status', this.getStatus());
     }
-    return this.surplusStudiedMinutes >= this.surplusTargetMinutes;
+
+    this.surplusMode = false;
+    this.log('✅ Surplus pass completed', 'success');
+    this._logSurplusSummary();
+    this.emit('status', this.getStatus());
+    return true;
+  }
+
+  async _runSurplusCourseBlock(cIdx, config, state) {
+    const total = this.coursesConfig.length;
+    const courseUrl = config.courseUrl;
+    const normalTarget = AutoCourseSession._targetMinutesFor(config);
+    const currentStudied = Math.max(0, Number(this.courseProgress[courseUrl]?.studiedMinutes) || 0);
+    const normalReached = normalTarget > 0 ? currentStudied >= normalTarget : true;
+    const target = this._surplusTargetFor(state);
+    const courseLabel = state.title || this.courseProgress[courseUrl]?.title || courseUrl;
+
+    let scan = await this._captureSurplusCourseScan(courseUrl);
+    if (!this._isRunActive()) return 'stopped';
+    if (!scan) {
+      // Một lần thử lại có giới hạn cho lỗi quét tạm thời (không lặp vô hạn).
+      scan = await this._captureSurplusCourseScan(courseUrl);
+      if (!this._isRunActive()) return 'stopped';
+    }
+    let lessons = this._extractUnfinishedLessons(scan, state);
+
+    if (lessons === null || lessons.length === 0) {
+      state.exhausted = true;
+      this.log(`📘 Surplus Course ${cIdx + 1}/${total}`, 'info');
+      this.log(`   Course: ${courseLabel}`, 'info');
+      this.log(`   Normal target: ${normalTarget} minutes`, 'info');
+      this.log(`   Normal target status: ${normalReached ? 'reached' : 'not reached'}`, 'info');
+      this.log('   Unfinished lessons found: 0', 'warn');
+      this.log(`   Surplus target: ${target} minutes`, 'warn');
+      this.log(`⚠️ Course ${cIdx + 1}/${total} surplus exhausted`, 'warn');
+      this.log(`   Target: ${target} minutes`, 'warn');
+      this.log(`   Confirmed/accounted surplus: ${Math.round(state.confirmedMinutes)} minutes`, 'warn');
+      this.log('   No more studyable unfinished lessons remain', 'warn');
+      if (cIdx + 1 < total) this.log(`➡️ Moving to Course ${cIdx + 2}/${total}`, 'info');
+      return 'exhausted';
+    }
+
+    const resuming = state.confirmedMinutes > 0 || state.localActiveMinutes > 0;
+    this.log(resuming ? `♻️ Resuming Surplus Course ${cIdx + 1}/${total}` : `📘 Surplus Course ${cIdx + 1}/${total}`, 'info');
+    this.log(`   Course: ${courseLabel}`, 'info');
+    this.log(`   Normal target: ${normalTarget} minutes`, 'info');
+    this.log(`   Normal target status: ${normalReached ? 'reached' : 'not reached'}`, 'info');
+    this.log(`   Unfinished lessons found: ${lessons.length}`, 'info');
+    this.log(`   Surplus target: ${target} minutes`, 'info');
+    this.log(`   Confirmed surplus: ${Math.round(state.confirmedMinutes)}/${target} minutes`, 'info');
+    this.emit('status', this.getStatus());
+
+    while (state.confirmedMinutes < target) {
+      if (!this._isRunActive()) return 'stopped';
+      await this._checkPaused();
+      if (!this._isRunActive()) return 'stopped';
+      if (this._hitSchedulingLimit()) return 'scheduled';
+      this._rolloverDailyCounter();
+      const dailyRemainingMs = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes) * 60000;
+      if (dailyRemainingMs <= 0) { this._hitDailyLimit(); return 'scheduled'; }
+      if (lessons.length === 0) break;
+
+      const lesson = lessons[0];
+      const result = await this._studySurplusLesson(cIdx, config, state, lesson);
+      if (!this._isRunActive()) return 'stopped';
+      if (result.outcome === 'scheduled') return 'scheduled';
+      if (result.outcome === 'stopped') return 'stopped';
+      this._syncLegacySurplusAggregates();
+      this.emit('status', this.getStatus());
+
+      if (result.outcome === 'confirmed') {
+        // Bài đã 100% → loại khỏi danh sách; còn dang dở → tiếp tục bài này.
+        if (result.lessonCompleted || (result.lessonPercent != null && result.lessonPercent >= 100)) {
+          lessons.shift();
+        } else if (result.lessonPercent != null) {
+          lesson.progressPercent = result.lessonPercent;
+        }
+      } else if (result.outcome === 'unavailable') {
+        lessons.shift();
+      } else if (state.unusableLessons.includes(lesson.url)) {
+        // unconfirmed & đã chạm ngưỡng → bỏ bài này.
+        lessons.shift();
+      }
+      // unconfirmed nhưng chưa chạm ngưỡng → thử lại (bị chặn bởi số lần tối đa).
+    }
+
+    if (state.confirmedMinutes >= target) {
+      state.completed = true;
+      this.log(`🎯 Surplus target reached for Course ${cIdx + 1}/${total}`, 'success');
+      this.log(`   Target: ${target} minutes`, 'success');
+      this.log(`   Confirmed/accounted surplus: ${Math.round(state.confirmedMinutes)} minutes`, 'success');
+      if (cIdx + 1 < total) this.log(`➡️ Moving to Course ${cIdx + 2}/${total}`, 'info');
+    } else {
+      state.exhausted = true;
+      this.log(`⚠️ Course ${cIdx + 1}/${total} surplus exhausted`, 'warn');
+      this.log(`   Target: ${target} minutes`, 'warn');
+      this.log(`   Confirmed/accounted surplus: ${Math.round(state.confirmedMinutes)} minutes`, 'warn');
+      this.log('   No more studyable unfinished lessons remain', 'warn');
+      if (cIdx + 1 < total) this.log(`➡️ Moving to Course ${cIdx + 2}/${total}`, 'info');
+    }
+    this._syncLegacySurplusAggregates();
+    this.emit('status', this.getStatus());
+    return state.completed ? 'completed' : 'exhausted';
+  }
+
+  // Học MỘT block surplus cho một bài, rồi xác minh website BEFORE/AFTER. Chỉ
+  // credit khi website xác nhận (thời gian khóa tăng HOẶC tiến độ bài tăng).
+  async _studySurplusLesson(cIdx, config, state, lesson) {
+    const total = this.coursesConfig.length;
+    const courseUrl = config.courseUrl;
+
+    this.log('📖 Selecting unfinished lesson', 'info');
+    this.log(`   Course: ${cIdx + 1}/${total}`, 'info');
+    this.log(`   Lesson: ${lesson.title || lesson.url}`, 'info');
+    this.log(`   Current website progress: ${lesson.progressPercent}%`, 'info');
+    this.log(`   URL: ${lesson.url}`, 'info');
+
+    let before = await this._captureSurplusEvidence(courseUrl, lesson.url);
+    if (!this._isRunActive()) return { outcome: 'stopped' };
+    if (!before) {
+      // Thử đọc lại một lần trước khi kết luận bài không dùng được.
+      before = await this._captureSurplusEvidence(courseUrl, lesson.url);
+      if (!this._isRunActive()) return { outcome: 'stopped' };
+    }
+    if (!before) {
+      this._markSurplusLessonUnusable(state, lesson.url);
+      this.log('⚠️ Surplus lesson unavailable', 'warn');
+      this.log(`   Lesson: ${lesson.title || lesson.url}`, 'warn');
+      this.log('   Reason: cannot read website progress', 'warn');
+      this.log('🔄 Trying next unfinished lesson', 'info');
+      return { outcome: 'unavailable' };
+    }
+
+    let opened = false;
+    try {
+      this.log('🌐 Opening surplus lesson...', 'info');
+      await this.page.goto(lesson.url, { waitUntil: 'load', timeout: 60000 });
+      await this._fakeVisibilityAPI();
+      await this.page.waitForTimeout(3500);
+      opened = this._isOnUrl(lesson.url);
+    } catch (err) {
+      this.log('⚠️ Surplus lesson unavailable', 'warn');
+      this.log(`   Lesson: ${lesson.title || lesson.url}`, 'warn');
+      this.log(`   Reason: ${String(err.message).split('\n')[0]}`, 'warn');
+    }
+    // Mở bài là I/O dài — phiên có thể đã hẹn giờ/kết thúc trong lúc chờ.
+    if (!this._isRunActive()) return { outcome: 'stopped' };
+    if (!opened) {
+      this._markSurplusLessonUnusable(state, lesson.url);
+      this.log('🔄 Trying next unfinished lesson', 'info');
+      return { outcome: 'unavailable' };
+    }
+    this.log('✅ Surplus lesson opened successfully', 'success');
+
+    const dailyRemainingMs = Math.max(0, this.options.dailyMaxMinutes - this.dailyStudiedMinutes) * 60000;
+    const targetRemainingMs = Math.max(0, state.targetMinutes - state.confirmedMinutes) * 60000;
+    if (dailyRemainingMs <= 0) { this._hitDailyLimit(); return { outcome: 'scheduled' }; }
+
+    let blockMinutes = SURPLUS_MIN_BLOCK_MINUTES;
+    try {
+      const timer = await readDomTimer(this.page);
+      if (timer && timer.totalMinutes > 0) blockMinutes = Math.max(SURPLUS_MIN_BLOCK_MINUTES, timer.totalMinutes);
+    } catch { /* dùng block tối thiểu */ }
+    if (!this._isRunActive()) return { outcome: 'stopped' };
+
+    const plannedMs = Math.max(0, Math.min(blockMinutes * 60000, targetRemainingMs, dailyRemainingMs));
+    if (plannedMs <= 0) return { outcome: 'unavailable' };
+
+    this.log('📚 Surplus study plan', 'info');
+    this.log(`   Course: ${cIdx + 1}/${total}`, 'info');
+    this.log(`   Lesson: ${lesson.title || lesson.url}`, 'info');
+    this.log(`   Lesson progress before: ${before.lessonPercent == null ? 'unknown' : `${before.lessonPercent}%`}`, 'info');
+    this.log(`   Course surplus progress: ${Math.round(state.confirmedMinutes)}/${state.targetMinutes} min`, 'info');
+    this.log(`   Surplus remaining: ${Math.ceil(targetRemainingMs / 60000)} min`, 'info');
+    this.log(`   Daily remaining: ${Math.floor(dailyRemainingMs / 60000)} min`, 'info');
+    this.log(`   Planned active study: ${Math.round(plannedMs / 60000)} min`, 'info');
+    this.log('▶️ Starting surplus study block', 'info');
+    this.log(`   Planned duration: ${Math.round(plannedMs / 60000)} minutes`, 'info');
+
+    const activeMs = await this._waitForActiveStudyTime(plannedMs);
+    if (!this._isRunActive()) return { outcome: 'stopped' };
+    const activeMinutes = activeMs / 60000;
+    state.localActiveMinutes = Math.round((state.localActiveMinutes + activeMinutes) * 100) / 100;
+    this.log('⏱️ Local active study finished', 'info');
+    this.log(`   Active time: ${Math.round(activeMinutes)} minutes`, 'info');
+
+    this.log('🔄 Refreshing/checkpointing surplus lesson...', 'info');
+    let after = await this._checkpointAndCaptureSurplusEvidence(courseUrl, lesson.url);
+    if (!this._isRunActive()) return { outcome: 'stopped' };
+    this.log('🔍 Verifying website-recorded progress...', 'info');
+    let verdict = this._classifySurplusProgress(before, after, activeMinutes);
+    this._logSurplusVerification(before, after, verdict);
+
+    if (!verdict.confirmed) {
+      // Một lần xác minh lại có giới hạn (không lặp vô hạn).
+      this.log('🔄 Performing one bounded re-verification', 'info');
+      after = await this._captureSurplusEvidence(courseUrl, lesson.url);
+      if (!this._isRunActive()) return { outcome: 'stopped' };
+      verdict = this._classifySurplusProgress(before, after, activeMinutes);
+      this._logSurplusVerification(before, after, verdict);
+    }
+
+    if (!verdict.confirmed) {
+      this.log('⚠️ Website did not confirm additional progress for this study block', 'warn');
+      const attempts = (state.lessonAttempts[lesson.url] || 0) + 1;
+      state.lessonAttempts[lesson.url] = attempts;
+      if (attempts >= SURPLUS_MAX_UNCONFIRMED_ATTEMPTS) {
+        this._markSurplusLessonUnusable(state, lesson.url);
+        this.log(`⚠️ Marking lesson unusable after ${attempts} unconfirmed attempts`, 'warn');
+      }
+      this.log('🔄 Trying next unfinished lesson', 'info');
+      return { outcome: 'unconfirmed' };
+    }
+
+    const credited = Math.max(0, Math.min(verdict.creditedMinutes, state.targetMinutes - state.confirmedMinutes));
+    state.confirmedMinutes = Math.round((state.confirmedMinutes + credited) * 100) / 100;
+    state.localActiveMinutes = Math.max(0, Math.round((state.localActiveMinutes - credited) * 100) / 100);
+    state.lessonAttempts[lesson.url] = 0;
+    if (after && after.courseMinutes != null) state.verifiedMinutes = after.courseMinutes;
+    this.dailyStudiedMinutes += credited;
+    this.surplusStudiedMinutes = Math.round((this.surplusStudiedMinutes + credited) * 100) / 100;
+    if (after && after.courseTitle) state.title = after.courseTitle;
+    const lessonCompleted = after ? (after.lessonCompleted === true || (after.lessonPercent != null && after.lessonPercent >= 100)) : false;
+    if (lessonCompleted && !state.studiedLessons.includes(lesson.url)) state.studiedLessons.push(lesson.url);
+    this.log(`📈 Course surplus progress: ${Math.round(state.confirmedMinutes)}/${state.targetMinutes} minutes`, 'success');
+
+    return { outcome: 'confirmed', lessonPercent: after ? after.lessonPercent : null, lessonCompleted };
   }
 
   async _finalizeSurplusCompletion() {
-    // Mục tiêu surplus là mức mong muốn tối đa: coi như hoàn thành khi đã đạt
-    // mục tiêu RNG HOẶC khi website không còn bài học được (exhaustion).
-    const targetReached = this.surplusTargetMinutes != null
-      && this.surplusStudiedMinutes >= this.surplusTargetMinutes;
-    const exhausted = this.surplusExhausted === true;
-    if (!targetReached && !exhausted) return false;
+    // Chỉ hoàn tất khi TOÀN BỘ khóa đã xử lý xong surplus pass (đạt target hoặc
+    // kiệt khẩu). `unknown` của gate cấp khóa không gây lặp vô hạn.
+    if (!this._surplusPassProcessed()) return false;
     if (!this._isRunActive()) return false;
+    this.log('🔎 Final verification after surplus pass', 'info');
     const verified = await this._verifyAllConfiguredCoursesCompleted();
     if (!this._isRunActive()) return false;
     if (!verified) {
-      // Chỉ hẹn lại surplus mode khi chưa kiệt khẩu — phiên exhausted không
-      // được quay lại học surplus nữa (đã không còn bài để học).
-      if (!exhausted) this.surplusMode = true;
-      this.log('⚠️ Surplus phase ended, but final all-course verification failed; deferring completion', 'warn');
+      this.log('⚠️ Surplus pass finished, but final all-course verification failed; deferring completion', 'warn');
       return false;
     }
     this.surplusMode = false;
@@ -1296,6 +1651,9 @@ class AutoCourseSession extends EventEmitter {
       dailyDate: this.dailyDate,
       courseProgress: this.courseProgress,
       surplusMode: this.surplusMode,
+      surplusCurrentCourseIndex: this.surplusCurrentCourseIndex,
+      surplusCourseStates: this.surplusCourseStates,
+      surplusPassProcessed: this._surplusPassProcessed(),
       surplusTargetMinutes: this.surplusTargetMinutes,
       surplusStudiedMinutes: this.surplusStudiedMinutes,
       surplusEligibleCourses: this.surplusEligibleCourses,
@@ -2168,7 +2526,12 @@ class AutoCourseSession extends EventEmitter {
       } else {
         const allWebsiteCoursesCompleted = this.coursesConfig.length === 0
           || await this._verifyAllConfiguredCoursesCompleted();
-        if (this.coursesConfig.length > 0 && allWebsiteCoursesCompleted && !this.surplusMode && !this.surplusExhausted) {
+        // Surplus pass chỉ bắt đầu khi mọi target thường đã đạt VÀ pass chưa xử lý xong.
+        const surplusPassPending = this.coursesConfig.length > 0
+          && allWebsiteCoursesCompleted
+          && !this.surplusMode
+          && !this._surplusPassProcessed();
+        if (surplusPassPending) {
           await this._initializeSurplusMode();
           if (this.surplusMode) {
             await this._runSurplusStudy();
@@ -2185,16 +2548,15 @@ class AutoCourseSession extends EventEmitter {
             return;
           }
         }
-        if (allWebsiteCoursesCompleted && this.surplusExhausted) {
-          this._setStatus('completed');
-          const surplusSummary = this.surplusTargetMinutes != null
-            ? `${Math.round(this.surplusStudiedMinutes)}/${this.surplusTargetMinutes} target minutes`
-            : `${Math.round(this.surplusStudiedMinutes)} minutes`;
-          this.log(`⚠️ Surplus phase exhausted (${surplusSummary} — no eligible studyable lessons remain)`, 'warn');
-          this.log('✅ Account fully completed', 'success');
-          this.log('➡️ Moving account to complete queue', 'success');
-          this.emit('status', this.getStatus());
-          return;
+        // Pass đã xử lý xong (restore/khôi phục) → xác minh lần cuối rồi hoàn tất.
+        if (allWebsiteCoursesCompleted && this._surplusPassProcessed()) {
+          if (await this._finalizeSurplusCompletion()) {
+            this._setStatus('completed');
+            this.log('✅ Account fully completed', 'success');
+            this.log('➡️ Moving account to complete queue', 'success');
+            this.emit('status', this.getStatus());
+            return;
+          }
         }
         const incompleteCourses = this.coursesConfig.filter(c => !this.courseProgress[c.courseUrl]?.completed);
         if (this.surplusMode || (!allWebsiteCoursesCompleted && incompleteCourses.length === 0)) {
