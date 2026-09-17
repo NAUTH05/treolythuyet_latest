@@ -1,9 +1,10 @@
 const { chromium } = require('playwright');
 const EventEmitter = require('events');
-const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, readDomTimer, getShiftsForDate, calcMsRemainingInShift, getNextShiftStart } = require('./courseScanner');
+const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, scanMyCoursesCompletion, readDomTimer, getShiftsForDate, calcMsRemainingInShift, getNextShiftStart } = require('./courseScanner');
 
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
+const MY_COURSES_URL = `${BASE_URL}/slides/all?my=1`;
 const SESSION_LOG_SEPARATOR = '---------------------------------------------------------';
 const POST_TARGET_GRACE_MINUTES = 5;
 const LOGIN_NAVIGATION_TIMEOUT_MS = 60000;
@@ -434,33 +435,230 @@ class AutoCourseSession extends EventEmitter {
       && this.coursesConfig.every(course => this.courseProgress[course.courseUrl]?.websiteCourseCompleted === true);
   }
 
+  static _targetMinutesFor(config) {
+    return (Number(config.targetHours) || 0) * 60 + (Number(config.targetMinutes) || 0);
+  }
+
+  static _courseCompletionStateOf(scan) {
+    if (!scan) return 'unknown';
+    if (scan.courseCompletionState === 'completed'
+      || scan.courseCompletionState === 'incomplete'
+      || scan.courseCompletionState === 'unknown') {
+      return scan.courseCompletionState;
+    }
+    // Tương thích kết quả scan cũ (chỉ có courseLevelCompleted boolean).
+    return scan.courseLevelCompleted === true ? 'completed' : 'unknown';
+  }
+
+  static _normalizedTitle(value) {
+    return String(value || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+      .replace(/[^a-z0-9]+/gi, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  _titlesLikelyMatch(a, b) {
+    const left = AutoCourseSession._normalizedTitle(a);
+    const right = AutoCourseSession._normalizedTitle(b);
+    if (!left || !right) return false;
+    return left === right || left.includes(right) || right.includes(left);
+  }
+
+  // Quét + đánh giá MỘT khóa: gate thời gian (authoritative) + trạng thái cấp khóa.
+  async _evaluateConfiguredCourse(config) {
+    const targetMinutes = AutoCourseSession._targetMinutesFor(config);
+    const inactive = () => {
+      const existing = this.courseProgress[config.courseUrl] || {};
+      return {
+        courseUrl: config.courseUrl,
+        title: existing.title || config.courseUrl,
+        targetMinutes,
+        actualStudiedMinutes: Math.max(0, Number(existing.studiedMinutes) || 0),
+        state: 'unknown',
+        percent: existing.websiteCourseProgressPercent ?? null,
+        source: null,
+        evidence: null,
+        targetReached: false,
+        scanFailed: true,
+        stale: true,
+        allLessons: [],
+      };
+    };
+
+    if (!this._isRunActive()) return inactive();
+    let result = null;
+    try {
+      result = await this._scanCourseDetailsForCheckpoint(config.courseUrl, true);
+    } catch (err) {
+      this.log(`⚠️ Không thể xác minh trạng thái cấp khóa [${config.courseUrl}]: ${String(err.message).split('\n')[0]}`, 'warn');
+    }
+    // I/O vừa xong có thể đã bị vượt qua bởi trạng thái hẹn giờ / dừng / đổi run
+    // → KHÔNG được ghi courseProgress hay tiếp tục xác minh.
+    if (!this._isRunActive()) return inactive();
+
+    const existing = this.courseProgress[config.courseUrl] || {};
+    if (!result) {
+      return {
+        courseUrl: config.courseUrl,
+        title: existing.title || config.courseUrl,
+        targetMinutes,
+        actualStudiedMinutes: Math.max(0, Number(existing.studiedMinutes) || 0),
+        state: 'unknown',
+        percent: existing.websiteCourseProgressPercent ?? null,
+        source: null,
+        evidence: null,
+        targetReached: false,
+        scanFailed: true,
+        allLessons: [],
+      };
+    }
+
+    const actualStudiedMinutes = Math.max(0, Number(result.actualStudiedMinutes) || 0);
+    const state = AutoCourseSession._courseCompletionStateOf(result);
+    const percent = Number.isFinite(result.courseProgressPercent) ? result.courseProgressPercent : null;
+    const targetReached = targetMinutes > 0 ? actualStudiedMinutes >= targetMinutes : true;
+
+    this.courseProgress[config.courseUrl] = {
+      ...existing,
+      title: result.courseTitle || existing.title || config.courseUrl,
+      targetMinutes,
+      // Không để một lần parse lỗi (0 phút) xoá tiến độ đang hiển thị.
+      studiedMinutes: actualStudiedMinutes > 0 ? actualStudiedMinutes : (existing.studiedMinutes ?? actualStudiedMinutes),
+      websiteCourseCompleted: state === 'completed',
+      websiteCourseCompletionState: state,
+      websiteCourseProgressPercent: percent ?? existing.websiteCourseProgressPercent ?? null,
+    };
+
+    return {
+      courseUrl: config.courseUrl,
+      title: result.courseTitle || existing.title || config.courseUrl,
+      targetMinutes,
+      actualStudiedMinutes,
+      state,
+      percent,
+      source: result.courseCompletionSource || result.courseCompletionEvidence?.resolutionSource || null,
+      evidence: result.courseCompletionEvidence || null,
+      targetReached,
+      scanFailed: false,
+      allLessons: Array.isArray(result.allLessons) ? result.allLessons : [],
+    };
+  }
+
+  _logCourseVerificationFailure(evaluation, reason) {
+    const label = reason === 'target-not-reached'
+      ? '⚠️ Course time target not reached'
+      : '⚠️ Course-level verification failed';
+    this.log(label, 'warn');
+    this.log(`   Course: ${evaluation.title}`, 'warn');
+    this.log(`   Configured target: ${evaluation.targetMinutes} minutes`, 'warn');
+    this.log(`   Actual studied: ${evaluation.actualStudiedMinutes} minutes`, 'warn');
+    this.log(`   Course progress detected: ${evaluation.percent == null ? 'null' : `${evaluation.percent}%`}`, 'warn');
+    this.log(`   Completion source: ${evaluation.source || 'none'}`, 'warn');
+    this.log(`   Course-level completed: ${evaluation.state === 'completed'}`, 'warn');
+  }
+
+  // Một lần xác minh tươi bằng trang "My Courses" cho các khóa còn UNKNOWN.
+  // Không đổi `incomplete` -> `completed`; chỉ nâng cấp khi có badge xác nhận.
+  async _resolveUnknownCoursesViaMyCourses(unknownEvaluations) {
+    if (!this.context || unknownEvaluations.length === 0) return;
+    let verifyPage = null;
+    try {
+      verifyPage = await this.context.newPage();
+      const myCourses = await scanMyCoursesCompletion(verifyPage, MY_COURSES_URL);
+      if (!Array.isArray(myCourses) || myCourses.length === 0) return;
+
+      for (const evaluation of unknownEvaluations) {
+        const match = myCourses.find(course => this._titlesLikelyMatch(course.title, evaluation.title));
+        if (!match) continue;
+        if (match.completed) {
+          evaluation.state = 'completed';
+          evaluation.percent = 100;
+          evaluation.source = match.source || 'my_courses_completed_badge';
+          this.courseProgress[evaluation.courseUrl] = {
+            ...(this.courseProgress[evaluation.courseUrl] || {}),
+            websiteCourseCompleted: true,
+            websiteCourseCompletionState: 'completed',
+            websiteCourseProgressPercent: 100,
+          };
+        } else if (match.state === 'incomplete') {
+          evaluation.state = 'incomplete';
+          evaluation.source = match.source || 'my_courses_incomplete';
+        }
+      }
+    } catch (err) {
+      this.log(`⚠️ Không thể xác minh trang My Courses: ${String(err.message).split('\n')[0]}`, 'warn');
+    } finally {
+      if (verifyPage) {
+        try { await verifyPage.close(); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // Cổng surplus: BẮT BUỘC mọi target thời gian đã đạt, rồi mới dùng bằng chứng
+  // cấp khóa. `unknown` KHÔNG bị coi là `incomplete`; chỉ `incomplete` tường minh
+  // mới chặn surplus. `unknown` được xác minh tươi một lần, nếu vẫn unknown thì
+  // fallback về target thời gian (có cảnh báo) để tránh kẹt vô hạn.
   async _verifyAllConfiguredCoursesCompleted() {
     if (!this.context || this.coursesConfig.length === 0) return false;
     if (!this._isRunActive()) return false;
+
+    const evaluations = [];
     for (const config of this.coursesConfig) {
       if (!this._isRunActive()) return false;
-      let result = null;
-      try {
-        result = await this._scanCourseDetailsForCheckpoint(config.courseUrl, true);
-      } catch (err) {
-        this.log(`⚠️ Không thể xác minh trạng thái cấp khóa [${config.courseUrl}]: ${String(err.message).split('\n')[0]}`, 'warn');
-      }
-      // I/O vừa xong có thể đã bị vượt qua bởi trạng thái hẹn giờ / dừng / đổi run.
+      evaluations.push(await this._evaluateConfiguredCourse(config));
       if (!this._isRunActive()) return false;
-      const websiteCompleted = Boolean(result && result.courseLevelCompleted === true);
-      const existing = this.courseProgress[config.courseUrl] || {};
-      this.courseProgress[config.courseUrl] = {
-        ...existing,
-        title: result?.courseTitle || existing.title || config.courseUrl,
-        websiteCourseCompleted: websiteCompleted,
-        websiteCourseProgressPercent: result?.courseProgressPercent ?? existing.websiteCourseProgressPercent ?? null,
-      };
-      if (!websiteCompleted) {
-        this.log(`ℹ️ Course chưa xác nhận 100% cấp khóa: ${result?.courseTitle || config.courseUrl}`, 'info');
-        return false;
-      }
     }
-    this.log(`✅ All ${this.coursesConfig.length} courses are confirmed 100% complete at course level`, 'success');
+    this._lastCourseEvaluations = evaluations;
+
+    this.log('🔎 Verifying website course-level completion...', 'info');
+
+    const failedTargets = evaluations.filter(e => !e.targetReached);
+    if (failedTargets.length > 0) {
+      for (const e of failedTargets) this._logCourseVerificationFailure(e, 'target-not-reached');
+      this.log('⛔ Not all configured study-time targets are reached — surplus deferred', 'warn');
+      return false;
+    }
+    this.log('✅ All configured course time targets reached', 'success');
+
+    if (evaluations.every(e => e.state === 'completed')) {
+      this.log(`✅ Website confirms all ${this.coursesConfig.length} configured courses are completed`, 'success');
+      return true;
+    }
+
+    const explicitIncomplete = evaluations.filter(e => e.state === 'incomplete');
+    if (explicitIncomplete.length > 0) {
+      for (const e of explicitIncomplete) this._logCourseVerificationFailure(e, 'website-incomplete');
+      this.log('❌ Website explicitly reports course incomplete — surplus deferred', 'warn');
+      return false;
+    }
+
+    const unknown = evaluations.filter(e => e.state === 'unknown');
+    for (const e of unknown) {
+      this.log(`⚠️ Course-level progress unavailable: ${e.title}`, 'warn');
+    }
+    this.log('🔄 Performing one fresh course-level verification', 'info');
+    await this._resolveUnknownCoursesViaMyCourses(unknown);
+    if (!this._isRunActive()) return false;
+
+    const nowIncomplete = unknown.filter(e => e.state === 'incomplete');
+    if (nowIncomplete.length > 0) {
+      for (const e of nowIncomplete) this._logCourseVerificationFailure(e, 'website-incomplete');
+      this.log('❌ Website explicitly reports course incomplete — surplus deferred', 'warn');
+      return false;
+    }
+
+    const stillUnknown = unknown.filter(e => e.state === 'unknown');
+    if (stillUnknown.length === 0) {
+      this.log(`✅ Website confirms all ${this.coursesConfig.length} configured courses are completed`, 'success');
+      return true;
+    }
+
+    for (const e of stillUnknown) {
+      this.log(`⚠️ Course-level progress still unavailable: ${e.title}`, 'warn');
+    }
+    this.log('⚠️ Falling back to verified configured study-time targets', 'warn');
     return true;
   }
 
@@ -479,20 +677,29 @@ class AutoCourseSession extends EventEmitter {
     if (!(await this._verifyAllConfiguredCoursesCompleted())) return false;
     if (!this._isRunActive()) return false;
 
+    // Dùng lại kết quả vừa xác minh; nếu chưa có (restore surplus) thì quét mới.
+    let evaluations = Array.isArray(this._lastCourseEvaluations) ? this._lastCourseEvaluations : [];
+    if (evaluations.length === 0) {
+      evaluations = [];
+      for (const config of this.coursesConfig) {
+        if (!this._isRunActive()) return false;
+        evaluations.push(await this._evaluateConfiguredCourse(config));
+        if (!this._isRunActive()) return false;
+      }
+    }
+
     const eligible = [];
-    for (const config of this.coursesConfig) {
+    for (const evaluation of evaluations) {
       if (!this._isRunActive()) return false;
-      let result = null;
-      try { result = await this._scanCourseDetailsForCheckpoint(config.courseUrl, true); } catch { /* handled below */ }
-      if (!this._isRunActive()) return false;
-      if (!result || result.courseLevelCompleted !== true) continue;
-      const lessons = Array.isArray(result.allLessons)
-        ? result.allLessons.filter(lesson => lesson && lesson.url
-          && !this._surplusUnusableLessons.has(`${config.courseUrl}|${lesson.url}`)
-          && !this._surplusStudiedLessons.has(`${config.courseUrl}|${lesson.url}`))
-        : [];
+      // `incomplete` (bằng chứng tường minh) không được học surplus. `completed` và
+      // `unknown` đều có thể cung cấp bài học surplus — target thời gian đã được
+      // _verifyAllConfiguredCoursesCompleted() xác nhận trước đó.
+      if (evaluation.state === 'incomplete') continue;
+      const lessons = (evaluation.allLessons || []).filter(lesson => lesson && lesson.url
+        && !this._surplusUnusableLessons.has(`${evaluation.courseUrl}|${lesson.url}`)
+        && !this._surplusStudiedLessons.has(`${evaluation.courseUrl}|${lesson.url}`));
       if (lessons.length === 0) continue;
-      eligible.push({ courseUrl: config.courseUrl, title: result.courseTitle || config.courseUrl, lessons });
+      eligible.push({ courseUrl: evaluation.courseUrl, title: evaluation.title, lessons });
     }
 
     this.surplusEligibleCourses = eligible.map(item => item.courseUrl);
@@ -773,14 +980,19 @@ class AutoCourseSession extends EventEmitter {
     const verifiedMinutes = Math.max(0, Number(verifiedScan.actualStudiedMinutes) || 0);
     const allLessonsCompleted = verifiedScan.uncompletedLessons.length === 0;
     const confirmed = courseReachedTarget(targetMinutes, verifiedMinutes, allLessonsCompleted);
+    const siteCompletionState = AutoCourseSession._courseCompletionStateOf(verifiedScan);
     this.courseProgress[courseUrl] = {
       ...this.courseProgress[courseUrl],
       title: verifiedScan.courseTitle || courseTitle,
       targetMinutes,
       studiedMinutes: verifiedMinutes,
       completed: confirmed,
-      websiteCourseCompleted: verifiedScan.courseLevelCompleted === true,
+      websiteCourseCompleted: siteCompletionState === 'completed',
+      websiteCourseCompletionState: siteCompletionState,
       websiteCourseProgressPercent: verifiedScan.courseProgressPercent ?? null,
+      websiteCourseCompletionSource: verifiedScan.courseCompletionSource
+        || verifiedScan.courseCompletionEvidence?.resolutionSource
+        || null,
       finalizationState: confirmed
         ? COURSE_FINALIZATION_STATES.COMPLETED
         : continueStudying

@@ -246,40 +246,171 @@ async function scanCourseDetails(page, courseUrl) {
         actualStudiedText = `${h} giờ ${m} phút`;
       }
 
-      // Read course-level progress separately from lesson badges. These
-      // selectors target the course header/progress container so an
-      // individual lesson's 100% cannot pass the all-courses gate.
-      let courseProgressPercent = null;
-      let courseLevelCompleted = false;
-      const courseCompletedMarker = document.querySelector(
-        '[data-course-completed="true"], [data-course-completion="100"], .o_wslides_course_header .o_wslides_progress_bar[data-completed="true"]'
-      );
-      if (courseCompletedMarker) {
-        courseLevelCompleted = true;
-        courseProgressPercent = 100;
+      // ── Phát hiện hoàn thành CẤP KHÓA (không dùng % của từng bài) ──
+      // Thứ tự ưu tiên:
+      //   1. badge "Đã hoàn thành / Completed" ở sidebar/khóa học
+      //   2. marker hoàn thành tường minh cấp khóa
+      //   3. thanh tiến độ cấp khóa tường minh (>=100% → completed, <100% → incomplete)
+      //   4. UNKNOWN (không thấy chỉ báo cấp khóa đáng tin — KHÁC với "incomplete")
+      const normalizeLooseText = (value) => String(value || '')
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+      const describeElement = (el) => {
+        if (!el || !el.tagName) return null;
+        const cls = String(el.className || '').split(/\s+/).filter(Boolean)[0];
+        return `${el.tagName.toLowerCase()}${cls ? `.${cls}` : ''}`;
+      };
+
+      // Badge hoàn thành chỉ được tìm trong sidebar/khóa học — KHÔNG quét cả
+      // vùng nội dung khóa học để tránh nhầm nhãn hoàn thành của quiz/bài học.
+      const COURSE_SIDEBAR_SELECTORS = [
+        '.o_wslides_course_sidebar',
+        '.o_wslides_sidebar',
+        '.o_wslides_course_header',
+        '.o_wslides_course_info',
+        '.o_wslides_course_nav',
+        '[class*="course_sidebar"]',
+        '[class*="course_info"]',
+        'aside',
+      ];
+      // Thanh tiến độ cấp khóa có thể nằm ở vùng chính của khóa học.
+      const COURSE_LEVEL_CONTAINER_SELECTORS = [...COURSE_SIDEBAR_SELECTORS, '.o_wslides_course_main'];
+      const LESSON_CONTAINER_SELECTOR = 'a[href*="/slides/slide/"], .o_wslides_slides_list, .o_wslides_slides_list_slide, .o_wslides_slide_list_record, .o_wslides_lesson_list';
+      const isInsideLessonContainer = (el) => Boolean(el && typeof el.closest === 'function' && el.closest(LESSON_CONTAINER_SELECTOR));
+
+      const collectContainers = (selectors) => {
+        const found = [];
+        for (const selector of selectors) {
+          document.querySelectorAll(selector).forEach(el => {
+            if (!found.includes(el)) found.push(el);
+          });
+        }
+        return found;
+      };
+      const courseSidebarContainers = collectContainers(COURSE_SIDEBAR_SELECTORS);
+      const courseLevelContainers = collectContainers(COURSE_LEVEL_CONTAINER_SELECTORS);
+
+      // So khớp hoàn thành có kiểm soát: "đã hoàn thành" (khác "thời gian hoàn
+      // thành"/"chưa hoàn thành") hoặc từ "completed" độc lập.
+      const looksCompleted = (normalized) => {
+        if (!normalized) return false;
+        if (normalized.includes('chua hoan thanh')) return false;
+        if (normalized.includes('da hoan thanh')) return true;
+        return /(^|[^a-z])completed([^a-z]|$)/.test(normalized)
+          && !/\b(not|in|un)\s*completed\b/.test(normalized);
+      };
+
+      let completedMarkerFound = false;
+      let markerSelector = null;
+      let matchedLabel = null;
+      let markerSource = null;
+
+      for (const container of courseSidebarContainers) {
+        const nodes = [container, ...Array.from(container.querySelectorAll('*'))];
+        let best = null;
+        for (const node of nodes) {
+          if (isInsideLessonContainer(node)) continue;
+          const normalized = normalizeLooseText(node.textContent);
+          if (!normalized || normalized.length > 60) continue;
+          if (!looksCompleted(normalized)) continue;
+          if (!best || normalized.length < best.normalized.length) best = { normalized, node };
+        }
+        if (best) {
+          completedMarkerFound = true;
+          markerSelector = describeElement(best.node);
+          matchedLabel = best.node.textContent.trim().replace(/\s+/g, ' ').slice(0, 40);
+          markerSource = 'course_sidebar_completed_badge';
+          break;
+        }
       }
-      if (!courseLevelCompleted) {
-        const progressCandidates = Array.from(document.querySelectorAll(
-          '[data-course-progress], [data-course-completion], .o_wslides_course_header .o_wslides_progress_bar, .o_wslides_course_header [role="progressbar"], .o_wslides_course_main .o_wslides_progress_bar'
-        ));
-        for (const el of progressCandidates) {
-          const values = [
-            el.getAttribute('data-course-progress'),
-            el.getAttribute('data-course-completion'),
-            el.getAttribute('aria-valuenow'),
-            el.style && el.style.width,
-            el.textContent,
-          ];
-          for (const value of values) {
-            const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*%?/);
-            if (!match) continue;
-            const parsed = Number(match[1]);
-            if (!Number.isFinite(parsed) || parsed < 0 || parsed > 100) continue;
-            courseProgressPercent = Math.max(courseProgressPercent ?? 0, parsed);
+
+      if (!completedMarkerFound) {
+        const explicit = Array.from(document.querySelectorAll(
+          '[data-course-completed="true"], [data-course-completion="100"], [class*="course"][class*="completed"]'
+        )).find(el => !isInsideLessonContainer(el));
+        if (explicit) {
+          completedMarkerFound = true;
+          markerSelector = describeElement(explicit);
+          matchedLabel = String(explicit.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+          markerSource = 'explicit_completed_marker';
+        }
+      }
+
+      // Ứng viên tiến độ CẤP KHÓA — chỉ trong container cấp khóa, loại trừ bài học
+      const progressCandidateEls = [];
+      for (const container of courseLevelContainers) {
+        container.querySelectorAll('[data-course-progress], [data-course-completion], [role="progressbar"], .o_wslides_progress_bar, [class*="progress"]').forEach(el => {
+          if (isInsideLessonContainer(el)) return;
+          if (!progressCandidateEls.includes(el)) progressCandidateEls.push(el);
+        });
+      }
+
+      const resolveCandidatePercent = (el) => {
+        const ranked = [
+          { raw: el.getAttribute('data-course-completion'), source: 'data-course-completion' },
+          { raw: el.getAttribute('data-course-progress'), source: 'data-course-progress' },
+          { raw: el.getAttribute('aria-valuenow'), source: 'aria-valuenow' },
+          { raw: el.style && el.style.width, source: 'style.width' },
+        ];
+        for (const candidate of ranked) {
+          if (candidate.raw == null || candidate.raw === '') continue;
+          const match = String(candidate.raw).match(/(\d+(?:\.\d+)?)\s*%?/);
+          if (!match) continue;
+          const parsed = Number(match[1]);
+          if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 100) {
+            return { percent: parsed, source: candidate.source };
           }
         }
-        courseLevelCompleted = courseProgressPercent != null && courseProgressPercent >= 100;
+        const textMatch = String(el.textContent || '').trim().match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+        if (textMatch) {
+          const parsed = Number(textMatch[1]);
+          if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 100) {
+            return { percent: parsed, source: 'course_progress_text' };
+          }
+        }
+        return null;
+      };
+
+      let courseProgressPercent = null;
+      let completionSource = null;
+      let courseCompletionState = 'unknown';
+
+      if (completedMarkerFound) {
+        courseCompletionState = 'completed';
+        courseProgressPercent = 100;
+        completionSource = markerSource;
+      } else {
+        for (const el of progressCandidateEls) {
+          const resolved = resolveCandidatePercent(el);
+          if (!resolved) continue;
+          courseProgressPercent = resolved.percent;
+          completionSource = resolved.source;
+          courseCompletionState = resolved.percent >= 100 ? 'completed' : 'incomplete';
+          break;
+        }
       }
+
+      const courseLevelCompleted = courseCompletionState === 'completed';
+
+      const courseCompletionEvidence = {
+        completedMarkerFound,
+        markerSelector,
+        matchedLabel,
+        progressCandidates: progressCandidateEls.slice(0, 8).map(el => ({
+          selector: describeElement(el),
+          dataCourseProgress: el.getAttribute('data-course-progress'),
+          dataCourseCompletion: el.getAttribute('data-course-completion'),
+          ariaValueNow: el.getAttribute('aria-valuenow'),
+          styleWidth: el.style ? el.style.width : null,
+          text: String(el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 60),
+        })),
+        resolvedProgressPercent: courseProgressPercent,
+        resolutionSource: completionSource,
+      };
 
       // Extract all lesson items
       const lessonItems = [];
@@ -329,6 +460,9 @@ async function scanCourseDetails(page, courseUrl) {
         courseTitle,
         courseProgressPercent,
         courseLevelCompleted,
+        courseCompletionState,
+        courseCompletionSource: completionSource,
+        courseCompletionEvidence,
         actualStudiedMinutes,
         actualStudiedText,
         totalLessons: lessonItems.length,
@@ -341,6 +475,67 @@ async function scanCourseDetails(page, courseUrl) {
   } catch (err) {
     console.error(`[COURSE SCANNER] Lỗi quét khóa học ${courseUrl}:`, err.message);
     return null;
+  }
+}
+
+// Quét trang "My Courses" (/slides/all?my=1) — nguồn xác minh cấp khóa THỨ CẤP.
+// Mỗi thẻ khóa học hoàn thành có badge "✔ Completed"/"Đã hoàn thành". Chỉ dùng để
+// phân giải các khóa mà trang khóa học riêng không đưa ra được bằng chứng cấp khóa.
+async function scanMyCoursesCompletion(page, myCoursesUrl) {
+  if (!page || !myCoursesUrl) return [];
+  try {
+    await page.goto(myCoursesUrl, { waitUntil: 'load', timeout: 60000 });
+    await page.waitForTimeout(2500);
+
+    return await page.evaluate(() => {
+      const normalizeLooseText = (value) => String(value || '')
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+      const looksCompleted = (normalized) => {
+        if (!normalized) return false;
+        if (normalized.includes('chua hoan thanh')) return false;
+        if (normalized.includes('da hoan thanh')) return true;
+        return /(^|[^a-z])completed([^a-z]|$)/.test(normalized)
+          && !/\b(not|in|un)\s*completed\b/.test(normalized);
+      };
+
+      const cards = Array.from(document.querySelectorAll(
+        '.o_wslides_course_card, .o_wslides_courses_list .card, [class*="course_card"], .card'
+      ));
+      const results = [];
+      const seen = new Set();
+
+      for (const card of cards) {
+        const link = card.matches('a[href*="/slides/"]') ? card : card.querySelector('a[href*="/slides/"]');
+        if (!link) continue;
+        const titleEl = card.querySelector('h1, h2, h3, h4, h5, .card-title, [class*="title"]') || link;
+        const title = String(titleEl.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!title || seen.has(title)) continue;
+        seen.add(title);
+
+        const normalized = normalizeLooseText(card.textContent);
+        const completed = looksCompleted(normalized);
+        let href = link.getAttribute('href');
+        try { href = href ? new URL(href, location.origin).href : null; } catch { /* keep */ }
+
+        results.push({
+          title,
+          url: href,
+          completed,
+          state: completed ? 'completed' : 'unknown',
+          source: completed ? 'my_courses_completed_badge' : null,
+        });
+      }
+
+      return results;
+    });
+  } catch (err) {
+    console.error(`[COURSE SCANNER] Lỗi quét My Courses:`, err.message);
+    return [];
   }
 }
 
@@ -463,6 +658,7 @@ module.exports = {
   isAllowedStudyDate,
   getNextAllowedStudyDate,
   scanCourseDetails,
+  scanMyCoursesCompletion,
   readDomTimer,
   parseVNShortDate,
   parseShifts,

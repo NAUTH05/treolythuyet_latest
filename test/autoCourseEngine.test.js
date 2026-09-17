@@ -1107,3 +1107,174 @@ test('_isRunActive từ chối mọi trạng thái hẹn giờ và thế hệ ru
   session._phase = PHASE_FINISHED;
   assert.equal(session._isRunActive(7), false, 'phải từ chối phiên đã finished');
 });
+
+// ============ CỔNG XÁC MINH CẤP KHÓA: completed / incomplete / unknown ============
+
+function courseScan({ title = 'Course', actual = 0, state = 'unknown', percent = null, lessons = [], uncompleted = [] } = {}) {
+  return {
+    courseTitle: title,
+    actualStudiedMinutes: actual,
+    courseCompletionState: state,
+    courseProgressPercent: percent,
+    allLessons: lessons,
+    uncompletedLessons: uncompleted,
+    totalLessons: lessons.length,
+  };
+}
+
+// Phiên có context giả + scan khóa giả. myCourses mô phỏng /slides/all?my=1.
+function makeGateSession(id, courses, { scans = {}, myCourses = [], options = {} } = {}) {
+  const session = new AutoCourseSession(id, { name: id, email: `${id}@x.vn` }, courses, options);
+  session._phase = PHASE_RUNNING;
+  session.status = 'studying';
+  session.context = {
+    newPage: async () => ({
+      goto: async () => {},
+      waitForTimeout: async () => {},
+      evaluate: async () => myCourses,
+      close: async () => {},
+    }),
+  };
+  session._scanCourseDetailsForCheckpoint = async (url) => {
+    const scan = scans[url];
+    if (typeof scan === 'function') return scan();
+    return scan === undefined ? null : scan;
+  };
+  return session;
+}
+
+test('gate: target reached + website completed → xác minh thành công', async () => {
+  const c1 = 'https://x/slides/c1';
+  const session = makeGateSession('gate-ok', [{ courseUrl: c1, targetMinutes: 60 }], {
+    scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'completed', percent: 100 }) },
+  });
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), true);
+  assert.equal(session.courseProgress[c1].websiteCourseCompletionState, 'completed');
+});
+
+test('gate: website tường minh 80% → KHÔNG bắt đầu surplus', async () => {
+  const c1 = 'https://x/slides/c1';
+  const session = makeGateSession('gate-incomplete', [{ courseUrl: c1, targetMinutes: 60 }], {
+    scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'incomplete', percent: 80 }) },
+  });
+  const logs = [];
+  session.on('log', e => logs.push(e.msg));
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), false);
+  assert.equal(logs.some(m => m.includes('Course progress detected: 80%')), true, 'phải log tiến độ + nguồn');
+});
+
+test('gate: UNKNOWN kích hoạt đúng MỘT lần xác minh tươi; vẫn UNKNOWN + đủ target → cho phép kèm cảnh báo', async () => {
+  const c1 = 'https://x/slides/c1';
+  const session = makeGateSession('gate-unknown', [{ courseUrl: c1, targetMinutes: 60 }], {
+    scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'unknown' }) },
+    myCourses: [],
+  });
+  let calls = 0;
+  const original = session._resolveUnknownCoursesViaMyCourses.bind(session);
+  session._resolveUnknownCoursesViaMyCourses = async (unknown) => { calls++; return original(unknown); };
+  const logs = [];
+  session.on('log', e => logs.push(e.msg));
+
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), true);
+  assert.equal(calls, 1, 'chỉ một lần xác minh tươi');
+  assert.equal(logs.some(m => m.includes('Falling back to verified configured study-time targets')), true);
+});
+
+test('gate: UNKNOWN được phân giải bởi trang My Courses', async () => {
+  const c1 = 'https://x/slides/c1';
+  const session = makeGateSession('gate-mycourses', [{ courseUrl: c1, targetMinutes: 60 }], {
+    scans: { [c1]: courseScan({ title: 'Cấu tạo và sửa chữa', actual: 60, state: 'unknown' }) },
+    myCourses: [{
+      title: 'Cấu tạo và sửa chữa thông thường xe',
+      completed: true,
+      state: 'completed',
+      source: 'my_courses_completed_badge',
+    }],
+  });
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), true);
+  assert.equal(session.courseProgress[c1].websiteCourseCompletionState, 'completed');
+});
+
+test('gate: một khóa dưới target → không bao giờ vào surplus', async () => {
+  const c1 = 'https://x/slides/c1';
+  const c2 = 'https://x/slides/c2';
+  const session = makeGateSession('gate-target', [
+    { courseUrl: c1, targetMinutes: 60 },
+    { courseUrl: c2, targetMinutes: 60 },
+  ], {
+    scans: {
+      [c1]: courseScan({ title: 'C1', actual: 60, state: 'completed', percent: 100 }),
+      [c2]: courseScan({ title: 'C2', actual: 59, state: 'completed', percent: 100 }),
+    },
+  });
+  assert.equal(await session._verifyAllConfiguredCoursesCompleted(), false);
+});
+
+test('production fixture: 3781/3780 + bài ôn tập 70% + UNKNOWN → surplus bắt đầu, RNG sinh đúng một lần', async () => {
+  const courses = [
+    { courseUrl: 'https://x/c1', targetMinutes: 840 },
+    { courseUrl: 'https://x/c2', targetMinutes: 840 },
+    { courseUrl: 'https://x/c3', targetMinutes: 840 },
+    { courseUrl: 'https://x/c4', targetMinutes: 840 },
+  ];
+  const lesson = (url, title, progressPercent = 100) => ({ url, title, progressPercent, isCompleted: progressPercent >= 100 });
+  const review = lesson('https://x/c4/review-999', 'Ôn tập', 70);
+  const session = makeGateSession('gate-production', courses, {
+    scans: {
+      [courses[0].courseUrl]: courseScan({ title: 'C1', actual: 900, state: 'completed', percent: 100, lessons: [lesson('https://x/c1/l1', 'L1')] }),
+      [courses[1].courseUrl]: courseScan({ title: 'C2', actual: 900, state: 'completed', percent: 100, lessons: [lesson('https://x/c2/l1', 'L1')] }),
+      [courses[2].courseUrl]: courseScan({ title: 'C3', actual: 900, state: 'completed', percent: 100, lessons: [lesson('https://x/c3/l1', 'L1')] }),
+      [courses[3].courseUrl]: courseScan({
+        title: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
+        actual: 3781,
+        state: 'unknown',
+        lessons: [lesson('https://x/c4/l1', 'L1'), review],
+        uncompleted: [review],
+      }),
+    },
+    myCourses: [
+      { title: 'C1', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
+      { title: 'C2', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
+      { title: 'C3', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
+      { title: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh', completed: true, state: 'completed', source: 'my_courses_completed_badge' },
+    ],
+  });
+  session._randomBetween = () => 47;
+
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(session.surplusMode, true);
+  assert.equal(session.surplusTargetMinutes, 47);
+  assert.equal(session._generateSurplusTargetOnce(), 47, 'RNG không được sinh lại');
+  assert.equal(session.surplusEligibleCourses.length, 4, 'bài ôn tập 70% không loại khóa khỏi surplus');
+});
+
+test('final surplus verification: UNKNOWN + đủ target → hoàn thành, không lặp vô hạn', async () => {
+  const c1 = 'https://x/slides/c1';
+  const session = makeGateSession('final-unknown', [{ courseUrl: c1, targetMinutes: 60 }], {
+    scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'unknown' }) },
+    myCourses: [],
+  });
+  session.surplusTargetMinutes = 40;
+  session.surplusStudiedMinutes = 40;
+  assert.equal(await session._finalizeSurplusCompletion(), true);
+  assert.equal(session.surplusMode, false);
+});
+
+test('final surplus verification: website tường minh incomplete → defer', async () => {
+  const c1 = 'https://x/slides/c1';
+  const session = makeGateSession('final-incomplete', [{ courseUrl: c1, targetMinutes: 60 }], {
+    scans: { [c1]: courseScan({ title: 'C1', actual: 60, state: 'incomplete', percent: 82 }) },
+  });
+  session.surplusTargetMinutes = 40;
+  session.surplusStudiedMinutes = 40;
+  assert.equal(await session._finalizeSurplusCompletion(), false);
+  assert.equal(session.surplusMode, true);
+});
+
+test('RNG surplus vẫn cố định 15-60 phút', () => {
+  const session = new AutoCourseSession('rng-range', { name: 'R', email: 'r@x.vn' });
+  for (let i = 0; i < 50; i++) {
+    const value = session._randomBetween(15, 60);
+    assert.ok(value >= 15 && value <= 60, `RNG=${value} ngoài 15-60`);
+  }
+});
