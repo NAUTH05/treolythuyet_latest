@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import * as api from '../api';
+import { formatAutoScanStartFeedback } from '../autoscanStartFeedback.mjs';
 
 const AUTO_STATUS = {
   idle:         { text: 'Chờ khởi động', badge: 'badge-idle' },
@@ -466,10 +467,17 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         accountIndices: [...selectedAccounts],
       });
 
-      if (data.ok) {
-        toast(`Đã khởi động Auto-Scan cho ${data.started.length} tài khoản`, 'success');
+      if (data && data.ok) {
+        // started.length === 0 KHÔNG bao giờ được hiện như thành công.
+        const feedback = formatAutoScanStartFeedback(data);
+        for (const entry of feedback.messages) {
+          toast(entry.message, entry.type);
+        }
       } else {
-        toast(data.error || 'Lỗi khởi động Auto-Scan', 'error');
+        toast((data && data.error) || 'Lỗi khởi động Auto-Scan', 'error');
+        if (data && Array.isArray(data.unresolved) && data.unresolved.length > 0) {
+          toast(`❌ Không tìm thấy tài khoản đã chọn: ${data.unresolved.join(', ')}`, 'error');
+        }
       }
     } catch (err) {
       toast(`Lỗi kết nối: ${err.message}`, 'error');

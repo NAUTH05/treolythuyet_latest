@@ -8,6 +8,7 @@ const { BotSession } = require('./bot');
 const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES } = require('./autoCourseEngine');
 const { AutoCourseRegistry } = require('./autoCourseRegistry');
 const { isStaleScheduledSession, restartScheduledSession, applyAutoScanRestoreState } = require('./autoScanRecovery');
+const { planAutoScanStart, findBlockingAutoScanSession, describeAutoScanBlocker, buildAutoScanStartResponse } = require('./autoScanStart');
 const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
@@ -2057,14 +2058,63 @@ app.post('/api/auto-scan/start', async (req, res) => {
   const allAccounts = loadAccounts();
   const requestedIndices = Array.isArray(accountIndices) ? accountIndices : [];
   if (requestedIndices.length === 0) {
-    return res.status(400).json({ error: 'Cần chọn ít nhất 1 tài khoản' });
+    return res.status(400).json({
+      ok: false,
+      error: 'Cần chọn ít nhất 1 tài khoản',
+      requested: [],
+      unresolved: [],
+      started: [],
+      skipped: [],
+    });
   }
-  // Bỏ index trùng: chọn trùng một tài khoản (hoặc double-click) trước đây sinh
-  // 2 phiên cho cùng tài khoản → 2 browser tranh nhau 1 phiên đăng nhập Odoo.
-  const targetAccounts = [...new Set(requestedIndices)].map(idx => allAccounts[idx - 1]).filter(Boolean);
-  if (targetAccounts.length === 0) {
-    return res.status(400).json({ error: 'Không tìm thấy tài khoản hợp lệ' });
+
+  // Phân giải tài khoản + phân loại blocker/xác chết theo vòng đời engine.
+  const { resolved, unresolved, plans } = planAutoScanStart({
+    allAccounts,
+    requestedIndices,
+    registry: autoScanRegistry,
+  });
+
+  console.log('[AUTOSCAN START]');
+  console.log(`  requested account IDs: ${JSON.stringify(requestedIndices)}`);
+  console.log(`  resolved accounts: ${JSON.stringify(resolved.map(item => item.account.name))}`);
+  if (unresolved.length > 0) console.log(`  unresolved account IDs: ${JSON.stringify(unresolved)}`);
+
+  if (resolved.length === 0) {
+    return res.status(400).json({
+      ok: false,
+      error: `Không tìm thấy tài khoản đã chọn (index/id: ${requestedIndices.join(', ')})`,
+      requested: requestedIndices,
+      unresolved,
+      started: [],
+      skipped: [],
+    });
   }
+
+  // Dọn phiên mồ côi / lịch quá hạn trước khi tạo phiên mới. KHÔNG đụng vào
+  // phiên đang chạy / tạm dừng / có lịch tương lai (đã bị xếp vào 'skip').
+  for (const item of plans) {
+    if (item.action !== 'cleanup+start') continue;
+    for (const stale of item.stale) {
+      console.log('[AUTOSCAN START] ♻️ Removed stale Auto-Scan blocker');
+      console.log(`  Account: ${item.account.name}`);
+      console.log(`  Session: ${stale.sessionId}`);
+      console.log(`  Previous status: ${stale.status}`);
+      console.log(`  Reason: ${stale.category}`);
+      addLog({
+        timestamp: formatVN(new Date()),
+        account: item.account.name,
+        msg: `♻️ Đã dọn phiên Auto-Scan mồ côi (${stale.status}) để khởi động phiên mới`,
+        level: 'warn',
+      });
+      if (autoScanRegistry.has(stale.sessionId)) {
+        await autoScanRegistry.forget(stale.sessionId);
+        io.emit('autoscan-removed', stale.sessionId);
+      }
+    }
+  }
+
+  const targetAccounts = plans.map(item => item.account);
 
   const validTimeWindows = Array.isArray(timeWindows)
     ? timeWindows.filter(w => w && /^\d{1,2}:\d{2}$/.test(w.start || '') && /^\d{1,2}:\d{2}$/.test(w.end || ''))
@@ -2094,24 +2144,41 @@ app.post('/api/auto-scan/start', async (req, res) => {
         { date: randomTargetDate },
       );
     } catch (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ ok: false, error: error.message, requested: requestedIndices, unresolved, started: [], skipped: [] });
     }
   }
-  for (const [accountPosition, acc] of targetAccounts.entries()) {
-    // Tài khoản đã có phiên Auto-Scan đang sống (chạy / tạm dừng / đang hẹn giờ)
-    // thì KHÔNG tạo thẻ thứ hai — bấm Bắt đầu lần nữa là thao tác vô ý, thẻ mới
-    // chỉ quay vòng trong vòng chờ 5 phút và làm Dashboard rối.
-    const existing = autoScanRegistry.values().find(
-      s => s.account.email === acc.email && !AUTO_TERMINAL_STATUSES.has(s.status)
-    );
-    if (existing) {
-      skipped.push({ sessionId: existing.id, account: acc.name, reason: `đã có phiên Auto-Scan ${existing.status}` });
+
+  for (const [accountPosition, item] of plans.entries()) {
+    const acc = item.account;
+
+    // Tài khoản đã có phiên Auto-Scan ĐANG SỐNG (chạy / tạm dừng / có lịch tương
+    // lai) thì KHÔNG tạo thẻ thứ hai — đây là lớp chống trùng phiên, KHÔNG được
+    // nới lỏng để "luôn start phiên mới".
+    if (item.action === 'skip') {
+      skipped.push({ account: acc.name, sessionId: item.sessionId, status: item.status, reason: item.reason });
       addLog({
         timestamp: formatVN(new Date()),
         account: acc.name,
-        msg: `⚠️ Bỏ qua yêu cầu Bắt đầu trùng — tài khoản đã có phiên Auto-Scan (${existing.status})`,
+        msg: `⚠️ Bỏ qua yêu cầu Bắt đầu trùng — ${item.reason}`,
         level: 'warn',
       });
+      console.log(`[AUTOSCAN START] skip | account=${acc.name} | session=${item.sessionId} | blocker status=${item.status} | blocker live=true | action=skip`);
+      continue;
+    }
+
+    // Sau khi dọn xác chết, kiểm tra lại ĐỒNG BỘ trước khi tạo phiên: hai tab /
+    // double-click không thể cùng tạo phiên cho một tài khoản.
+    const stillBlocked = findBlockingAutoScanSession(autoScanRegistry, acc.email, { now: Date.now() });
+    if (stillBlocked) {
+      const reason = describeAutoScanBlocker(stillBlocked.session, stillBlocked.verdict);
+      skipped.push({ account: acc.name, sessionId: stillBlocked.session.id, status: stillBlocked.session.status, reason });
+      addLog({
+        timestamp: formatVN(new Date()),
+        account: acc.name,
+        msg: `⚠️ Bỏ qua yêu cầu Bắt đầu trùng — ${reason}`,
+        level: 'warn',
+      });
+      console.log(`[AUTOSCAN START] skip | account=${acc.name} | session=${stillBlocked.session.id} | blocker live=true | action=skip`);
       continue;
     }
 
@@ -2124,7 +2191,7 @@ app.post('/api/auto-scan/start', async (req, res) => {
       randomStartEnabled: randomStartEnabled === true,
       randomStartFrom: randomStartFrom || newDayStartTime || '06:00',
       randomStartTo: randomStartTo || newDayStartTime || '06:00',
-      scheduledStartAt: randomAssignments.find(item => item.accountIndex === accountPosition)?.scheduledStartAt || null,
+      scheduledStartAt: randomAssignments.find(a => a.accountIndex === accountPosition)?.scheduledStartAt || null,
       scheduledStartDate: randomStartEnabled ? randomTargetDate : null,
       refreshInterval: parseInt(refreshInterval, 10) || 15,
       stealth: stealth === true,
@@ -2138,9 +2205,12 @@ app.post('/api/auto-scan/start', async (req, res) => {
 
     startAutoScanWhenFree(autoSession, 'api-start');
     started.push({ sessionId, account: acc.name });
+    console.log(`[AUTOSCAN START] start | account=${acc.name} | session=${sessionId} | action=${item.action === 'cleanup+start' ? 'stale-cleanup + fresh-start' : 'fresh-start'}`);
   }
 
-  return respondAfterStateSync(res, saveAutoScanState(), { ok: true, started, skipped });
+  const response = buildAutoScanStartResponse({ started, skipped, unresolved });
+  console.log(`[AUTOSCAN START] result=${response.result} | started=${started.length} | skipped=${skipped.length} | unresolved=${unresolved.length}`);
+  return respondAfterStateSync(res, saveAutoScanState(), response);
 });
 
 // Điều chỉnh thời gian đã học hôm nay cho phiên Auto-Scan

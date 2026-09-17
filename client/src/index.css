@@ -1464,6 +1464,7 @@ input.input-num,
 .toast.toast-success { border-left-color: var(--success); }
 .toast.toast-error   { border-left-color: var(--danger); }
 .toast.toast-info    { border-left-color: var(--accent); }
+.toast.toast-warning { border-left-color: var(--warning); }
 
 @keyframes toastIn {
   from { opacity: 0; transform: translateX(12px); }

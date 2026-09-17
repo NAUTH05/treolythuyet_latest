@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test",
+    "test": "node --test --test-concurrency=1",
     "cli": "node index.js",
     "dev": "node server.js",
     "dev:client": "cd client && npm run dev",
