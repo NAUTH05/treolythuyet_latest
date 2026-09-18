@@ -168,6 +168,58 @@ function productionFixtureDom() {
   return makeDocument({ root, h1, bodyText: 'Thời gian hoàn thành 15 giờ 60 phút' });
 }
 
+// ── Fixture REAL PRODUCTION: cấu trúc DOM cấp khóa của Odoo ──
+// Badge "Đã hoàn thành" luôn có trong DOM; ở khóa chưa xong nó bị ẩn `d-none`.
+// Thanh tiến độ cấp khóa hiển thị aria-valuenow + .o_wslides_progress_percentage.
+function productionCompletionDom({ badgeHidden, percent }) {
+  const h1 = new FakeNode({
+    tagName: 'h1',
+    textContent: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
+  });
+  const badge = new FakeNode({
+    tagName: 'span',
+    className: 'o_wslides_channel_completion_completed badge rounded-pill text-bg-success py-1 px-2 mx-auto'
+      + (badgeHidden ? ' d-none' : ''),
+    textContent: 'Đã hoàn thành',
+  });
+  const bar = new FakeNode({
+    tagName: 'div',
+    className: 'progress-bar',
+    attrs: {
+      role: 'progressbar',
+      'aria-valuemin': '0',
+      'aria-valuemax': '100',
+      'aria-valuenow': String(percent),
+    },
+    style: { width: `${percent}%` },
+  });
+  const progress = new FakeNode({ tagName: 'div', className: 'progress flex-grow-1 bg-black-50', children: [bar] });
+  const pct = new FakeNode({ tagName: 'span', className: 'o_wslides_progress_percentage', textContent: String(percent) });
+  const pctWrap = new FakeNode({ tagName: 'div', className: 'ms-3 small', children: [pct] });
+  const wrap = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_channel_completion_progressbar d-flex w-100 align-items-center',
+    children: [progress, pctWrap],
+  });
+  const inner = new FakeNode({
+    tagName: 'div',
+    className: 'd-flex align-items-center pt-3',
+    children: [badge, wrap],
+  });
+  const top = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_sidebar_top d-flex justify-content-between',
+    children: [inner],
+  });
+  const sidebar = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_course_sidebar bg-white px-3 py-2 py-md-3 mb-3 mb-md-5',
+    children: [top],
+  });
+  const root = new FakeNode({ tagName: 'div', children: [h1, sidebar] });
+  return makeDocument({ root, h1 });
+}
+
 test('production fixture: sidebar "Đã hoàn thành" → completed dù có bài 0%', async () => {
   const result = await scanCourseDetails(scannerPage(productionFixtureDom()), 'https://x/slides/course-1');
 
@@ -267,6 +319,90 @@ test('lesson 52%/0% KHÔNG thay thế tiến độ cấp khóa 17% trong sidebar
   assert.equal(result.courseProgressPercent, 17);
   assert.equal(result.allLessons.length, 3);
   assert.equal(result.uncompletedLessons.length, 3);
+});
+
+test('PRODUCTION THẬT: badge "Đã hoàn thành" có d-none + 17% → incomplete 17', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCompletionDom({ badgeHidden: true, percent: 17 })),
+    'https://x/slides/course-213',
+  );
+
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseProgressPercent, 17);
+  assert.equal(result.courseCompletionSource, 'course_sidebar_aria-valuenow');
+  assert.equal(result.courseCompletionEvidence.completedBadgeFound, true);
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
+  assert.equal(result.courseCompletionEvidence.progressBarVisible, true);
+  assert.equal(result.courseCompletionEvidence.progressAriaValueNow, '17');
+  assert.equal(result.courseCompletionEvidence.progressText, '17');
+  assert.equal(result.courseCompletionEvidence.resolvedProgressPercent, 17);
+  assert.equal(result.courseCompletionEvidence.resolutionSource, 'course_sidebar_aria-valuenow');
+  assert.equal(result.courseCompletionEvidence.finalState, 'incomplete');
+  assert.equal(result.courseCompletionEvidence.completedMarkerFound, false);
+});
+
+for (const percent of [52, 98]) {
+  test(`PRODUCTION THẬT: badge ẩn + ${percent}% → incomplete ${percent}`, async () => {
+    const result = await scanCourseDetails(
+      scannerPage(productionCompletionDom({ badgeHidden: true, percent })),
+      `https://x/slides/course-${percent}`,
+    );
+    assert.equal(result.courseCompletionState, 'incomplete');
+    assert.equal(result.courseLevelCompleted, false);
+    assert.equal(result.courseProgressPercent, percent);
+    assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
+  });
+}
+
+test('PRODUCTION THẬT: badge visible (không d-none) → completed 100, không cần % 100', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCompletionDom({ badgeHidden: false, percent: 17 })),
+    'https://x/slides/course-done',
+  );
+
+  assert.equal(result.courseLevelCompleted, true);
+  assert.equal(result.courseCompletionState, 'completed');
+  assert.equal(result.courseProgressPercent, 100);
+  assert.equal(result.courseCompletionSource, 'course_completed_badge_visible');
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, true);
+  assert.equal(result.courseCompletionEvidence.finalState, 'completed');
+});
+
+test('badge ẩn + generic "course completed" VISIBLE + 17% → vẫn incomplete 17', async () => {
+  const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course weak evidence' });
+  const bar = new FakeNode({
+    tagName: 'div',
+    className: 'progress-bar',
+    attrs: { role: 'progressbar', 'aria-valuenow': '17' },
+  });
+  const wrap = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_channel_completion_progressbar d-flex',
+    children: [bar],
+  });
+  const badge = new FakeNode({
+    tagName: 'span',
+    className: 'o_wslides_channel_completion_completed badge d-none',
+    textContent: 'Đã hoàn thành',
+  });
+  const weak = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_course_completed',
+    textContent: 'Completed',
+  });
+  const sidebar = new FakeNode({
+    tagName: 'aside',
+    className: 'o_wslides_course_sidebar',
+    children: [badge, wrap, weak],
+  });
+  const root = new FakeNode({ tagName: 'div', children: [h1, sidebar] });
+
+  const result = await scanCourseDetails(scannerPage(makeDocument({ root, h1 })), 'https://x/slides/course-f');
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseProgressPercent, 17);
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
 });
 
 test('"Thời gian hoàn thành" không bị nhầm thành badge hoàn thành', async () => {

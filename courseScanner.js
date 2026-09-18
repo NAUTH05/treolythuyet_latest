@@ -291,48 +291,103 @@ async function scanCourseDetails(page, courseUrl) {
       };
       const courseSidebarContainers = collectContainers(COURSE_SIDEBAR_SELECTORS);
 
-      // So khớp hoàn thành có kiểm soát: "đã hoàn thành" (khác "thời gian hoàn
-      // thành"/"chưa hoàn thành") hoặc từ "completed" độc lập.
-      const looksCompleted = (normalized) => {
-        if (!normalized) return false;
-        if (normalized.includes('chua hoan thanh')) return false;
-        if (normalized.includes('da hoan thanh')) return true;
-        return /(^|[^a-z])completed([^a-z]|$)/.test(normalized)
-          && !/\b(not|in|un)\s*completed\b/.test(normalized);
+      // ── Nhận diện hoàn thành CẤP KHÓA theo đúng DOM production ──
+      // Odoo render đồng thời ở khóa CHƯA xong:
+      //   <span class="o_wslides_channel_completion_completed ... d-none">Đã hoàn thành</span>
+      //   <div class="o_wslides_channel_completion_progressbar ...">
+      //     <div class="progress-bar" role="progressbar" aria-valuenow="17" ...></div>
+      //     <span class="o_wslides_progress_percentage">17</span> %
+      //   </div>
+      // Badge "Đã hoàn thành" LUÔN có trong DOM (template/state) nhưng bị ẩn bằng
+      // `d-none`; textContent vẫn chứa nó. Vì vậy bằng chứng hoàn thành BẮT BUỘC
+      // phải kiểm tra VISIBLE, nếu không scanner sẽ báo Completed/100% sai.
+
+      const hasClassToken = (el, token) => {
+        if (!el) return false;
+        if (el.classList && typeof el.classList.contains === 'function') {
+          return el.classList.contains(token);
+        }
+        return String(el.className || '').split(/\s+/).includes(token);
       };
 
-      let completedMarkerFound = false;
-      let markerSelector = null;
-      let matchedLabel = null;
-      let markerSource = null;
-
-      for (const container of courseSidebarContainers) {
-        const nodes = [container, ...Array.from(container.querySelectorAll('*'))];
-        let best = null;
-        for (const node of nodes) {
-          if (isInsideLessonContainer(node)) continue;
-          const normalized = normalizeLooseText(node.textContent);
-          if (!normalized || normalized.length > 60) continue;
-          if (!looksCompleted(normalized)) continue;
-          if (!best || normalized.length < best.normalized.length) best = { normalized, node };
+      const isElementVisible = (el) => {
+        if (!el || el.nodeType === 3) return false;
+        if (el.hidden === true) return false;
+        if (typeof el.getAttribute === 'function' && el.getAttribute('aria-hidden') === 'true') return false;
+        if (hasClassToken(el, 'd-none') || hasClassToken(el, 'hidden')) return false;
+        if (typeof window !== 'undefined' && window && typeof window.getComputedStyle === 'function') {
+          const computed = window.getComputedStyle(el);
+          if (computed) {
+            if (computed.display === 'none') return false;
+            if (computed.visibility === 'hidden') return false;
+          }
         }
-        if (best) {
-          completedMarkerFound = true;
-          markerSelector = describeElement(best.node);
-          matchedLabel = best.node.textContent.trim().replace(/\s+/g, ' ').slice(0, 40);
-          markerSource = 'course_sidebar_completed_badge';
-          break;
+        if (typeof el.getClientRects === 'function') {
+          const rects = el.getClientRects();
+          if (rects && typeof rects.length === 'number' && rects.length === 0) return false;
+        }
+        return true;
+      };
+
+      // Node có hậu duệ đang ẩn → textContent bị trộn cả text ẩn, không được dùng
+      // làm bằng chứng hoàn thành (đây chính là bẫy của badge `d-none`).
+      const containsHiddenDescendant = (el) => {
+        if (!el || typeof el.querySelectorAll !== 'function') return false;
+        return Array.from(el.querySelectorAll('*')).some(child => !isElementVisible(child));
+      };
+
+      const parsePercentValue = (raw) => {
+        if (raw == null || raw === '') return null;
+        const match = String(raw).match(/(\d+(?:\.\d+)?)/);
+        if (!match) return null;
+        const parsed = Number(match[1]);
+        return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed : null;
+      };
+
+      // 1) Selector production chính xác — phải VISIBLE mới có thẩm quyền.
+      const completedBadgeEls = Array.from(document.querySelectorAll('.o_wslides_channel_completion_completed'));
+      const completedBadgeFound = completedBadgeEls.length > 0;
+      const visibleCompletedBadge = completedBadgeEls.find(isElementVisible) || null;
+
+      // 2) Tiến độ cấp khóa production — ưu tiên aria-valuenow rồi % text.
+      const progressBarWrap = Array.from(
+        document.querySelectorAll('.o_wslides_channel_completion_progressbar')
+      ).find(isElementVisible) || null;
+      let progressBarVisible = false;
+      let progressAriaValueNow = null;
+      let progressText = null;
+      let explicitProgress = null;
+
+      if (progressBarWrap) {
+        progressBarVisible = true;
+        const bar = progressBarWrap.querySelector('.progress-bar[role="progressbar"]')
+          || progressBarWrap.querySelector('[role="progressbar"]');
+        if (bar) {
+          progressAriaValueNow = bar.getAttribute('aria-valuenow');
+          const parsed = parsePercentValue(progressAriaValueNow);
+          if (parsed != null) {
+            explicitProgress = { percent: parsed, source: 'course_sidebar_aria-valuenow' };
+          }
+        }
+        const pctEl = progressBarWrap.querySelector('.o_wslides_progress_percentage');
+        if (pctEl) {
+          progressText = String(pctEl.textContent || '').trim().replace(/\s+/g, ' ');
+          if (explicitProgress == null) {
+            const parsed = parsePercentValue(progressText);
+            if (parsed != null) {
+              explicitProgress = { percent: parsed, source: 'course_sidebar_progress_percentage' };
+            }
+          }
         }
       }
 
-      // Ứng viên tiến độ CẤP KHÓA — CHỈ trong sidebar khóa học, loại trừ bài học.
-      // KHÔNG dùng fallback selector class chung chung kiểu
-      // [class*="course"][class*="completed"] làm bằng chứng hoàn thành: chúng có
-      // thể khớp widget/template Odoo không liên quan và ghi đè % thật đang hiển thị.
+      // 3) Fallback có kiểm soát cho DOM Odoo cũ/khác: ứng viên tiến độ cấp khóa
+      // phải nằm trong sidebar, đang VISIBLE và KHÔNG thuộc danh sách bài học.
       const progressCandidateEls = [];
       for (const container of courseSidebarContainers) {
         container.querySelectorAll('[data-course-progress], [data-course-completion], [role="progressbar"], .o_wslides_progress_bar, [class*="progress"]').forEach(el => {
           if (isInsideLessonContainer(el)) return;
+          if (!isElementVisible(el)) return;
           if (!progressCandidateEls.includes(el)) progressCandidateEls.push(el);
         });
       }
@@ -345,12 +400,8 @@ async function scanCourseDetails(page, courseUrl) {
         ];
         for (const candidate of ranked) {
           if (candidate.raw == null || candidate.raw === '') continue;
-          const match = String(candidate.raw).match(/(\d+(?:\.\d+)?)\s*%?/);
-          if (!match) continue;
-          const parsed = Number(match[1]);
-          if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 100) {
-            return { percent: parsed, source: candidate.source };
-          }
+          const parsed = parsePercentValue(candidate.raw);
+          if (parsed != null) return { percent: parsed, source: candidate.source };
         }
         const textMatch = String(el.textContent || '').trim().match(/(\d{1,3}(?:\.\d+)?)\s*%/);
         if (textMatch) {
@@ -362,28 +413,86 @@ async function scanCourseDetails(page, courseUrl) {
         return null;
       };
 
-      let courseProgressPercent = null;
-      let completionSource = null;
-      let courseCompletionState = 'unknown';
-
-      if (completedMarkerFound) {
-        courseCompletionState = 'completed';
-        courseProgressPercent = 100;
-        completionSource = markerSource;
-      } else {
+      if (explicitProgress == null) {
         for (const el of progressCandidateEls) {
           const resolved = resolveCandidatePercent(el);
           if (!resolved) continue;
-          courseProgressPercent = resolved.percent;
-          completionSource = resolved.source;
-          courseCompletionState = resolved.percent >= 100 ? 'completed' : 'incomplete';
+          explicitProgress = resolved;
           break;
         }
       }
 
+      // 4) Fallback text YẾU: chỉ xét text VISIBLE, scoped sidebar, không thuộc
+      // bài học, không bị trộn bởi hậu duệ đang ẩn. Chỉ dùng khi KHÔNG có tiến độ
+      // cấp khóa hiển thị — không bao giờ ghi đè % thật (VD 17%).
+      // "đã hoàn thành" (khác "thời gian hoàn thành"/"chưa hoàn thành") hoặc
+      // "completed" độc lập.
+      const looksCompleted = (normalized) => {
+        if (!normalized) return false;
+        if (normalized.includes('chua hoan thanh')) return false;
+        if (normalized.includes('da hoan thanh')) return true;
+        return /(^|[^a-z])completed([^a-z]|$)/.test(normalized)
+          && !/\b(not|in|un)\s*completed\b/.test(normalized);
+      };
+
+      let weakBadgeNode = null;
+      for (const container of courseSidebarContainers) {
+        const nodes = [container, ...Array.from(container.querySelectorAll('*'))];
+        let best = null;
+        for (const node of nodes) {
+          if (isInsideLessonContainer(node)) continue;
+          if (!isElementVisible(node)) continue;
+          if (containsHiddenDescendant(node)) continue;
+          const normalized = normalizeLooseText(node.textContent);
+          if (!normalized || normalized.length > 60) continue;
+          if (!looksCompleted(normalized)) continue;
+          if (!best || normalized.length < best.normalized.length) best = { normalized, node };
+        }
+        if (best) { weakBadgeNode = best.node; break; }
+      }
+
+      // ── Thứ tự ưu tiên (hai trạng thái cấp khóa loại trừ nhau) ──
+      // 1. Badge production VISIBLE            → completed 100%.
+      // 2. Tiến độ cấp khóa visible            → >=100 completed, <100 incomplete.
+      //    % hiển thị luôn thắng bằng chứng hoàn thành YẾU.
+      // 3. Text hoàn thành visible YẾU         → completed (chỉ khi không có %).
+      // 4. unknown.
+      let courseProgressPercent = null;
+      let completionSource = null;
+      let courseCompletionState = 'unknown';
+      let markerSelector = null;
+      let matchedLabel = null;
+
+      if (visibleCompletedBadge) {
+        courseCompletionState = 'completed';
+        courseProgressPercent = 100;
+        completionSource = 'course_completed_badge_visible';
+        markerSelector = describeElement(visibleCompletedBadge);
+        matchedLabel = String(visibleCompletedBadge.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+      } else if (explicitProgress) {
+        courseProgressPercent = explicitProgress.percent;
+        completionSource = explicitProgress.source;
+        courseCompletionState = explicitProgress.percent >= 100 ? 'completed' : 'incomplete';
+      } else if (weakBadgeNode) {
+        courseCompletionState = 'completed';
+        courseProgressPercent = 100;
+        completionSource = 'course_sidebar_completed_badge';
+        markerSelector = describeElement(weakBadgeNode);
+        matchedLabel = String(weakBadgeNode.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+      }
+
+      const completedMarkerFound = courseCompletionState === 'completed';
       const courseLevelCompleted = courseCompletionState === 'completed';
 
       const courseCompletionEvidence = {
+        completedBadgeFound,
+        completedBadgeVisible: Boolean(visibleCompletedBadge),
+        completedBadgeClasses: (visibleCompletedBadge || completedBadgeEls[0])
+          ? String((visibleCompletedBadge || completedBadgeEls[0]).className || '')
+          : null,
+        progressBarVisible,
+        progressAriaValueNow,
+        progressText,
         completedMarkerFound,
         markerSelector,
         matchedLabel,
@@ -397,6 +506,7 @@ async function scanCourseDetails(page, courseUrl) {
         })),
         resolvedProgressPercent: courseProgressPercent,
         resolutionSource: completionSource,
+        finalState: courseCompletionState,
       };
 
       // Extract all lesson items
