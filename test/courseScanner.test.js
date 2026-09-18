@@ -276,3 +276,15 @@ test('My Courses: thẻ KHÔNG có Completed → incomplete, giữ đúng thứ 
   assert.deepEqual(results.map(r => r.state), ['completed', 'incomplete', 'incomplete']);
   assert.equal(results[1].source, 'my_courses_listed_incomplete');
 });
+
+test('My Courses incomplete cards do not invent numeric progress', async () => {
+  const h5 = new FakeNode({ tagName: 'h5', textContent: 'Course incomplete 98%' });
+  const link = new FakeNode({ tagName: 'a', attrs: { href: '/slides/course-incomplete' }, children: [h5] });
+  const card = new FakeNode({ tagName: 'div', className: 'card', children: [link] });
+  const root = new FakeNode({ tagName: 'div', children: [card] });
+
+  const results = await scanMyCoursesCompletion(scannerPage(makeDocument({ root })), 'https://x/slides/all?my=1');
+  assert.equal(results[0].completed, false);
+  assert.equal(results[0].progressPercent, null);
+  assert.equal(results[0].state, 'incomplete');
+});

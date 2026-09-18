@@ -14,13 +14,14 @@ const AUTO_STATUS = {
   'daily-limit':{ text: 'Đủ giờ hôm nay — đã hẹn lịch', badge: 'badge-logging-in' },
   'time-window':{ text: 'Ngoài khung giờ — đã hẹn lịch', badge: 'badge-logging-in' },
   'next-day':   { text: 'Còn khóa chưa xong — đã hẹn ngày sau', badge: 'badge-logging-in' },
+  'discovery-retry': { text: 'Website chưa mở khóa — chờ quét lại', badge: 'badge-logging-in' },
   completed:    { text: 'Hoàn thành', badge: 'badge-completed' },
   stopped:      { text: 'Đã dừng', badge: 'badge-idle' },
   error:        { text: 'Lỗi', badge: 'badge-error' },
 };
 
 const ACTIVE_STATUSES = new Set(['idle', 'logging-in', 'scanning', 'studying', 'surplus-study']);
-const SCHEDULED_STATUSES = new Set(['scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day']);
+const SCHEDULED_STATUSES = new Set(['scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day', 'discovery-retry']);
 const DONE_STATUSES = new Set(['completed', 'stopped', 'error']);
 
 function formatVNDateTime(iso) {
@@ -56,7 +57,15 @@ function AutoScanCard({ scan, toast }) {
   const isActive = ACTIVE_STATUSES.has(scan.status);
   const isScheduled = SCHEDULED_STATUSES.has(scan.status);
   const isPaused = scan.status === 'paused';
-  const courses = Object.entries(scan.courseProgress || {});
+  const courses = Object.entries(scan.courseProgress || {}).sort(([, a], [, b]) => {
+    const ai = a?.discoveredOrderIndex === null || a?.discoveredOrderIndex === undefined || a?.discoveredOrderIndex === ''
+      ? Number.MAX_SAFE_INTEGER
+      : (Number.isFinite(Number(a.discoveredOrderIndex)) ? Number(a.discoveredOrderIndex) : Number.MAX_SAFE_INTEGER);
+    const bi = b?.discoveredOrderIndex === null || b?.discoveredOrderIndex === undefined || b?.discoveredOrderIndex === ''
+      ? Number.MAX_SAFE_INTEGER
+      : (Number.isFinite(Number(b.discoveredOrderIndex)) ? Number(b.discoveredOrderIndex) : Number.MAX_SAFE_INTEGER);
+    return ai - bi;
+  });
   // Khóa học chỉ có số liệu SAU khi auto-discovery chạy (sau khi login). Trước
   // đó totalCourses = 0 → hiển thị "Chưa quét", KHÔNG bịa 1/1.
   const totalCourses = scan.totalCourses
@@ -164,7 +173,7 @@ function AutoScanCard({ scan, toast }) {
           </button>
         </span>
         {isScheduled && scan.nextRunTime && (
-          <span>{scan.status === 'scheduled-start' ? 'Chờ đến giờ hẹn' : 'Tự chạy lại'}: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
+          <span>{scan.status === 'scheduled-start' ? 'Chờ đến giờ hẹn' : scan.status === 'discovery-retry' ? 'Quét lại lúc' : 'Tự chạy lại'}: <strong>{formatVNDateTime(scan.nextRunTime)}</strong></span>
         )}
         {scan.randomStartEnabled && scan.scheduledStartAt && (
           <span>Hẹn chạy hôm nay: <strong>{formatVNDateTime(scan.scheduledStartAt)}</strong></span>
@@ -184,20 +193,34 @@ function AutoScanCard({ scan, toast }) {
       {courses.length > 0 && (
         <div className="course-progress">
           {courses.map(([url, cp]) => {
+            const websiteFieldsPresent = Object.prototype.hasOwnProperty.call(cp, 'websiteCourseCompleted')
+              || Object.prototype.hasOwnProperty.call(cp, 'websiteCourseCompletionState')
+              || Object.prototype.hasOwnProperty.call(cp, 'websiteCourseProgressPercent');
+            const websiteCompleted = cp.websiteCourseCompleted === true || cp.websiteCourseCompletionState === 'completed';
+            const websitePercent = cp.websiteCourseProgressPercent === null || cp.websiteCourseProgressPercent === undefined || cp.websiteCourseProgressPercent === ''
+              ? null
+              : Number(cp.websiteCourseProgressPercent);
+            const knownWebsitePercent = Number.isFinite(websitePercent) ? Math.max(0, Math.min(100, websitePercent)) : null;
             const target = cp.targetMinutes || 0;
             const studied = cp.studiedMinutes || 0;
-            const pct = cp.completed ? 100 : target > 0 ? Math.min(100, (studied / target) * 100) : 0;
+            const legacyCompleted = cp.completed === true;
+            const pct = websiteFieldsPresent
+              ? (websiteCompleted ? 100 : (knownWebsitePercent ?? 0))
+              : (legacyCompleted ? 100 : target > 0 ? Math.min(100, (studied / target) * 100) : 0);
+            const label = websiteFieldsPresent
+              ? (websiteCompleted ? 'Completed' : (knownWebsitePercent == null ? 'In Progress' : `${Math.round(knownWebsitePercent)}%`))
+              : (legacyCompleted ? 'Đã đạt mục tiêu' : `${formatMinutes(studied)} / ${formatMinutes(target)}`);
             return (
               <div className="course-progress-row" key={url}>
                 <div className="course-progress-title">
                   <span className="name" title={url}>{cp.title || courseNameFromUrl(url)}</span>
-                  <span className={`value ${cp.completed ? 'done' : ''}`}>
-                    {cp.completed ? 'Đã đạt mục tiêu' : `${formatMinutes(studied)} / ${formatMinutes(target)}`}
+                  <span className={`value ${(websiteCompleted || (!websiteFieldsPresent && legacyCompleted)) ? 'done' : ''}`}>
+                    {label}
                   </span>
                 </div>
                 <div className="progress-track">
                   <div
-                    className={`progress-fill ${cp.completed ? 'success' : ''}`}
+                    className={`progress-fill ${(websiteCompleted || (!websiteFieldsPresent && legacyCompleted)) ? 'success' : ''}`}
                     style={{ width: `${pct}%` }}
                   />
                 </div>

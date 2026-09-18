@@ -33,7 +33,7 @@ function fakeScheduledSession(id, {
 // 7. Scheduled run transitions to PHASE_FINISHED (đã kiểm ở engine) — ở đây xác
 // nhận trạng thái hẹn giờ vẫn được coi là "cần restart" bởi tầng điều phối.
 test('trạng thái hẹn giờ là nguồn duy nhất cho restart, không phải trạng thái kết thúc', () => {
-  for (const status of ['daily-limit', 'date-limit', 'time-window', 'next-day']) {
+  for (const status of ['daily-limit', 'date-limit', 'time-window', 'next-day', 'discovery-retry']) {
     assert.equal(isScheduledAutoScan(fakeScheduledSession('s', { status })), true, status);
     assert.equal(canRestartScheduledSession(fakeScheduledSession('s', { status })), true, status);
   }

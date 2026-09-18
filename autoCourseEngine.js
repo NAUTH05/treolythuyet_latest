@@ -14,6 +14,8 @@ const LOGIN_POST_SUBMIT_GRACE_MS = 5000;
 const LOGIN_RETRY_BASE_MS = 15000;
 const LOGIN_RETRY_MAX_MS = 5 * 60 * 1000;
 const MAX_CONCURRENT_LOGINS = 3;
+const COURSE_DISCOVERY_RETRY_MINUTES = 10;
+const DISCOVERY_RETRY_STATUS = 'discovery-retry';
 
 // ── SURPLUS (học thừa) ──
 // Mỗi khóa được cấp MỘT mục tiêu RNG riêng trong khoảng 15-60 phút. Khóa được
@@ -84,7 +86,7 @@ const COURSE_FINALIZATION_STATES = Object.freeze({
 // Dashboard phải hiểu được toàn bộ danh sách này (xem test frontendStatusContract).
 const AUTO_COURSE_STATUSES = [
   'idle', 'logging-in', 'scanning', 'studying', 'paused',
-  'surplus-study', 'scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day',
+  'surplus-study', 'scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day', DISCOVERY_RETRY_STATUS,
   'completed', 'stopped', 'error',
 ];
 
@@ -96,7 +98,7 @@ const TERMINAL_STATUSES = new Set(['completed', 'stopped', 'error']);
 // scheduledStartAt (random distributed start) rồi engine mới chạy. KHÁC với
 // idle ("chờ khởi động") và KHÁC với các giới hạn ngày/ca/khung giờ ở trên.
 // Vẫn là trạng thái không-kết-thúc nên được stale recovery xử lý khi timer mất.
-const SCHEDULED_STATUSES = new Set(['scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day']);
+const SCHEDULED_STATUSES = new Set(['scheduled-start', 'date-limit', 'daily-limit', 'time-window', 'next-day', DISCOVERY_RETRY_STATUS]);
 const SCHEDULED_START_STATUS = 'scheduled-start';
 
 // Giai đoạn vòng đời của đối tượng phiên (khác với `status` hiển thị):
@@ -439,6 +441,61 @@ class AutoCourseSession extends EventEmitter {
     return this._hitDailyLimit() || this._hitTimeShiftLimit() || this._hitTimeWindowLimit();
   }
 
+  // A zero-course scan is temporary: the provider may publish the course list later.
+  // Keep the browser lifecycle short and let the server restart a fresh session later.
+  _scheduleDiscoveryRetry() {
+    this._rolloverDailyCounter();
+    const cooldownMs = COURSE_DISCOVERY_RETRY_MINUTES * 60 * 1000;
+    if (this.dailyStudiedMinutes >= this.options.dailyMaxMinutes) {
+      this._hitDailyLimit();
+      return false;
+    }
+
+    const now = new Date();
+    const retryAt = new Date(now.getTime() + cooldownMs);
+    const emitScheduled = () => this.emit('status', this.getStatus());
+
+    if (!isAllowedStudyDate(retryAt, this.options.allowedDateRanges)) {
+      this.nextRunTime = null;
+      this._enterScheduledStatus('next-day');
+      this.log('⏰ Hôm nay không còn thời gian hợp lệ — sẽ quét lại vào ngày học tiếp theo', 'warn');
+      emitScheduled();
+      return false;
+    }
+
+    const customRules = this.options.customTimeRules || [];
+    if (customRules.length > 0) {
+      const shiftsToday = getShiftsForDate(now, customRules);
+      if (shiftsToday && shiftsToday.length > 0) {
+        const shiftStatus = calcMsRemainingInShift(now, shiftsToday);
+        if (!shiftStatus.inShift || (Number.isFinite(shiftStatus.remainingMs) && shiftStatus.remainingMs < cooldownMs)) {
+          this.nextRunTime = null;
+          this._enterScheduledStatus('date-limit');
+          this.log('⏰ Ca học hôm nay sắp kết thúc — sẽ quét lại vào ca hợp lệ tiếp theo', 'warn');
+          emitScheduled();
+          return false;
+        }
+      }
+    }
+
+    const windowRemaining = this._msRemainingInWindow();
+    if (windowRemaining === -2 || (windowRemaining >= 0 && windowRemaining < cooldownMs)) {
+      this.nextRunTime = null;
+      this._enterScheduledStatus('time-window');
+      this.log('⏰ Khung giờ hiện tại không đủ cho lần quét lại — sẽ chờ khung hợp lệ tiếp theo', 'warn');
+      emitScheduled();
+      return false;
+    }
+
+    this.nextRunTime = retryAt.toISOString();
+    this._enterScheduledStatus(DISCOVERY_RETRY_STATUS);
+    this.log('⚠️ Website chưa trả về khóa học sau khi đăng nhập', 'warn');
+    this.log(`⏳ Sẽ quét lại khóa học sau ${COURSE_DISCOVERY_RETRY_MINUTES} phút`, 'warn');
+    this.log(`⏰ Lần quét tiếp theo: ${retryAt.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}`, 'info');
+    emitScheduled();
+    return true;
+  }
+
   // Xem trước giới hạn lịch mà KHÔNG đổi trạng thái. Dùng để caller kịp lưu tiến
   // độ (F5 để Odoo chốt checkpoint) TRƯỚC khi phiên chốt sang trạng thái hẹn giờ.
   _peekSchedulingLimit() {
@@ -576,7 +633,12 @@ class AutoCourseSession extends EventEmitter {
 
     const actualStudiedMinutes = Math.max(0, Number(result.actualStudiedMinutes) || 0);
     const state = AutoCourseSession._courseCompletionStateOf(result);
-    const percent = Number.isFinite(result.courseProgressPercent) ? result.courseProgressPercent : null;
+    const percent = AutoCourseSession._nullableFiniteNumber(result.courseProgressPercent);
+    // An UNKNOWN detail scan must not downgrade a Completed badge previously
+    // confirmed by My Courses. UNKNOWN means no fresh evidence, not incomplete.
+    const preservedState = state === 'unknown' && existing.websiteCourseCompletionState
+      ? existing.websiteCourseCompletionState
+      : state;
     const targetReached = targetMinutes > 0 ? actualStudiedMinutes >= targetMinutes : true;
 
     this.courseProgress[config.courseUrl] = {
@@ -585,8 +647,8 @@ class AutoCourseSession extends EventEmitter {
       targetMinutes,
       // Không để một lần parse lỗi (0 phút) xoá tiến độ đang hiển thị.
       studiedMinutes: actualStudiedMinutes > 0 ? actualStudiedMinutes : (existing.studiedMinutes ?? actualStudiedMinutes),
-      websiteCourseCompleted: state === 'completed',
-      websiteCourseCompletionState: state,
+      websiteCourseCompleted: preservedState === 'completed',
+      websiteCourseCompletionState: preservedState,
       websiteCourseProgressPercent: percent ?? existing.websiteCourseProgressPercent ?? null,
     };
 
@@ -766,15 +828,16 @@ class AutoCourseSession extends EventEmitter {
       if (!absoluteUrl && item.coursePath) {
         try { absoluteUrl = new URL(item.coursePath, BASE_URL).href; } catch { absoluteUrl = item.coursePath; }
       }
+      const websiteCompleted = item.completed === true || item.state === 'completed';
       normalized.push({
         courseUrl: absoluteUrl || identity,
         coursePath: identity,
         title: item.title,
         orderIndex: normalized.length,
-        completed: item.completed === true,
-        completionState: item.completed === true ? 'completed' : (item.state === 'completed' ? 'completed' : 'incomplete'),
-        progressPercent: Number.isFinite(Number(item.progressPercent)) ? Number(item.progressPercent) : null,
-        recordedMinutes: Number.isFinite(Number(item.recordedMinutes)) ? Number(item.recordedMinutes) : null,
+        completed: websiteCompleted,
+        completionState: websiteCompleted ? 'completed' : 'incomplete',
+        progressPercent: AutoCourseSession._nullableFiniteNumber(item.progressPercent),
+        recordedMinutes: AutoCourseSession._nullableFiniteNumber(item.recordedMinutes),
         discoveredAt: new Date().toISOString(),
         source: item.source || 'my_courses',
       });
@@ -811,7 +874,14 @@ class AutoCourseSession extends EventEmitter {
 
     this._discoveryValid = true;
     this._detectNewCourses(normalized, log);
+    this.emit('status', this.getStatus());
     return normalized;
+  }
+
+  static _nullableFiniteNumber(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
   }
 
   // Phát hiện khóa MỚI chưa từng thấy để log và đánh thức NORMAL.
@@ -1070,6 +1140,10 @@ class AutoCourseSession extends EventEmitter {
     if (!this._isRunActive()) return false;
     // Surplus chỉ được bắt đầu khi MỌI khóa hiện tại của website đã Completed.
     const allCompleted = await this._verifyAllCurrentCoursesCompleted({ log: false });
+    if (allCompleted === null) {
+      this._scheduleDiscoveryRetry();
+      return false;
+    }
     if (allCompleted !== true) return false;
     if (!this._isRunActive()) return false;
 
@@ -1351,6 +1425,10 @@ class AutoCourseSession extends EventEmitter {
     this.log('🔎 Final website course discovery...', 'info');
     const allCompleted = await this._verifyAllCurrentCoursesCompleted({ log: false });
     if (!this._isRunActive()) return false;
+    if (allCompleted === null) {
+      this._scheduleDiscoveryRetry();
+      return false;
+    }
     if (allCompleted !== true) {
       this.log('⚠️ Surplus pass finished, but website still has incomplete courses or discovery failed; deferring completion', 'warn');
       return false;
@@ -2044,10 +2122,7 @@ class AutoCourseSession extends EventEmitter {
       // 1) AUTO-DISCOVER danh sách khóa hiện tại từ website (nguồn chân lý).
       const discovery = await this._discoverCourses({ log: false });
       if (!discovery) {
-        this.log('⚠️ Could not discover website courses — scheduling next run', 'warn');
-        if (this._hitSchedulingLimit()) return;
-        this._enterScheduledStatus('next-day');
-        this.emit('status', this.getStatus());
+        this._scheduleDiscoveryRetry();
         return;
       }
       this._logDiscovery(discovery);
@@ -2104,6 +2179,11 @@ class AutoCourseSession extends EventEmitter {
         }
 
         this.log(`📚 Khóa [${scanResult.courseTitle}]: Tìm thấy ${scanResult.uncompletedLessons.length}/${scanResult.totalLessons} bài chưa xong (<100%)`, 'info');
+        this.log(`   NORMAL Course ${cIdx + 1}/${this.coursesConfig.length}`, 'info');
+        this.log(`   Course: ${scanResult.courseTitle}`, 'info');
+        this.log(`   Website status: ${scanResult.courseLevelCompleted === true ? 'Completed' : 'In Progress'}`, 'info');
+        this.log(`   Course progress: ${scanResult.courseProgressPercent == null ? 'unavailable' : `${scanResult.courseProgressPercent}%`}`, 'info');
+        this.log(`   Unfinished lessons: ${scanResult.uncompletedLessons.length}`, 'info');
         scanResult.allLessons.forEach((l, idx) => {
           this.log(`   └─ Bài ${idx + 1}: ${l.title} -> ${l.progressPercent}% (${l.isCompleted ? 'Đã hoàn thành' : 'CHƯA XONG'})`, l.isCompleted ? 'info' : 'warn');
         });
@@ -2716,10 +2796,7 @@ class AutoCourseSession extends EventEmitter {
         // 3) Sau NORMAL pass: phát hiện LẠI danh sách khóa (bắt khóa mới/đổi trạng thái).
         const afterNormal = await this._discoverCourses({ log: false });
         if (!afterNormal) {
-          this.log('⏭️ Could not rediscover website courses — scheduling next run', 'warn');
-          if (this._hitSchedulingLimit()) return;
-          this._enterScheduledStatus('next-day');
-          this.emit('status', this.getStatus());
+          this._scheduleDiscoveryRetry();
           return;
         }
 
@@ -2748,10 +2825,7 @@ class AutoCourseSession extends EventEmitter {
         // 5) PHÁT HIỆN LẦN CUỐI trước khi vào complete queue (chống khóa mới).
         const finalDiscovery = await this._discoverCourses({ log: false });
         if (!finalDiscovery) {
-          this.log('⏭️ Final course discovery failed — scheduling next run', 'warn');
-          if (this._hitSchedulingLimit()) return;
-          this._enterScheduledStatus('next-day');
-          this.emit('status', this.getStatus());
+          this._scheduleDiscoveryRetry();
           return;
         }
         if (!this._allDiscoveredCoursesCompleted()) {
@@ -2767,6 +2841,10 @@ class AutoCourseSession extends EventEmitter {
           this.log('✅ Account fully completed', 'success');
           this.log('➡️ Moving account to complete queue', 'success');
         } else {
+          if (SCHEDULED_STATUSES.has(this.status)) {
+            this.emit('status', this.getStatus());
+            return;
+          }
           this.log('⏭️ Surplus pass not finished — scheduling next run', 'warn');
           if (this._hitSchedulingLimit()) return;
           this._enterScheduledStatus('next-day');
@@ -2840,4 +2918,6 @@ module.exports = {
   LoginLimiter,
   globalLoginLimiter,
   MAX_CONCURRENT_LOGINS,
+  COURSE_DISCOVERY_RETRY_MINUTES,
+  DISCOVERY_RETRY_STATUS,
 };

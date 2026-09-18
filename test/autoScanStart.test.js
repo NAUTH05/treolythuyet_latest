@@ -120,6 +120,17 @@ test('7. phiên hẹn lịch tương lai chặn start trùng', () => {
   assert.equal(plan.plans[0].action, 'skip');
   assert.equal(plan.plans[0].status, 'next-day');
 
+  const retry = makeSession('retry', {
+    status: 'discovery-retry',
+    phase: PHASE_FINISHED,
+    nextRunTime: new Date(Date.now() + 10 * 60_000).toISOString(),
+    email: 'retry@x.vn',
+  });
+  registry.adopt(retry);
+  const retryPlan = planAutoScanStart({ allAccounts: [{ name: 'R', email: 'retry@x.vn' }], requestedIndices: [1], registry });
+  assert.equal(retryPlan.plans[0].action, 'skip');
+  assert.equal(retryPlan.plans[0].status, 'discovery-retry');
+
   // idle đang chờ lịch random trong tương lai cũng là blocker hợp lệ.
   const waiting = makeSession('waiting', {
     status: 'idle',

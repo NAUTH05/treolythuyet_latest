@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { BotSession } = require('./bot');
-const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES, SCHEDULED_START_STATUS } = require('./autoCourseEngine');
+const { AutoCourseSession, getPersistentAutoCourseOptions, SCHEDULED_STATUSES: AUTO_SCHEDULED_STATUSES, TERMINAL_STATUSES: AUTO_TERMINAL_STATUSES, SCHEDULED_START_STATUS, COURSE_DISCOVERY_RETRY_MINUTES } = require('./autoCourseEngine');
 const { AutoCourseRegistry } = require('./autoCourseRegistry');
 const { isStaleScheduledSession, restartScheduledSession, applyAutoScanRestoreState } = require('./autoScanRecovery');
 const { planAutoScanStart, findBlockingAutoScanSession, describeAutoScanBlocker, buildAutoScanStartResponse, applyScheduledStart } = require('./autoScanStart');
@@ -1803,7 +1803,10 @@ function scheduleAutoScanResume(autoSession) {
   if (!autoScanRegistry.isCurrent(autoSession)) return;
 
   let resumeAt;
-  if (autoSession.status === 'time-window' && (autoSession.options.timeWindows || []).length > 0) {
+  if (autoSession.status === 'discovery-retry' && autoSession.nextRunTime) {
+    resumeAt = new Date(autoSession.nextRunTime);
+    if (Number.isNaN(resumeAt.getTime())) resumeAt = new Date(Date.now() + COURSE_DISCOVERY_RETRY_MINUTES * 60 * 1000);
+  } else if (autoSession.status === 'time-window' && (autoSession.options.timeWindows || []).length > 0) {
     resumeAt = new Date(Date.now() + calcNextWindowMs(autoSession.options.timeWindows));
   } else if (autoSession.status === 'date-limit' && (autoSession.options.customTimeRules || []).length > 0) {
     resumeAt = getNextShiftStart(
@@ -1827,7 +1830,9 @@ function scheduleAutoScanResume(autoSession) {
   addLog({
     timestamp: formatVN(new Date()),
     account: autoSession.account.name,
-    msg: `⏰ Auto-Scan hẹn tự chạy lại lúc ${formatVN(resumeAt)}`,
+    msg: autoSession.status === 'discovery-retry'
+      ? `⏳ Quét lại khóa học lúc ${formatVN(resumeAt)}`
+      : `⏰ Auto-Scan hẹn tự chạy lại lúc ${formatVN(resumeAt)}`,
     level: 'info',
   });
   emitAutoScanStatus(autoSession);
@@ -1871,7 +1876,9 @@ function restartAutoScanSession(sessionId) {
   addLog({
     timestamp: formatVN(new Date()),
     account: old.account.name,
-    msg: `▶️ Đến giờ hẹn — khởi động lại Auto-Scan cho ${old.account.name}`,
+    msg: old.status === 'discovery-retry'
+      ? `🔄 Đến giờ quét lại khóa học — khởi động lại Auto-Scan cho ${old.account.name}`
+      : `▶️ Đến giờ hẹn — khởi động lại Auto-Scan cho ${old.account.name}`,
     level: 'info',
   });
   saveAutoScanState();
@@ -1982,16 +1989,20 @@ async function loadAndRestoreAutoScans() {
       s.nextRunTime = null;
       scheduleAutoScanTimer(saved.id, Date.now() + RESTORE_START_DELAY_MS, () => startAutoScanWhenFree(s, 'khôi-phục-ngày-hợp-lệ'), 'restore');
       active++;
-    } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window' || saved.status === 'next-day') {
+    } else if (saved.status === 'date-limit' || saved.status === 'daily-limit' || saved.status === 'time-window' || saved.status === 'next-day' || saved.status === 'discovery-retry') {
       const fireAt = saved.nextRunTime
         ? new Date(saved.nextRunTime)
+        : saved.status === 'discovery-retry'
+          ? new Date(Date.now() + COURSE_DISCOVERY_RETRY_MINUTES * 60 * 1000)
         : (saved.status === 'time-window' && options.timeWindows.length > 0)
           ? new Date(Date.now() + calcNextWindowMs(options.timeWindows))
           : getNextAllowedStudyDate(new Date(), options.allowedDateRanges, options.newDayStartTime);
       logHistory.push({
         timestamp: formatVN(new Date()),
         account: saved.account.name,
-        msg: `⏰ Khôi phục lịch hẹn Auto-Scan → chạy lại lúc ${formatVN(fireAt)}`,
+        msg: saved.status === 'discovery-retry'
+          ? `⏳ Khôi phục lịch quét lại khóa học → chạy lại lúc ${formatVN(fireAt)}`
+          : `⏰ Khôi phục lịch hẹn Auto-Scan → chạy lại lúc ${formatVN(fireAt)}`,
         level: 'info',
       });
       s.nextRunTime = fireAt.toISOString();

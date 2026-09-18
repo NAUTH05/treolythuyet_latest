@@ -147,6 +147,30 @@ test('discovery rỗng/thất bại KHÔNG được coi là đã hoàn thành', 
   assert.equal(await session._verifyAllCurrentCoursesCompleted(), null);
 });
 
+test('discovery retry stays same-day for ten minutes and preserves known state', async () => {
+  const session = discoverySession('disc-retry', [raceCourse('Known', '/slides/known', { completed: false })]);
+  await session._discoverCourses();
+  const knownBefore = JSON.stringify(session.discoveredCourses);
+  session.context = discoveryContext([]);
+  assert.equal(await session._discoverCourses(), null);
+  assert.equal(JSON.stringify(session.discoveredCourses), knownBefore);
+  assert.equal(session.courseProgress[abs('/slides/known')].websiteCourseCompletionState, 'incomplete');
+
+  session._phase = PHASE_RUNNING;
+  const now = Date.now();
+  assert.equal(session._scheduleDiscoveryRetry(), true);
+  assert.equal(session.status, 'discovery-retry');
+  const delay = new Date(session.nextRunTime).getTime() - now;
+  assert.ok(delay >= 9.9 * 60 * 1000 && delay <= 10.1 * 60 * 1000, `retry delay=${delay}`);
+});
+
+test('nullable discovery numbers do not turn null or empty strings into zero', () => {
+  assert.equal(AutoCourseSession._nullableFiniteNumber(null), null);
+  assert.equal(AutoCourseSession._nullableFiniteNumber(''), null);
+  assert.equal(AutoCourseSession._nullableFiniteNumber('0'), 0);
+  assert.equal(AutoCourseSession._nullableFiniteNumber('98'), 98);
+});
+
 test('NORMAL có ưu tiên: surplus không khởi động khi còn khóa chưa Completed', async () => {
   const session = discoverySession('disc-priority', [
     raceCourse('A', '/slides/a', { completed: true }),

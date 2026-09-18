@@ -354,7 +354,6 @@ async function scanCourseDetails(page, courseUrl) {
           { raw: el.getAttribute('data-course-completion'), source: 'data-course-completion' },
           { raw: el.getAttribute('data-course-progress'), source: 'data-course-progress' },
           { raw: el.getAttribute('aria-valuenow'), source: 'aria-valuenow' },
-          { raw: el.style && el.style.width, source: 'style.width' },
         ];
         for (const candidate of ranked) {
           if (candidate.raw == null || candidate.raw === '') continue;
@@ -527,8 +526,7 @@ async function scanMyCoursesCompletion(page, myCoursesUrl) {
 
         const normalized = normalizeLooseText(card.textContent);
         const completed = looksCompleted(normalized);
-        // % tiến độ hiển thị trên thẻ (nếu có), tránh nhầm với năm/số khác.
-        const percentMatch = String(card.textContent || '').match(/(\d{1,3})\s*%/);
+        // Incomplete My Courses cards do not expose a reliable numeric percentage.
 
         results.push({
           title,
@@ -537,7 +535,7 @@ async function scanMyCoursesCompletion(page, myCoursesUrl) {
           orderIndex: results.length,
           completed,
           state: completed ? 'completed' : 'incomplete',
-          progressPercent: completed ? 100 : (percentMatch ? Math.min(100, parseInt(percentMatch[1], 10)) : null),
+          progressPercent: completed ? 100 : null,
           source: completed ? 'my_courses_completed_badge' : 'my_courses_listed_incomplete',
         });
       }
