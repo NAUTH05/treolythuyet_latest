@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import * as api from '../api';
 import { formatAutoScanStartFeedback } from '../autoscanStartFeedback.mjs';
+import { formatMinutes, courseRowDisplay } from '../courseProgressDisplay.mjs';
 
 const AUTO_STATUS = {
   idle:         { text: 'Chờ khởi động', badge: 'badge-idle' },
@@ -36,12 +37,6 @@ function formatVNDateTime(iso) {
   } catch {
     return iso;
   }
-}
-
-function formatMinutes(mins) {
-  const m = Math.max(0, Math.round(mins || 0));
-  const h = Math.floor(m / 60);
-  return h > 0 ? `${h}h ${m % 60}m` : `${m}m`;
 }
 
 function courseNameFromUrl(url) {
@@ -193,34 +188,18 @@ function AutoScanCard({ scan, toast }) {
       {courses.length > 0 && (
         <div className="course-progress">
           {courses.map(([url, cp]) => {
-            const websiteFieldsPresent = Object.prototype.hasOwnProperty.call(cp, 'websiteCourseCompleted')
-              || Object.prototype.hasOwnProperty.call(cp, 'websiteCourseCompletionState')
-              || Object.prototype.hasOwnProperty.call(cp, 'websiteCourseProgressPercent');
-            const websiteCompleted = cp.websiteCourseCompleted === true || cp.websiteCourseCompletionState === 'completed';
-            const websitePercent = cp.websiteCourseProgressPercent === null || cp.websiteCourseProgressPercent === undefined || cp.websiteCourseProgressPercent === ''
-              ? null
-              : Number(cp.websiteCourseProgressPercent);
-            const knownWebsitePercent = Number.isFinite(websitePercent) ? Math.max(0, Math.min(100, websitePercent)) : null;
-            const target = cp.targetMinutes || 0;
-            const studied = cp.studiedMinutes || 0;
-            const legacyCompleted = cp.completed === true;
-            const pct = websiteFieldsPresent
-              ? (websiteCompleted ? 100 : (knownWebsitePercent ?? 0))
-              : (legacyCompleted ? 100 : target > 0 ? Math.min(100, (studied / target) * 100) : 0);
-            const label = websiteFieldsPresent
-              ? (websiteCompleted ? 'Completed' : (knownWebsitePercent == null ? 'In Progress' : `${Math.round(knownWebsitePercent)}%`))
-              : (legacyCompleted ? 'Đã đạt mục tiêu' : `${formatMinutes(studied)} / ${formatMinutes(target)}`);
+            const { pct, label, done } = courseRowDisplay(cp);
             return (
               <div className="course-progress-row" key={url}>
                 <div className="course-progress-title">
                   <span className="name" title={url}>{cp.title || courseNameFromUrl(url)}</span>
-                  <span className={`value ${(websiteCompleted || (!websiteFieldsPresent && legacyCompleted)) ? 'done' : ''}`}>
+                  <span className={`value ${done ? 'done' : ''}`}>
                     {label}
                   </span>
                 </div>
                 <div className="progress-track">
                   <div
-                    className={`progress-fill ${(websiteCompleted || (!websiteFieldsPresent && legacyCompleted)) ? 'success' : ''}`}
+                    className={`progress-fill ${done ? 'success' : ''}`}
                     style={{ width: `${pct}%` }}
                   />
                 </div>

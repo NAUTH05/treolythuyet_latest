@@ -74,6 +74,28 @@ test('state Auto-Scan phức hợp round-trip nguyên vẹn', () => {
   assert.deepEqual(roundTrip(state), state);
 });
 
+test('websiteRecordedMinutes/Text và website course state round-trip qua Firestore', () => {
+  const state = {
+    autoScans: [
+      {
+        id: 'recorded',
+        account: { name: 'Cao Thị Kim Anh' },
+        courseProgress: {
+          'https://x/slides/course-213': {
+            websiteCourseCompleted: false,
+            websiteCourseCompletionState: 'incomplete',
+            websiteCourseProgressPercent: 25,
+            websiteRecordedMinutes: 193,
+            websiteRecordedText: '3 giờ 13 phút',
+          },
+        },
+      },
+    ],
+  };
+
+  assert.deepEqual(roundTrip(state), state);
+});
+
 test('đọc được document cũ lưu object dưới dạng chuỗi JSON', () => {
   const legacy = { fields: { autoScans: { stringValue: JSON.stringify([{ id: 'a' }]) } } };
 

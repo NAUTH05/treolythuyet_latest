@@ -1554,3 +1554,102 @@ test('RNG surplus vẫn cố định 15-60 phút', () => {
     assert.ok(value >= 15 && value <= 60, `RNG=${value} ngoài 15-60`);
   }
 });
+
+// ── "Thời gian hoàn thành" của website: metadata hiển thị, KHÔNG quyết định
+//    hoàn thành. null (chưa biết) khác 0 (đã biết là 0). ──
+
+test('_websiteRecordedTime: đổi giờ/phút thành phút, giữ null và 0 chính xác', () => {
+  assert.deepEqual(
+    AutoCourseSession._websiteRecordedTime({ actualStudiedMinutes: 193, actualStudiedText: '3 giờ 13 phút' }),
+    { websiteRecordedMinutes: 193, websiteRecordedText: '3 giờ 13 phút' },
+  );
+  assert.deepEqual(
+    AutoCourseSession._websiteRecordedTime({ actualStudiedMinutes: 884, actualStudiedText: '14 giờ 44 phút' }),
+    { websiteRecordedMinutes: 884, websiteRecordedText: '14 giờ 44 phút' },
+  );
+  // Không có text → CHƯA BIẾT (null), không phải 0.
+  assert.deepEqual(
+    AutoCourseSession._websiteRecordedTime({ actualStudiedMinutes: 0, actualStudiedText: '' }),
+    { websiteRecordedMinutes: null, websiteRecordedText: null },
+  );
+  // Có text "0 giờ 0 phút" → đã biết là 0.
+  assert.deepEqual(
+    AutoCourseSession._websiteRecordedTime({ actualStudiedMinutes: 0, actualStudiedText: '0 giờ 0 phút' }),
+    { websiteRecordedMinutes: 0, websiteRecordedText: '0 giờ 0 phút' },
+  );
+  // Scan lỗi/thiếu text KHÔNG được xoá giá trị hợp lệ cũ.
+  assert.deepEqual(
+    AutoCourseSession._websiteRecordedTime(
+      { actualStudiedMinutes: 0, actualStudiedText: '' },
+      { websiteRecordedMinutes: 193, websiteRecordedText: '3 giờ 13 phút' },
+    ),
+    { websiteRecordedMinutes: 193, websiteRecordedText: '3 giờ 13 phút' },
+  );
+  assert.deepEqual(
+    AutoCourseSession._websiteRecordedTime(null, { websiteRecordedMinutes: 884, websiteRecordedText: '14 giờ 44 phút' }),
+    { websiteRecordedMinutes: 884, websiteRecordedText: '14 giờ 44 phút' },
+  );
+});
+
+test('course detail scan lưu websiteRecordedMinutes/Text và emit status live', async () => {
+  const session = new AutoCourseSession('recorded', { name: 'R', email: 'r@x.vn' });
+  const courseUrl = 'https://x/slides/course-1';
+  const config = { courseUrl, title: 'Cấu tạo', targetHours: 0, targetMinutes: 0 };
+  session.coursesConfig = [config];
+  session._phase = PHASE_RUNNING;
+  session._scanCourseDetailsForCheckpoint = async () => ({
+    courseTitle: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
+    actualStudiedMinutes: 193,
+    actualStudiedText: '3 giờ 13 phút',
+    courseProgressPercent: 25,
+    courseCompletionState: 'incomplete',
+    courseLevelCompleted: false,
+    totalLessons: 5,
+    uncompletedLessons: [{ progressPercent: 52 }],
+    allLessons: [],
+  });
+
+  const statuses = [];
+  session.on('status', snapshot => statuses.push(snapshot));
+
+  const evaluation = await session._evaluateConfiguredCourse(config);
+
+  assert.equal(session.courseProgress[courseUrl].websiteRecordedMinutes, 193);
+  assert.equal(session.courseProgress[courseUrl].websiteRecordedText, '3 giờ 13 phút');
+  assert.equal(session.courseProgress[courseUrl].websiteCourseProgressPercent, 25);
+  assert.equal(session.courseProgress[courseUrl].websiteCourseCompletionState, 'incomplete');
+  assert.equal(evaluation.state, 'incomplete');
+  assert.equal(evaluation.percent, 25);
+  // Live: một snapshot 'status' được phát sau khi ghi, mang đủ dữ liệu mới.
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].courseProgress[courseUrl].websiteRecordedMinutes, 193);
+  assert.equal(statuses[0].courseProgress[courseUrl].websiteCourseProgressPercent, 25);
+});
+
+test('course detail scan thiếu "Thời gian hoàn thành" giữ nguyên giá trị cũ', async () => {
+  const session = new AutoCourseSession('recorded-preserve', { name: 'R', email: 'r@x.vn' });
+  const courseUrl = 'https://x/slides/course-1';
+  const config = { courseUrl, title: 'C1', targetHours: 0, targetMinutes: 0 };
+  session.coursesConfig = [config];
+  session._phase = PHASE_RUNNING;
+  session.courseProgress[courseUrl] = {
+    websiteRecordedMinutes: 884,
+    websiteRecordedText: '14 giờ 44 phút',
+  };
+  session._scanCourseDetailsForCheckpoint = async () => ({
+    courseTitle: 'C1',
+    actualStudiedMinutes: 0,
+    actualStudiedText: '',
+    courseProgressPercent: null,
+    courseCompletionState: 'unknown',
+    courseLevelCompleted: false,
+    totalLessons: 1,
+    uncompletedLessons: [],
+    allLessons: [],
+  });
+
+  await session._evaluateConfiguredCourse(config);
+
+  assert.equal(session.courseProgress[courseUrl].websiteRecordedMinutes, 884);
+  assert.equal(session.courseProgress[courseUrl].websiteRecordedText, '14 giờ 44 phút');
+});

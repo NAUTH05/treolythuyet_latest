@@ -641,8 +641,10 @@ class AutoCourseSession extends EventEmitter {
       : state;
     const targetReached = targetMinutes > 0 ? actualStudiedMinutes >= targetMinutes : true;
 
+    const recorded = AutoCourseSession._websiteRecordedTime(result, existing);
     this.courseProgress[config.courseUrl] = {
       ...existing,
+      ...recorded,
       title: result.courseTitle || existing.title || config.courseUrl,
       targetMinutes,
       // Không để một lần parse lỗi (0 phút) xoá tiến độ đang hiển thị.
@@ -651,6 +653,8 @@ class AutoCourseSession extends EventEmitter {
       websiteCourseCompletionState: preservedState,
       websiteCourseProgressPercent: percent ?? existing.websiteCourseProgressPercent ?? null,
     };
+    // Đẩy trạng thái mới (percent + thời gian website) ra Dashboard ngay.
+    this.emit('status', this.getStatus());
 
     return {
       courseUrl: config.courseUrl,
@@ -882,6 +886,22 @@ class AutoCourseSession extends EventEmitter {
     if (value === null || value === undefined || value === '') return null;
     const number = Number(value);
     return Number.isFinite(number) ? number : null;
+  }
+
+  // Thời gian hoàn thành tích lũy theo WEBSITE ("Thời gian hoàn thành" trên trang
+  // chi tiết khóa). Chỉ là metadata hiển thị — KHÔNG dùng để suy ra hoàn thành.
+  // Scan lỗi/thiếu text → giữ nguyên giá trị hợp lệ cũ, KHÔNG ghi đè bằng null.
+  static _websiteRecordedTime(scan, existing = null) {
+    const prev = existing || {};
+    const preserved = {
+      websiteRecordedMinutes: prev.websiteRecordedMinutes ?? null,
+      websiteRecordedText: prev.websiteRecordedText ?? null,
+    };
+    if (!scan) return preserved;
+    const text = typeof scan.actualStudiedText === 'string' ? scan.actualStudiedText.trim() : '';
+    const minutes = AutoCourseSession._nullableFiniteNumber(scan.actualStudiedMinutes);
+    if (!text || minutes == null || minutes < 0) return preserved;
+    return { websiteRecordedMinutes: minutes, websiteRecordedText: text };
   }
 
   // Phát hiện khóa MỚI chưa từng thấy để log và đánh thức NORMAL.
@@ -1571,8 +1591,10 @@ class AutoCourseSession extends EventEmitter {
     const allLessonsCompleted = verifiedScan.uncompletedLessons.length === 0;
     const confirmed = courseReachedTarget(targetMinutes, verifiedMinutes, allLessonsCompleted);
     const siteCompletionState = AutoCourseSession._courseCompletionStateOf(verifiedScan);
+    const recorded = AutoCourseSession._websiteRecordedTime(verifiedScan, this.courseProgress[courseUrl]);
     this.courseProgress[courseUrl] = {
       ...this.courseProgress[courseUrl],
+      ...recorded,
       title: verifiedScan.courseTitle || courseTitle,
       targetMinutes,
       studiedMinutes: verifiedMinutes,
@@ -2189,15 +2211,20 @@ class AutoCourseSession extends EventEmitter {
         });
 
         let courseStudiedMins = scanResult.actualStudiedMinutes || 0;
+        const recorded = AutoCourseSession._websiteRecordedTime(scanResult, this.courseProgress[cConfig.courseUrl]);
         this.courseProgress[cConfig.courseUrl] = {
+          ...this.courseProgress[cConfig.courseUrl],
+          ...recorded,
           title: scanResult.courseTitle,
           targetMinutes,
           studiedMinutes: courseStudiedMins,
           completed: false,
           websiteCourseCompleted: scanResult.courseLevelCompleted === true,
+          websiteCourseCompletionState: AutoCourseSession._courseCompletionStateOf(scanResult),
           websiteCourseProgressPercent: scanResult.courseProgressPercent ?? null,
           finalizationState: COURSE_FINALIZATION_STATES.NORMAL_STUDY,
         };
+        this.emit('status', this.getStatus());
 
         if (scanResult.actualStudiedText) {
           this.log(`⏱️ Thời gian đã hoàn thành tích lũy trên web: ${scanResult.actualStudiedText} (${courseStudiedMins} phút)`, 'info');
@@ -2766,13 +2793,16 @@ class AutoCourseSession extends EventEmitter {
           if (!this._isRunActive()) return;
           if (recheck) {
             const siteState = AutoCourseSession._courseCompletionStateOf(recheck);
+            const recorded = AutoCourseSession._websiteRecordedTime(recheck, this.courseProgress[cConfig.courseUrl]);
             this.courseProgress[cConfig.courseUrl] = {
               ...this.courseProgress[cConfig.courseUrl],
+              ...recorded,
               title: recheck.courseTitle || scanResult.courseTitle,
               websiteCourseCompleted: siteState === 'completed',
               websiteCourseCompletionState: siteState,
               websiteCourseProgressPercent: recheck.courseProgressPercent ?? null,
             };
+            this.emit('status', this.getStatus());
             if (siteState === 'completed') {
               this.log(`✅ NORMAL Course ${cIdx + 1}/${this.coursesConfig.length} completed`, 'success');
               this.log('   Website confirms: Completed', 'success');

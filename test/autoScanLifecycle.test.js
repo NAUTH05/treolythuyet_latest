@@ -227,3 +227,25 @@ test('applyAutoScanRestoreState kẹp mục tiêu surplus trong 15-60 phút', ()
   applyAutoScanRestoreState(session, { surplusTargetMinutes: 999 });
   assert.equal(session.surplusTargetMinutes, 60);
 });
+
+test('khôi phục state giữ websiteRecordedMinutes/Text và website course state', () => {
+  const courseUrl = 'https://x/slides/course-1';
+  const restored = new AutoCourseSession('restore-recorded', { name: 'R', email: 'r@x.vn' }, []);
+  applyAutoScanRestoreState(restored, {
+    courseProgress: {
+      [courseUrl]: {
+        title: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
+        websiteCourseCompleted: false,
+        websiteCourseCompletionState: 'incomplete',
+        websiteCourseProgressPercent: 25,
+        websiteRecordedMinutes: 193,
+        websiteRecordedText: '3 giờ 13 phút',
+      },
+    },
+  });
+
+  assert.equal(restored.courseProgress[courseUrl].websiteRecordedMinutes, 193);
+  assert.equal(restored.courseProgress[courseUrl].websiteRecordedText, '3 giờ 13 phút');
+  assert.equal(restored.courseProgress[courseUrl].websiteCourseProgressPercent, 25);
+  assert.equal(restored.courseProgress[courseUrl].websiteCourseCompletionState, 'incomplete');
+});

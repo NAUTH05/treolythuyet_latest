@@ -405,6 +405,24 @@ test('badge ẩn + generic "course completed" VISIBLE + 17% → vẫn incomplete
   assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
 });
 
+for (const [hours, minutes, expected] of [[3, 13, 193], [14, 44, 884]]) {
+  test(`"Thời gian hoàn thành" ${hours} giờ ${minutes} phút → ${expected} phút`, async () => {
+    const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course time' });
+    const timeInfo = new FakeNode({ tagName: 'div', textContent: `Thời gian hoàn thành ${hours} giờ ${minutes} phút` });
+    const sidebar = new FakeNode({ tagName: 'div', className: 'o_wslides_course_sidebar', children: [timeInfo] });
+    const root = new FakeNode({ tagName: 'div', children: [h1, sidebar] });
+    const bodyText = `Thời gian hoàn thành ${hours} giờ ${minutes} phút`;
+
+    const result = await scanCourseDetails(
+      scannerPage(makeDocument({ root, h1, bodyText })),
+      `https://x/slides/course-${expected}`,
+    );
+
+    assert.equal(result.actualStudiedMinutes, expected);
+    assert.equal(result.actualStudiedText, `${hours} giờ ${minutes} phút`);
+  });
+}
+
 test('"Thời gian hoàn thành" không bị nhầm thành badge hoàn thành', async () => {
   const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course C' });
   const sidebar = new FakeNode({
