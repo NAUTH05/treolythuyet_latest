@@ -277,8 +277,6 @@ async function scanCourseDetails(page, courseUrl) {
         '[class*="course_info"]',
         'aside',
       ];
-      // Thanh tiến độ cấp khóa có thể nằm ở vùng chính của khóa học.
-      const COURSE_LEVEL_CONTAINER_SELECTORS = [...COURSE_SIDEBAR_SELECTORS, '.o_wslides_course_main'];
       const LESSON_CONTAINER_SELECTOR = 'a[href*="/slides/slide/"], .o_wslides_slides_list, .o_wslides_slides_list_slide, .o_wslides_slide_list_record, .o_wslides_lesson_list';
       const isInsideLessonContainer = (el) => Boolean(el && typeof el.closest === 'function' && el.closest(LESSON_CONTAINER_SELECTOR));
 
@@ -292,7 +290,6 @@ async function scanCourseDetails(page, courseUrl) {
         return found;
       };
       const courseSidebarContainers = collectContainers(COURSE_SIDEBAR_SELECTORS);
-      const courseLevelContainers = collectContainers(COURSE_LEVEL_CONTAINER_SELECTORS);
 
       // So khớp hoàn thành có kiểm soát: "đã hoàn thành" (khác "thời gian hoàn
       // thành"/"chưa hoàn thành") hoặc từ "completed" độc lập.
@@ -328,21 +325,12 @@ async function scanCourseDetails(page, courseUrl) {
         }
       }
 
-      if (!completedMarkerFound) {
-        const explicit = Array.from(document.querySelectorAll(
-          '[data-course-completed="true"], [data-course-completion="100"], [class*="course"][class*="completed"]'
-        )).find(el => !isInsideLessonContainer(el));
-        if (explicit) {
-          completedMarkerFound = true;
-          markerSelector = describeElement(explicit);
-          matchedLabel = String(explicit.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
-          markerSource = 'explicit_completed_marker';
-        }
-      }
-
-      // Ứng viên tiến độ CẤP KHÓA — chỉ trong container cấp khóa, loại trừ bài học
+      // Ứng viên tiến độ CẤP KHÓA — CHỈ trong sidebar khóa học, loại trừ bài học.
+      // KHÔNG dùng fallback selector class chung chung kiểu
+      // [class*="course"][class*="completed"] làm bằng chứng hoàn thành: chúng có
+      // thể khớp widget/template Odoo không liên quan và ghi đè % thật đang hiển thị.
       const progressCandidateEls = [];
-      for (const container of courseLevelContainers) {
+      for (const container of courseSidebarContainers) {
         container.querySelectorAll('[data-course-progress], [data-course-completion], [role="progressbar"], .o_wslides_progress_bar, [class*="progress"]').forEach(el => {
           if (isInsideLessonContainer(el)) return;
           if (!progressCandidateEls.includes(el)) progressCandidateEls.push(el);

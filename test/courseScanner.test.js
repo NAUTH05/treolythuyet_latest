@@ -217,6 +217,58 @@ test('thanh tiến độ cấp khóa tường minh 80% → incomplete', async ()
   assert.equal(result.courseCompletionSource, 'aria-valuenow');
 });
 
+test('sidebar 17% + class "course completed" ngoài sidebar → KHÔNG được nhận completed', async () => {
+  const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course chưa xong' });
+  const bar = new FakeNode({ tagName: 'div', className: 'progress', textContent: '17%' });
+  const sidebar = new FakeNode({
+    tagName: 'aside',
+    className: 'o_wslides_course_sidebar',
+    children: [bar],
+  });
+  // Phần tử không liên quan (widget/template Odoo) khớp selector rộng
+  // [class*="course"][class*="completed"] — từng gây false positive production.
+  const unrelated = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_course_completed widget',
+    textContent: 'Completed',
+  });
+  const root = new FakeNode({ tagName: 'div', children: [h1, sidebar, unrelated] });
+
+  const result = await scanCourseDetails(scannerPage(makeDocument({ root, h1 })), 'https://x/slides/course-d');
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseProgressPercent, 17);
+  assert.equal(result.courseCompletionEvidence.completedMarkerFound, false);
+});
+
+test('lesson 52%/0% KHÔNG thay thế tiến độ cấp khóa 17% trong sidebar', async () => {
+  const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course mixed' });
+  const bar = new FakeNode({ tagName: 'div', className: 'progress', textContent: '17%' });
+  const lessons = new FakeNode({
+    tagName: 'ul',
+    className: 'o_wslides_slides_list',
+    children: [
+      lessonLink('/slides/slide/l1-201', 'Lesson 1', 52).li,
+      lessonLink('/slides/slide/l2-202', 'Lesson 2', 0).li,
+      lessonLink('/slides/slide/l3-203', 'Lesson 3', 0).li,
+    ],
+  });
+  const sidebar = new FakeNode({
+    tagName: 'aside',
+    className: 'o_wslides_course_sidebar',
+    children: [bar, lessons],
+  });
+  const root = new FakeNode({ tagName: 'div', children: [h1, sidebar] });
+
+  const result = await scanCourseDetails(scannerPage(makeDocument({ root, h1 })), 'https://x/slides/course-e');
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseProgressPercent, 17);
+  assert.equal(result.allLessons.length, 3);
+  assert.equal(result.uncompletedLessons.length, 3);
+});
+
 test('"Thời gian hoàn thành" không bị nhầm thành badge hoàn thành', async () => {
   const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course C' });
   const sidebar = new FakeNode({
