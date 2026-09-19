@@ -1,3 +1,5 @@
+require('../config/env');
+
 const crypto = require('crypto');
 const firebase = require('../firebase-service');
 

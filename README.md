@@ -88,14 +88,24 @@ Expected branch output is test_dev. Never deploy, merge, rebase, or reset main o
 
 ## Install Dependencies
 
-Both lockfiles are required:
+The repository has two npm projects: the root server and the `client/` frontend. Both lockfiles are required.
 
 ~~~bash
 npm ci
-cd client && npm ci && cd ..
+npm run install:client
 ~~~
 
-npm ci reproduces the locked dependency tree. Do not delete or regenerate lockfiles during deployment.
+`npm ci` installs the root/server dependency tree reproducibly. `npm run install:client` runs `npm --prefix client ci` and installs the frontend tree, which is where Vite lives. Do not delete or regenerate either lockfile during deployment.
+
+`npm run build` also runs the client install automatically (see below), so a normal production flow cannot fail with `vite: not found` just because the separate frontend tree was forgotten.
+
+The single-command equivalent after the root install is:
+
+~~~bash
+npm run setup
+~~~
+
+`npm run setup` runs the client install, the Vite build, and the Playwright Chromium install.
 
 ## Install Playwright
 
@@ -106,7 +116,7 @@ npx playwright install-deps chromium
 npm run install-browser
 ~~~
 
-The script runs npx playwright install chromium. The launcher is headless and uses --no-sandbox, --disable-setuid-sandbox, and --disable-dev-shm-usage.
+The script runs npx playwright install chromium. The launcher is headless and uses --no-sandbox, --disable-setuid-sandbox, and --disable-dev-shm-usage. `npm run setup` includes this step.
 
 ## Firebase Configuration
 
@@ -168,6 +178,35 @@ FIREBASE_SERVICE_ACCOUNT_FILE=/etc/treolythuyet/firebase-service-account.json
 FIREBASE_USE_APPLICATION_DEFAULT=false
 ~~~
 
+### How environment configuration is loaded
+
+`.env` is loaded once by the centralized bootstrap in `config/env.js`, which resolves the file with an absolute path from the repository location and is required at the very top of `server.js`, `index.js`, and `scripts/verifyFirebaseAdmin.js`. It is not loaded inside low-level modules, so behavior no longer depends on which module happens to be required first, and it works regardless of the shell working directory (including under PM2).
+
+Real process environment variables always win over `.env`; dotenv is called without `override`. `NODE_ENV` is set to `production` by `ecosystem.config.js`, while `PORT` and all secrets come from `.env` (or the real environment). PM2 deliberately does not copy `ADMIN_PASSWORD`, `FIREBASE_SERVICE_ACCOUNT_FILE`, or `PORT` into `env`, because PM2 evaluates `ecosystem.config.js` before `.env` exists and would otherwise inject empty strings that shadow the real values.
+
+In production, `server.js` fails fast with a clear `[CONFIG]` error if `ADMIN_PASSWORD` is missing. Every startup also prints a secret-free summary:
+
+~~~text
+[CONFIG] NODE_ENV=production
+[CONFIG] PORT=3000
+[CONFIG] ADMIN_PASSWORD=set
+[CONFIG] FIREBASE_SERVICE_ACCOUNT_FILE=set
+~~~
+
+### Verify Environment Safely
+
+Confirm that `.env` is being read without printing any secret value:
+
+~~~bash
+node -e "require('./config/env'); console.log({
+  adminPasswordSet: Boolean(process.env.ADMIN_PASSWORD),
+  port: process.env.PORT,
+  firebaseFileSet: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_FILE)
+})"
+~~~
+
+The expected output is `adminPasswordSet: true`, the configured `port`, and `firebaseFileSet: true`. Never echo `.env` contents.
+
 ## File Permissions
 
 Runtime writes are:
@@ -192,7 +231,13 @@ Never use chmod -R 777.
 npm run build
 ~~~
 
-This runs cd client && npm run build and writes Vite output to public/, which Express serves at /.
+This runs `npm run install:client` (`npm --prefix client ci`) and then `npm run build:client` (`npm --prefix client run build`). Vite writes the SPA to the repository-root `public/` directory, which Express serves at `/` through `express.static(path.join(__dirname, 'public'))`. The output path is resolved from `client/vite.config.js` with an absolute path derived from the config location, so it never depends on the shell working directory. The generated entrypoint is `public/index.html`.
+
+Verify the build landed where the server serves it:
+
+~~~bash
+test -f public/index.html && echo "public/index.html present"
+~~~
 
 ## Verify Installation
 
@@ -236,7 +281,25 @@ pm2 delete treoweb
 pm2 monit
 ~~~
 
-The exact PM2 name is treoweb; the checked-in config runs server.js, autorestarts, and writes the two PM2 log files.
+The exact PM2 name is treoweb; the checked-in config runs `server.js` with `cwd` set to the repository root, autorestarts, and writes the two PM2 log files. It sets only `NODE_ENV=production` and intentionally does not pass secrets.
+
+Because `server.js` loads `.env` itself on every process start, changing `.env` and running a normal restart is enough:
+
+~~~bash
+pm2 restart treoweb
+~~~
+
+Use `--update-env` only when the values PM2 itself injects change, for example after editing `ecosystem.config.js`:
+
+~~~bash
+pm2 restart treoweb --update-env
+~~~
+
+After editing `ecosystem.config.js` itself, reload the config file:
+
+~~~bash
+pm2 startOrReload ecosystem.config.js --update-env
+~~~
 
 ## PM2 Startup After Reboot
 
@@ -361,22 +424,22 @@ HTTP may redirect to HTTPS. Open exactly https://lythuyet.mrnauthdev.dpdns.org, 
 Root scripts:
 
 - npm test: Node built-in test suite.
-- npm run build: client build.
+- npm run install:client: install the client dependency tree with `npm --prefix client ci`.
+- npm run build:client: run the client build only.
+- npm run build: install client deps, then build the client.
+- npm run setup: build, then install Playwright Chromium.
 - npm run verify:firebase-admin: Firebase Admin read/write verification.
 - npm run install-browser: Chromium installation.
 - npm start and npm run dev: start server.js.
 - npm run cli: CLI entry (requires arguments).
 - npm run dev:client: Vite dev server on 5173.
-- npm run setup: install/build/browser setup.
 
 Client scripts:
 
 ~~~bash
-cd client
-npm run lint
-npm run build
-npm run preview
-cd ..
+npm --prefix client run lint
+npm --prefix client run build
+npm --prefix client run preview
 ~~~
 
 There is no root npm run lint.
@@ -389,12 +452,14 @@ git fetch origin
 git checkout test_dev
 git pull --ff-only origin test_dev
 npm ci
-cd client && npm ci && cd ..
-npm run install-browser
 npm run build
 npm test
+# Only when dependencies or Playwright changed:
+npm run install-browser
 pm2 restart treoweb
 ~~~
+
+`npm run build` installs the client dependency tree before building, so a plain `npm ci && npm run build` is sufficient for frontend changes. `pm2 restart treoweb` re-reads `.env` because the application loads it on startup; `--update-env` is not required for `.env` changes.
 
 Never switch to or merge main.
 
@@ -406,9 +471,8 @@ git log -1 --oneline
 pm2 stop treoweb
 git checkout <previous-test-dev-commit>
 npm ci
-cd client && npm ci && cd ..
 npm run build
-pm2 start treoweb
+pm2 restart treoweb
 ~~~
 
 This checks out a detached commit. Return with git checkout test_dev. Avoid git reset --hard because it discards uncommitted files.
@@ -501,6 +565,7 @@ Never commit .env, Firebase credentials, passwords, API keys, private keys, acce
 | autoCourseRegistry.js | Auto-Scan ownership/timers. |
 | courseScanner.js | Course/date/time helpers. |
 | firebase-service.js | Firebase Admin/Firestore. |
+| config/env.js | Centralized `.env` bootstrap, PORT validation, and secret-free startup diagnostics. |
 | stateSync.js | Serialized state synchronization. |
 | ecosystem.config.js | PM2 configuration. |
 | client/ | React/Vite source and lockfile. |
@@ -515,11 +580,11 @@ Never commit .env, Firebase credentials, passwords, API keys, private keys, acce
 1. Install required packages and Node 20 using the commands above.
 2. Clone https://github.com/NAUTH05/treolythuyet_latest.git into /opt/treolythuyet.
 3. Run git checkout test_dev, git branch --show-current, and git log -1 --oneline.
-4. Run npm ci, then run cd client && npm ci && cd ..
-5. Run npx playwright install-deps chromium and npm run install-browser.
+4. Run npm ci, then run npm run setup (installs the client dependency tree, builds the Vite SPA into public/, and installs Playwright Chromium).
+5. Run npx playwright install-deps chromium if the Linux browser libraries are missing.
 6. Put Firebase JSON under /etc/treolythuyet/, create .env, and set ADMIN_PASSWORD, PORT, and one Firebase credential method.
 7. Set secure ownership/modes and run npm run verify:firebase-admin.
-8. Run npm run build and npm test.
+8. Run npm test to confirm the backend test suite passes.
 9. Run npm start; test curl -I http://127.0.0.1:3000/; stop with Ctrl+C.
 10. Install PM2, run pm2 start ecosystem.config.js, and verify pm2 status.
 11. Run pm2 save and pm2 startup, execute PM2's printed command, reboot, and verify.

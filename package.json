@@ -8,11 +8,13 @@
     "test": "node --test --test-concurrency=1",
     "cli": "node index.js",
     "dev": "node server.js",
-    "dev:client": "cd client && npm run dev",
-    "build": "cd client && npm run build",
+    "dev:client": "npm --prefix client run dev",
+    "install:client": "npm --prefix client ci",
+    "build:client": "npm --prefix client run build",
+    "build": "npm run install:client && npm run build:client",
     "verify:firebase-admin": "node scripts/verifyFirebaseAdmin.js",
     "install-browser": "npx playwright install chromium",
-    "setup": "npm install && cd client && npm install && npm run build && cd .. && npx playwright install chromium"
+    "setup": "npm run build && npm run install-browser"
   },
   "dependencies": {
     "chalk": "^4.1.2",

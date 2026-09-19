@@ -1,3 +1,5 @@
+require('./config/env');
+
 const yargs = require('yargs');
 const chalk = require('chalk');
 const { BotSession } = require('./bot');
