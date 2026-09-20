@@ -694,8 +694,16 @@ function makeSurplusSession({
   rngSequence = null,
   dailyMaxMinutes = 480,
   progressPerMinute = 4,
+  surplusStrategy = 'legacy-random',
+  extraOptions = {},
 }) {
-  const session = new AutoCourseSession(id, { name: id }, courses, { dailyMaxMinutes });
+  const session = new AutoCourseSession(id, { name: id }, courses, {
+    dailyMaxMinutes,
+    // Các test này kiểm tra cơ chế RNG legacy (15-60) một cách tường minh, vì
+    // default production giờ là phân bổ theo năng lực lịch còn lại.
+    surplusStrategy,
+    ...extraOptions,
+  });
   session._phase = PHASE_RUNNING;
   session.context = {};
   session._fakeVisibilityAPI = async () => {};
@@ -1653,3 +1661,56 @@ test('course detail scan thiếu "Thời gian hoàn thành" giữ nguyên giá t
   assert.equal(session.courseProgress[courseUrl].websiteRecordedMinutes, 884);
   assert.equal(session.courseProgress[courseUrl].websiteRecordedText, '14 giờ 44 phút');
 });
+
+// ── SURPLUS THEO NĂNG LỰC LỊCH (chiến lược 'schedule', default mới) ──
+
+test('schedule strategy: chia đều năng lực còn lại, không dùng RNG', async () => {
+  const courses = [
+    { courseUrl: 'https://x/c1', targetMinutes: 0 },
+    { courseUrl: 'https://x/c2', targetMinutes: 0 },
+  ];
+  const website = makeWebsite(courses);
+  const { session } = makeSurplusSession({
+    id: 'surplus-schedule-share',
+    courses,
+    website,
+    surplusStrategy: 'schedule',
+    dailyMaxMinutes: 480,
+  });
+  assert.equal(await session._initializeSurplusMode(), true);
+  assert.equal(session.surplusCourseStates[courses[0].courseUrl].targetMinutes, 240);
+  assert.equal(session.surplusCourseStates[courses[1].courseUrl].targetMinutes, 240);
+  assert.equal(session.surplusPlan.totalMinutes, 480);
+  assert.equal(session.surplusPlan.hasFiniteHorizon, false);
+});
+
+test('schedule strategy: khóa kiệt khẩu → năng lực chưa dùng dồn cho khóa còn lại', async () => {
+  const courses = [
+    { courseUrl: 'https://x/c1', targetMinutes: 0 },
+    { courseUrl: 'https://x/c2', targetMinutes: 0 },
+  ];
+  const website = {
+    'https://x/c1': { title: 'C1', minutes: 60, lessons: [{ title: 'L1', url: 'https://x/c1/l1', progressPercent: 100 }] },
+    'https://x/c2': { title: 'C2', minutes: 60, lessons: [{ title: 'L2', url: 'https://x/c2/l2', progressPercent: 0 }] },
+  };
+  const { session } = makeSurplusSession({
+    id: 'surplus-schedule-redistribute',
+    courses,
+    website,
+    surplusStrategy: 'schedule',
+    dailyMaxMinutes: 480,
+  });
+  await session._initializeSurplusMode();
+  session._waitForActiveStudyTime = async (ms) => {
+    website['https://x/c2'].minutes += ms / 60000;
+    return ms;
+  };
+  await session._runSurplusStudy();
+
+  assert.equal(session.surplusCourseStates['https://x/c1'].exhausted, true, 'C1 hết bài → kiệt khẩu');
+  assert.ok(
+    session.surplusCourseStates['https://x/c2'].targetMinutes >= 479,
+    `C2 phải nhận lại năng lực chưa dùng (nhận ${session.surplusCourseStates['https://x/c2'].targetMinutes})`
+  );
+});
+

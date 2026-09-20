@@ -15,6 +15,9 @@ const LEVEL_LABELS = {
   error: 'Lỗi',
 };
 
+const PAGE_SIZE = 200;      // mỗi lần tải
+const MAX_RENDER = 2000;    // trần số dòng giữ trong DOM sau khi trộn realtime
+
 function vnDateDDMMYYYY(d = new Date()) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Asia/Ho_Chi_Minh',
@@ -36,12 +39,24 @@ function normalizeLogDate(value) {
   return '';
 }
 
+// Khóa ổn định để trộn realtime + lịch sử mà không trùng (khớp logQuery.logEntryKey).
+function logKey(entry) {
+  if (entry && entry.id) return String(entry.id);
+  const e = entry || {};
+  return `${e.date || ''}|${e.timestamp || ''}|${e.account || 'system'}|${e.level || 'info'}|${e.msg || ''}`;
+}
+
 export default function LogPanel({ logs: liveLogs = [], onClear }) {
   const boxRef = useRef(null);
   const [folders, setFolders] = useState([]);
   const [selectedDate, setSelectedDate] = useState(() => vnDateDDMMYYYY());
-  const [dateLogs, setDateLogs] = useState([]);
+  // loadedLogs giữ thứ tự thời gian (cũ → mới). Trang mới (cũ hơn) được chèn lên đầu.
+  const [loadedLogs, setLoadedLogs] = useState([]);
+  const [nextCursor, setNextCursor] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
 
   // Bộ lọc
@@ -53,78 +68,90 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
   const todayStr = vnDateDDMMYYYY();
   const isTodaySelected = selectedDate === todayStr;
 
-  // Tải danh sách thư mục ngày từ backend
-  const loadFolders = useCallback(async () => {
+  const loadDates = useCallback(async () => {
     try {
-      const list = await api.fetchLogFolders();
-      if (Array.isArray(list)) {
-        setFolders(list);
-        // Nếu ngày đang chọn không có trong list và chưa có folder nào, giữ nguyên todayStr
-        if (!selectedDate && list.length > 0) {
-          setSelectedDate(list[0].date);
-        }
-      }
+      const list = await api.fetchLogDates();
+      if (Array.isArray(list)) setFolders(list);
     } catch (e) {
-      console.error('Không thể tải danh sách folder log:', e.message);
+      console.error('Không thể tải danh sách ngày log:', e.message);
     }
-  }, [selectedDate]);
+  }, []);
 
-  // Tải logs theo ngày đã chọn
-  const loadLogsForDate = useCallback(async (date) => {
+  // Tải trang ĐẦU (mới nhất) cho ngày + bộ lọc hiện tại.
+  const loadFirstPage = useCallback(async (date, account, level) => {
     if (!date) return;
     setLoading(true);
     try {
-      const res = await api.fetchLogsByDate(date);
-      if (res && Array.isArray(res.logs)) {
-        setDateLogs(res.logs);
-      } else {
-        setDateLogs([]);
-      }
+      const res = await api.fetchLogHistory({ date, account, level, limit: PAGE_SIZE });
+      const rows = res && Array.isArray(res.logs) ? res.logs : [];
+      setLoadedLogs(rows.slice().reverse());
+      setNextCursor(res ? res.nextCursor : null);
+      setHasMore(Boolean(res && res.hasMore));
+      setTotal(res && Number.isFinite(res.total) ? res.total : rows.length);
     } catch (e) {
       console.error(`Không thể tải log ngày ${date}:`, e.message);
-      setDateLogs([]);
+      setLoadedLogs([]);
+      setNextCursor(null);
+      setHasMore(false);
+      setTotal(0);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => {
-    loadFolders();
-  }, [loadFolders]);
-
-  useEffect(() => {
-    loadLogsForDate(selectedDate);
-  }, [selectedDate, loadLogsForDate]);
-
-  // Tổng hợp danh sách log để hiển thị
-  // Nếu đang chọn ngày hôm nay: ưu tiên hợp nhất `liveLogs` với `dateLogs`
-  const currentLogs = useMemo(() => {
-    if (isTodaySelected) {
-      if (liveLogs.length > 0) {
-        // Map theo unique key
-        const map = new Map();
-        const todayLiveLogs = liveLogs.filter(item => {
-          const itemDate = normalizeLogDate(item.date);
-          return !itemDate || itemDate === todayStr;
-        });
-        [...dateLogs, ...todayLiveLogs].forEach(item => {
-          const key = `${item.timestamp}_${item.account}_${item.msg}`;
-          map.set(key, item);
-        });
-        return Array.from(map.values());
-      }
-      return dateLogs;
+  // Tải thêm trang CŨ hơn và chèn lên đầu danh sách thời gian.
+  const loadMore = useCallback(async () => {
+    if (!hasMore || nextCursor == null || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const res = await api.fetchLogHistory({
+        date: selectedDate,
+        account: filterAccount,
+        level: filterLevel,
+        limit: PAGE_SIZE,
+        cursor: nextCursor,
+      });
+      const rows = res && Array.isArray(res.logs) ? res.logs : [];
+      setLoadedLogs(prev => [...rows.slice().reverse(), ...prev]);
+      setNextCursor(res ? res.nextCursor : null);
+      setHasMore(Boolean(res && res.hasMore));
+    } catch (e) {
+      console.error('Không thể tải thêm log:', e.message);
+    } finally {
+      setLoadingMore(false);
     }
-    return dateLogs;
-  }, [isTodaySelected, liveLogs, dateLogs, todayStr]);
+  }, [hasMore, nextCursor, loadingMore, selectedDate, filterAccount, filterLevel]);
 
-  // Trích xuất danh sách tài khoản xuất hiện trong log hiện tại
-  const accountList = useMemo(
-    () => [...new Set(currentLogs.map(l => l.account).filter(Boolean))].sort(),
-    [currentLogs]
-  );
+  useEffect(() => {
+    loadDates();
+  }, [loadDates]);
 
-  // Đếm theo từng cấp độ log
+  // Ngày hoặc bộ lọc đổi → tải lại trang đầu (lọc CHẠY Ở SERVER, không lọc ở React).
+  useEffect(() => {
+    loadFirstPage(selectedDate, filterAccount, filterLevel);
+  }, [selectedDate, filterAccount, filterLevel, loadFirstPage]);
+
+  // Trộn realtime (chỉ khi xem hôm nay) với lịch sử, dedupe theo id/khóa.
+  const currentLogs = useMemo(() => {
+    if (!isTodaySelected || liveLogs.length === 0) return loadedLogs;
+    const map = new Map();
+    for (const entry of loadedLogs) map.set(logKey(entry), entry);
+    for (const entry of liveLogs) {
+      const itemDate = normalizeLogDate(entry && entry.date);
+      if (itemDate && itemDate !== todayStr) continue;
+      map.set(logKey(entry), entry);
+    }
+    const merged = [...map.values()];
+    return merged.length > MAX_RENDER ? merged.slice(-MAX_RENDER) : merged;
+  }, [isTodaySelected, liveLogs, loadedLogs, todayStr]);
+
+  // Danh sách tài khoản: ưu tiên metadata server cho ngày đang chọn.
+  const accountList = useMemo(() => {
+    const fromMeta = folders.find(f => f.date === selectedDate)?.accounts;
+    if (Array.isArray(fromMeta) && fromMeta.length > 0) return [...fromMeta].sort();
+    return [...new Set(currentLogs.map(l => l.account).filter(Boolean))].sort();
+  }, [folders, selectedDate, currentLogs]);
+
   const levelCounts = useMemo(() => {
     const counts = { error: 0, warn: 0, success: 0, info: 0 };
     currentLogs.forEach(l => {
@@ -134,83 +161,91 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
     return counts;
   }, [currentLogs]);
 
-  // Filter logs theo tiêu chí
+  // Chỉ tìm kiếm từ khóa trên các dòng đã tải (giới hạn trong bộ nhớ).
   const filteredLogs = useMemo(() => {
+    if (!searchQuery) return currentLogs;
+    const query = searchQuery.toLowerCase();
     return currentLogs.filter(l => {
-      if (filterAccount && l.account !== filterAccount) return false;
-      if (filterLevel && l.level !== filterLevel) return false;
-      if (searchQuery) {
-        const query = searchQuery.toLowerCase();
-        const msg = (l.msg || '').toLowerCase();
-        const acc = (l.account || '').toLowerCase();
-        if (!msg.includes(query) && !acc.includes(query)) return false;
-      }
-      return true;
+      const msg = (l.msg || '').toLowerCase();
+      const acc = (l.account || '').toLowerCase();
+      return msg.includes(query) || acc.includes(query);
     });
-  }, [currentLogs, filterAccount, filterLevel, searchQuery]);
+  }, [currentLogs, searchQuery]);
 
-  // Auto scroll xuống cuối nếu bật
   useEffect(() => {
     if (autoScroll && boxRef.current) {
       boxRef.current.scrollTop = boxRef.current.scrollHeight;
     }
   }, [filteredLogs, autoScroll]);
 
-  // Xóa folder log của ngày đang chọn
   const handleDeleteCurrentFolder = async () => {
     if (!window.confirm(`Bạn có chắc chắn muốn xóa toàn bộ log của ngày ${selectedDate}?`)) return;
     try {
       await api.deleteLogFolder(selectedDate);
       if (onClear && isTodaySelected) onClear();
-      setDateLogs([]);
-      await loadFolders();
+      setLoadedLogs([]);
+      setNextCursor(null);
+      setHasMore(false);
+      setTotal(0);
+      await loadDates();
     } catch (e) {
       alert('Không thể xóa folder log: ' + e.message);
     }
   };
 
-  // Export file log
-  const handleExport = (type = 'txt') => {
-    if (filteredLogs.length === 0) return;
-    let content = '';
-    let mime = 'text/plain';
-    let ext = 'txt';
+  // Export lấy dữ liệu TƯỜNG MINH từ server (trả toàn bộ ngày) rồi áp từ khóa.
+  const handleExport = async (type = 'txt') => {
+    try {
+      const data = await api.fetchLogExport({
+        date: selectedDate,
+        account: filterAccount,
+        level: filterLevel,
+      });
+      let rows = data && Array.isArray(data.logs) ? data.logs : [];
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        rows = rows.filter(l => (l.msg || '').toLowerCase().includes(q) || (l.account || '').toLowerCase().includes(q));
+      }
+      if (rows.length === 0) return;
 
-    if (type === 'json') {
-      content = JSON.stringify(filteredLogs, null, 2);
-      mime = 'application/json';
-      ext = 'json';
-    } else {
-      content = filteredLogs
-        .map(l => l.level === 'separator'
-          ? l.msg
-          : `[${l.timestamp}] [${l.account || 'system'}] [${(l.level || 'info').toUpperCase()}] ${l.msg}`)
-        .join('\n');
+      let content = '';
+      let mime = 'text/plain';
+      let ext = 'txt';
+      if (type === 'json') {
+        content = JSON.stringify(rows, null, 2);
+        mime = 'application/json';
+        ext = 'json';
+      } else {
+        content = rows
+          .map(l => l.level === 'separator'
+            ? l.msg
+            : `[${l.timestamp}] [${l.account || 'system'}] [${(l.level || 'info').toUpperCase()}] ${l.msg}`)
+          .join('\n');
+      }
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `logs_${selectedDate}_${new Date().getTime()}.${ext}`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('Không thể export log: ' + e.message);
     }
-
-    const blob = new Blob([content], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `logs_${selectedDate}_${new Date().getTime()}.${ext}`;
-    a.click();
-    URL.revokeObjectURL(url);
   };
 
   return (
     <div className="card log-container-advanced">
-      {/* Header bar tổng quan */}
       <div className="card-header log-header-bar">
         <div className="log-header-title">
           <span>📁 Thư mục Logs</span>
           <span className="log-badge-count">{folders.length} ngày</span>
         </div>
 
-        {/* Action quick buttons */}
         <div className="log-header-actions">
           <button
             className="btn btn-sm btn-outline"
-            onClick={() => { loadFolders(); loadLogsForDate(selectedDate); }}
+            onClick={() => { loadDates(); loadFirstPage(selectedDate, filterAccount, filterLevel); }}
             title="Làm mới danh sách"
           >
             🔄 Làm mới
@@ -245,7 +280,6 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
       </div>
 
       <div className="log-workspace">
-        {/* CỘT TRÁI: Thư mục theo ngày DD-MM-YYYY */}
         <aside className="log-folder-sidebar">
           <div className="log-folder-header">
             <span>Danh sách ngày</span>
@@ -276,11 +310,8 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
           </div>
         </aside>
 
-        {/* CỘT PHẢI: Nội dung log & Bộ lọc */}
         <main className="log-main-content">
-          {/* Thanh Filter Đầy Đủ */}
           <div className="log-filter-toolbar">
-            {/* Đổi nhanh thư mục date trong dropdown */}
             <div className="filter-group">
               <label>Ngày:</label>
               <select
@@ -296,7 +327,6 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
               </select>
             </div>
 
-            {/* Lọc theo tài khoản */}
             <div className="filter-group">
               <label>Tài khoản:</label>
               <select
@@ -311,7 +341,6 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
               </select>
             </div>
 
-            {/* Lọc theo Trạng thái / Level */}
             <div className="filter-group">
               <label>Trạng thái:</label>
               <select
@@ -327,18 +356,16 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
               </select>
             </div>
 
-            {/* Tìm kiếm từ khóa */}
             <div className="filter-group search-input-group">
               <input
                 type="text"
-                placeholder="🔍 Tìm từ khóa / nội dung log..."
+                placeholder="🔍 Tìm trong các dòng đã tải..."
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
                 className="input-sm"
               />
             </div>
 
-            {/* Reset Filter */}
             {(filterAccount || filterLevel || searchQuery) && (
               <button
                 className="btn btn-sm btn-ghost"
@@ -353,7 +380,6 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
               </button>
             )}
 
-            {/* Auto scroll toggle */}
             <label className="checkbox-auto-scroll" title="Tự động cuộn xuống khi có log mới">
               <input
                 type="checkbox"
@@ -364,8 +390,15 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
             </label>
           </div>
 
-          {/* Log Display Box */}
           <div className="log-body-container">
+            {hasMore && (
+              <div style={{ textAlign: 'center', padding: '6px 0' }}>
+                <button className="btn btn-sm btn-outline" onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? 'Đang tải...' : '↑ Tải thêm (cũ hơn)'}
+                </button>
+              </div>
+            )}
+
             <div className="log-box-advanced" ref={boxRef}>
               {loading ? (
                 <div className="empty" style={{ padding: '30px 0' }}>
@@ -377,11 +410,11 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
                 </div>
               ) : (
                 filteredLogs.map((entry, i) => entry.level === 'separator' ? (
-                  <div key={i} className="log-session-separator" aria-label={`Bắt đầu session ${entry.account || ''}`}>
+                  <div key={logKey(entry) + i} className="log-session-separator" aria-label={`Bắt đầu session ${entry.account || ''}`}>
                     {entry.msg}
                   </div>
                 ) : (
-                  <div key={i} className="log-line">
+                  <div key={logKey(entry) + i} className="log-line">
                     <span className="log-time">{entry.timestamp}</span>{' '}
                     <span className="log-account">[{entry.account || 'system'}]</span>{' '}
                     <span className={`log-level-tag ${entry.level || 'info'}`}>
@@ -393,9 +426,11 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
               )}
             </div>
 
-            {/* Footer tóm tắt số lượng */}
             <div className="log-status-footer">
-              <span>Hiển thị <strong>{filteredLogs.length}</strong> / <strong>{currentLogs.length}</strong> dòng log</span>
+              <span>
+                Hiển thị <strong>{filteredLogs.length}</strong> / <strong>{total}</strong> dòng
+                {hasMore ? ' (còn dữ liệu cũ hơn)' : ''}
+              </span>
               {isTodaySelected && (
                 <span className="live-pulse" title="Đang nhận log trực tiếp từ Socket.io">
                   🔴 Live Stream

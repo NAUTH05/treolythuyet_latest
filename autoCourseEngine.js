@@ -1,6 +1,12 @@
 const { chromium } = require('playwright');
 const EventEmitter = require('events');
 const { isAllowedStudyDate, getNextAllowedStudyDate, scanCourseDetails, scanMyCoursesCompletion, readDomTimer, getShiftsForDate, calcMsRemainingInShift, getNextShiftStart } = require('./courseScanner');
+const {
+  normalizeSurplusOptions,
+  surplusTargetBounds,
+  planSurplusCapacity,
+  allocateSurplusTargets,
+} = require('./autoScanSurplus');
 
 const BASE_URL = 'https://hoclythuyetlaixe.eco-tek.com.vn';
 const LOGIN_URL = `${BASE_URL}/web/login`;
@@ -18,8 +24,9 @@ const COURSE_DISCOVERY_RETRY_MINUTES = 10;
 const DISCOVERY_RETRY_STATUS = 'discovery-retry';
 
 // ── SURPLUS (học thừa) ──
-// Mỗi khóa được cấp MỘT mục tiêu RNG riêng trong khoảng 15-60 phút. Khóa được
-// xử lý TUẦN TỰ theo đúng thứ tự coursesConfig, không chọn ngẫu nhiên.
+// Chiến lược MẶC ĐỊNH mới: dùng phần năng lực học còn lại trước khi hết lịch và
+// chia đều cho các khóa còn dùng được (xem autoScanSurplus.js). Chế độ
+// 'legacy-random' (mục tiêu RNG 15-60 mỗi khóa) vẫn được giữ để tương thích.
 const SURPLUS_TARGET_MIN_MINUTES = 15;
 const SURPLUS_TARGET_MAX_MINUTES = 60;
 const SURPLUS_MIN_BLOCK_MINUTES = 5;
@@ -115,11 +122,11 @@ function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted 
   return target > 0 ? studied >= target : allLessonsCompleted;
 }
 
-function createCourseFinalizationPlan(existingPlan, lessonRemainingMs, elapsedMs = 0) {
+function createCourseFinalizationPlan(existingPlan, lessonRemainingMs, elapsedMs = 0, graceMinutes = POST_TARGET_GRACE_MINUTES) {
   if (existingPlan) return existingPlan;
 
   const remainingMs = Math.max(0, Number(lessonRemainingMs) || 0);
-  const graceMs = POST_TARGET_GRACE_MINUTES * 60 * 1000;
+  const graceMs = Math.max(0, Number(graceMinutes) || 0) * 60 * 1000;
   const allowanceMs = Math.min(remainingMs, graceMs);
 
   return Object.freeze({
@@ -141,6 +148,7 @@ function isAutoCourseAccountBlockingStatus(status) {
 }
 
 function getPersistentAutoCourseOptions(options = {}) {
+  const surplus = normalizeSurplusOptions(options);
   return {
     dailyMaxMinutes: options.dailyMaxMinutes ?? 480,
     allowedDateRanges: options.allowedDateRanges || [],
@@ -158,6 +166,13 @@ function getPersistentAutoCourseOptions(options = {}) {
     initialDailyMinutesToggle: options.initialDailyMinutesToggle === true,
     initialDailyMinutes: options.initialDailyMinutes || 0,
     initialDailyDate: options.initialDailyDate || null,
+    // Tham số vận hành an toàn (surplus/retry/grace) — persist để sống qua restart.
+    surplusStrategy: surplus.surplusStrategy,
+    surplusMinBlockMinutes: surplus.surplusMinBlockMinutes,
+    surplusMaxUnconfirmedAttempts: surplus.surplusMaxUnconfirmedAttempts,
+    courseDiscoveryRetryMinutes: surplus.courseDiscoveryRetryMinutes,
+    postTargetGraceMinutes: surplus.postTargetGraceMinutes,
+    surplusMaxPerCourseMinutes: surplus.surplusMaxPerCourseMinutes,
   };
 }
 
@@ -214,8 +229,13 @@ class AutoCourseSession extends EventEmitter {
     this.knownCourseKeys = Array.isArray(options.knownCourseKeys) ? [...new Set(options.knownCourseKeys)] : [];
     this._discoveryValid = false;
     this.surplusMode = Boolean(options.surplusMode);
+    // Tham số vận hành an toàn (đã chuẩn hoá) — không tin FE, không tin document cũ.
+    this.surplusOptions = normalizeSurplusOptions(options);
     // Trạng thái surplus theo TỪNG KHÓA (nguồn chân lý mới). Xem _surplusStateFor().
-    this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(options.surplusCourseStates);
+    this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(
+      options.surplusCourseStates,
+      surplusTargetBounds(this.surplusOptions)
+    );
     this.surplusCurrentCourseIndex = Number.isInteger(options.surplusCurrentCourseIndex) && options.surplusCurrentCourseIndex >= 0
       ? options.surplusCurrentCourseIndex
       : 0;
@@ -228,6 +248,7 @@ class AutoCourseSession extends EventEmitter {
       ? [...new Set(options.surplusEligibleCourses)]
       : [];
     this.surplusExhausted = options.surplusExhausted === true;
+    this.surplusPlan = null; // snapshot kế hoạch năng lực gần nhất (chỉ để hiển thị/log)
     this._surplusLegacyMigrated = false;
     this._stopped = false;
     this._phase = PHASE_NEW;
@@ -445,7 +466,7 @@ class AutoCourseSession extends EventEmitter {
   // Keep the browser lifecycle short and let the server restart a fresh session later.
   _scheduleDiscoveryRetry() {
     this._rolloverDailyCounter();
-    const cooldownMs = COURSE_DISCOVERY_RETRY_MINUTES * 60 * 1000;
+    const cooldownMs = this.surplusOptions.courseDiscoveryRetryMinutes * 60 * 1000;
     if (this.dailyStudiedMinutes >= this.options.dailyMaxMinutes) {
       this._hitDailyLimit();
       return false;
@@ -490,7 +511,7 @@ class AutoCourseSession extends EventEmitter {
     this.nextRunTime = retryAt.toISOString();
     this._enterScheduledStatus(DISCOVERY_RETRY_STATUS);
     this.log('⚠️ Website chưa trả về khóa học sau khi đăng nhập', 'warn');
-    this.log(`⏳ Sẽ quét lại khóa học sau ${COURSE_DISCOVERY_RETRY_MINUTES} phút`, 'warn');
+    this.log(`⏳ Sẽ quét lại khóa học sau ${this.surplusOptions.courseDiscoveryRetryMinutes} phút`, 'warn');
     this.log(`⏰ Lần quét tiếp theo: ${retryAt.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' })}`, 'info');
     emitScheduled();
     return true;
@@ -545,7 +566,10 @@ class AutoCourseSession extends EventEmitter {
 
   // Chuẩn hoá surplusCourseStates từ Firestore (object) — chịu được document cũ
   // thiếu trường/định dạng lạ, không bao giờ ném lỗi.
-  static _normalizeSurplusCourseStates(raw) {
+  static _normalizeSurplusCourseStates(raw, {
+    minTargetMinutes = SURPLUS_TARGET_MIN_MINUTES,
+    maxTargetMinutes = SURPLUS_TARGET_MAX_MINUTES,
+  } = {}) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
     const normalized = {};
     for (const [courseUrl, state] of Object.entries(raw)) {
@@ -558,7 +582,7 @@ class AutoCourseSession extends EventEmitter {
         courseUrl,
         title: state.title || null,
         targetMinutes: Number.isFinite(target) && target > 0
-          ? Math.max(SURPLUS_TARGET_MIN_MINUTES, Math.min(SURPLUS_TARGET_MAX_MINUTES, target))
+          ? Math.max(minTargetMinutes, Math.min(maxTargetMinutes, target))
           : null,
         confirmedMinutes: Math.max(0, Number(state.confirmedMinutes) || 0),
         localActiveMinutes: Math.max(0, Number(state.localActiveMinutes) || 0),
@@ -981,11 +1005,18 @@ class AutoCourseSession extends EventEmitter {
     }
   }
 
+  _surplusTargetBounds() {
+    return surplusTargetBounds(this.surplusOptions);
+  }
+
   // Khởi tạo/chuẩn hoá trạng thái surplus per-course. MIGRATE state cũ account-level
   // (surplusTargetMinutes/surplusStudiedMinutes/surplusExhausted) mà không seed
   // confirmedMinutes từ số phút LOCAL chưa được website xác nhận.
   _ensureSurplusCourseStates() {
-    this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(this.surplusCourseStates);
+    this.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(
+      this.surplusCourseStates,
+      this._surplusTargetBounds()
+    );
     const hasPerCourse = Object.keys(this.surplusCourseStates).length > 0;
     if (!hasPerCourse && !this._surplusLegacyMigrated
       && (this.surplusTargetMinutes != null || this.surplusStudiedMinutes > 0 || this.surplusExhausted === true)) {
@@ -1026,6 +1057,77 @@ class AutoCourseSession extends EventEmitter {
       this.log(`🎲 Surplus target for this course: ${state.targetMinutes} minutes`, 'info');
     }
     return state.targetMinutes;
+  }
+
+  // ── KẾ HOẠCH NĂNG LỰC THEO LỊCH (chiến lược 'schedule') ──
+  // Tính lại từ trạng thái HIỆN TẠI (giờ/ngày/đã học) và chia đều cho các khóa
+  // còn dùng được. Gọi ở các ranh giới vòng đời (vào surplus, sau mỗi khóa xong)
+  // nên KHÔNG bao giờ tin một ngân sách tương lai cũ.
+  _planSurplusAllocation({ log = true } = {}) {
+    if (this.surplusOptions.surplusStrategy !== 'schedule') return null;
+
+    const remainingCourses = this.coursesConfig.filter(config => {
+      const state = this.surplusCourseStates[config.courseUrl];
+      return Boolean(state) && state.completed !== true && state.exhausted !== true;
+    });
+    const allConfirmed = Object.values(this.surplusCourseStates || {})
+      .reduce((sum, state) => sum + Math.max(0, Number(state.confirmedMinutes) || 0), 0);
+
+    const plan = planSurplusCapacity({
+      now: new Date(),
+      dailyMaxMinutes: this.options.dailyMaxMinutes,
+      dailyStudiedMinutes: this.dailyStudiedMinutes,
+      allowedDateRanges: this.options.allowedDateRanges || [],
+      customTimeRules: this.options.customTimeRules || [],
+      timeWindows: this.options.timeWindows || [],
+    });
+    this.surplusPlan = {
+      ...plan,
+      computedAt: new Date().toISOString(),
+      eligibleCount: remainingCourses.length,
+      allocatedCount: 0,
+    };
+
+    if (remainingCourses.length > 0) {
+      const targets = allocateSurplusTargets(
+        remainingCourses.map(config => ({
+          courseUrl: config.courseUrl,
+          confirmedMinutes: this.surplusCourseStates[config.courseUrl].confirmedMinutes || 0,
+        })),
+        plan.totalMinutes,
+        {
+          maxPerCourseMinutes: this.surplusOptions.surplusMaxPerCourseMinutes,
+          consumedMinutes: allConfirmed,
+        }
+      );
+      for (const config of remainingCourses) {
+        const target = targets[config.courseUrl];
+        if (Number.isFinite(target) && target > 0) {
+          this.surplusCourseStates[config.courseUrl].targetMinutes = target;
+        }
+      }
+      this.surplusPlan.allocatedCount = remainingCourses.length;
+    }
+
+    if (log) this._logSurplusPlan(remainingCourses);
+    return this.surplusPlan;
+  }
+
+  // Log NGẮN GỌN ở ranh giới kế hoạch — không log mỗi vòng lặp.
+  _logSurplusPlan(remainingCourses) {
+    const plan = this.surplusPlan;
+    if (!plan) return;
+    this.log('♻️ SURPLUS PLAN', 'info');
+    this.log(`   Remaining schedule capacity: ${this._formatMinutes(plan.totalMinutes)}`, 'info');
+    this.log(`   Today available: ${this._formatMinutes(plan.todayMinutes)}`, 'info');
+    if (plan.hasFiniteHorizon) {
+      const days = plan.futureDays.length;
+      this.log(`   Future allowed capacity: ${this._formatMinutes(plan.futureTotalMinutes)} (${days} day${days === 1 ? '' : 's'}, horizon ${plan.horizonDate})`, 'info');
+    } else {
+      this.log('   Surplus future budget not preallocated because allowed-date calendar is empty; using current-day capacity only.', 'warn');
+    }
+    this.log(`   Eligible courses: ${remainingCourses.length}`, 'info');
+    this.log('   Allocation: dynamic fair-share', 'info');
   }
 
   // Còn khóa nào chưa xử lý xong surplus pass không?
@@ -1169,6 +1271,9 @@ class AutoCourseSession extends EventEmitter {
 
     this._ensureSurplusCourseStates();
     this.surplusMode = true;
+    // Chiến lược theo lịch: TÍNH LẠI năng lực còn lại từ hiện tại rồi chia lại.
+    // Đây là ranh giới recompute (vào surplus/sau restart/qua ngày mới).
+    this._planSurplusAllocation();
     this.log('➡️ Entering surplus-study phase', 'success');
     this.log(`   Courses: ${this.coursesConfig.length} | resume index: ${this.surplusCurrentCourseIndex}`, 'info');
     this.emit('status', this.getStatus());
@@ -1187,7 +1292,11 @@ class AutoCourseSession extends EventEmitter {
     this.log('🔁 Starting surplus pass', 'info');
     this.log(`   Courses: ${total}`, 'info');
     this.log('   Strategy: sequential', 'info');
-    this.log(`   RNG: per-course ${SURPLUS_TARGET_MIN_MINUTES}-${SURPLUS_TARGET_MAX_MINUTES} minutes`, 'info');
+    if (this.surplusOptions.surplusStrategy === 'legacy-random') {
+      this.log(`   RNG: per-course ${SURPLUS_TARGET_MIN_MINUTES}-${SURPLUS_TARGET_MAX_MINUTES} minutes`, 'info');
+    } else {
+      this.log('   Allocation: remaining schedule capacity (dynamic fair-share)', 'info');
+    }
 
     for (let cIdx = this.surplusCurrentCourseIndex; cIdx < total; cIdx++) {
       if (!this._isRunActive()) return false;
@@ -1205,6 +1314,21 @@ class AutoCourseSession extends EventEmitter {
       if (outcome === 'scheduled' || outcome === 'stopped') return false;
 
       this.surplusCurrentCourseIndex = cIdx + 1;
+      // Tái phân bổ: nếu khóa vừa xong còn phần chưa dùng, chia lại cho các khóa
+      // còn dùng được TRƯỚC khi sang khóa kế tiếp.
+      if (this.surplusOptions.surplusStrategy === 'schedule' && (outcome === 'exhausted' || outcome === 'completed')) {
+        if (outcome === 'exhausted') {
+          const remaining = this.coursesConfig.filter((c, i) => i > cIdx
+            && !this.surplusCourseStates[c.courseUrl]?.completed
+            && !this.surplusCourseStates[c.courseUrl]?.exhausted).length;
+          const unused = Math.max(0, Math.round((state.targetMinutes || 0) - (state.confirmedMinutes || 0)));
+          if (remaining > 0 && unused > 0) {
+            this.log(`♻️ Course ${cIdx + 1}/${total} exhausted after ${this._formatMinutes(state.confirmedMinutes)}`, 'warn');
+            this.log(`   Redistributing remaining surplus capacity across ${remaining} course${remaining === 1 ? '' : 's'}`, 'warn');
+          }
+        }
+        this._planSurplusAllocation({ log: false });
+      }
       this._syncLegacySurplusAggregates();
       this.emit('status', this.getStatus());
     }
@@ -1222,7 +1346,20 @@ class AutoCourseSession extends EventEmitter {
     const normalTarget = AutoCourseSession._targetMinutesFor(config);
     const currentStudied = Math.max(0, Number(this.courseProgress[courseUrl]?.studiedMinutes) || 0);
     const normalReached = normalTarget > 0 ? currentStudied >= normalTarget : true;
-    const target = this._surplusTargetFor(state);
+    let target;
+    if (this.surplusOptions.surplusStrategy === 'schedule') {
+      // Kế hoạch năng lực theo lịch: nếu chưa có (hoặc target chưa được cấp) thì
+      // tính lại ngay tại đây — không tin target RNG cũ còn sót trong Firestore.
+      if (!this.surplusPlan || !(Number(state.targetMinutes) > 0)) {
+        this._planSurplusAllocation({ log: false });
+      }
+      const minBlock = Math.max(1, this.surplusOptions.surplusMinBlockMinutes);
+      const planned = Number(state.targetMinutes);
+      target = Number.isFinite(planned) && planned > 0 ? Math.max(minBlock, Math.floor(planned)) : minBlock;
+      state.targetMinutes = target;
+    } else {
+      target = this._surplusTargetFor(state);
+    }
     const courseLabel = state.title || this.courseProgress[courseUrl]?.title || courseUrl;
 
     let scan = await this._captureSurplusCourseScan(courseUrl);
@@ -1366,10 +1503,10 @@ class AutoCourseSession extends EventEmitter {
     const targetRemainingMs = Math.max(0, state.targetMinutes - state.confirmedMinutes) * 60000;
     if (dailyRemainingMs <= 0) { this._hitDailyLimit(); return { outcome: 'scheduled' }; }
 
-    let blockMinutes = SURPLUS_MIN_BLOCK_MINUTES;
+    let blockMinutes = this.surplusOptions.surplusMinBlockMinutes;
     try {
       const timer = await readDomTimer(this.page);
-      if (timer && timer.totalMinutes > 0) blockMinutes = Math.max(SURPLUS_MIN_BLOCK_MINUTES, timer.totalMinutes);
+      if (timer && timer.totalMinutes > 0) blockMinutes = Math.max(this.surplusOptions.surplusMinBlockMinutes, timer.totalMinutes);
     } catch { /* dùng block tối thiểu */ }
     if (!this._isRunActive()) return { outcome: 'stopped' };
 
@@ -1414,7 +1551,7 @@ class AutoCourseSession extends EventEmitter {
       this.log('⚠️ Website did not confirm additional progress for this study block', 'warn');
       const attempts = (state.lessonAttempts[lesson.url] || 0) + 1;
       state.lessonAttempts[lesson.url] = attempts;
-      if (attempts >= SURPLUS_MAX_UNCONFIRMED_ATTEMPTS) {
+      if (attempts >= this.surplusOptions.surplusMaxUnconfirmedAttempts) {
         this._markSurplusLessonUnusable(state, lesson.url);
         this.log(`⚠️ Marking lesson unusable after ${attempts} unconfirmed attempts`, 'warn');
       }
@@ -1918,6 +2055,16 @@ class AutoCourseSession extends EventEmitter {
       surplusStudiedMinutes: this.surplusStudiedMinutes,
       surplusEligibleCourses: this.surplusEligibleCourses,
       surplusExhausted: this.surplusExhausted,
+      surplusStrategy: this.surplusOptions.surplusStrategy,
+      surplusPlan: this.surplusPlan ? {
+        totalMinutes: this.surplusPlan.totalMinutes,
+        todayMinutes: this.surplusPlan.todayMinutes,
+        futureTotalMinutes: this.surplusPlan.futureTotalMinutes,
+        hasFiniteHorizon: this.surplusPlan.hasFiniteHorizon,
+        horizonDate: this.surplusPlan.horizonDate,
+        eligibleCount: this.surplusPlan.eligibleCount,
+        computedAt: this.surplusPlan.computedAt,
+      } : null,
     };
   }
 
@@ -2433,7 +2580,8 @@ class AutoCourseSession extends EventEmitter {
             courseFinalizationPlan = createCourseFinalizationPlan(
               courseFinalizationPlan,
               lessonRemainingMs,
-              elapsedMs
+              elapsedMs,
+              this.surplusOptions.postTargetGraceMinutes
             );
             this._setCourseFinalizationState(cConfig.courseUrl, COURSE_FINALIZATION_STATES.TARGET_REACHED);
             this.log(`⏱️ Checkpoint has not yet confirmed the course target: ${courseStudiedMins}/${targetMinutes} local minutes`, 'warn');
@@ -2447,7 +2595,7 @@ class AutoCourseSession extends EventEmitter {
             } else {
               this.log('📖 Current lesson is still active', 'info');
               this.log(`⏱️ Current lesson has ${Math.ceil(lessonRemainingMs / 60000)} minutes remaining`, 'info');
-              this.log('🛑 Applying maximum 5-minute post-target grace period', 'warn');
+              this.log(`🛑 Applying maximum ${this.surplusOptions.postTargetGraceMinutes}-minute post-target grace period`, 'warn');
             }
           };
 
@@ -2530,7 +2678,7 @@ class AutoCourseSession extends EventEmitter {
               const finalizationRemainingMs = Math.max(0, courseFinalizationPlan.deadlineElapsedMs - elapsedMs);
               if (finalizationRemainingMs <= 0) {
                 if (courseFinalizationPlan.mode === 'grace-period') {
-                  this.log('🛑 5-minute post-target grace period reached', 'warn');
+                  this.log(`🛑 ${this.surplusOptions.postTargetGraceMinutes}-minute post-target grace period reached`, 'warn');
                   this.log('⏹️ Stopping current lesson', 'warn');
                 }
                 break;
@@ -2594,7 +2742,7 @@ class AutoCourseSession extends EventEmitter {
               && courseFinalizationPlan.mode === 'grace-period'
               && elapsedMs >= courseFinalizationPlan.deadlineElapsedMs
               && elapsedMs < durationMs) {
-              this.log('🛑 5-minute post-target grace period reached', 'warn');
+              this.log(`🛑 ${this.surplusOptions.postTargetGraceMinutes}-minute post-target grace period reached`, 'warn');
               this.log('⏹️ Stopping current lesson', 'warn');
               break;
             }

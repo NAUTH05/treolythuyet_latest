@@ -16,8 +16,18 @@ const { autoScanSnapshot, createAutoScanBroadcaster } = require('./autoScanBroad
 const { isAllowedStudyDate, getNextAllowedStudyDate, getNextShiftStart } = require('./courseScanner');
 const { vnDateDDMMYYYY, formatToDDMMYYYY, filterLogsForDate } = require('./logDateUtils');
 const fbService = require('./firebase-service');
-const { SerializedStateSync, writeJsonAtomicSync } = require('./stateSync');
+const { SerializedStateSync } = require('./stateSync');
 const { operatingWindow, assignDistributedStartTimes } = require('./autoScanScheduling');
+const { normalizeSurplusOptions } = require('./autoScanSurplus');
+const { filterLogEntries, paginateNewestFirst } = require('./logQuery');
+const {
+  readDailyLogFile,
+  appendDailyLogFile,
+  clearCache: clearLogStoreCache,
+  ndjsonPath,
+  legacyLogsPath,
+  parseNdjson,
+} = require('./logStore');
 
 async function respondAfterStateSync(res, pending, body) {
   try {
@@ -154,7 +164,8 @@ const MAX_LOG = 500;
 // =================== DAILY LOGS (ngày DD-MM-YYYY → folder/user) =====================
 const DAILY_LOGS_FILE = path.join(__dirname, 'daily-logs.json');
 const LOGS_DAILY_DIR = path.join(__dirname, 'logs', 'daily');
-const MAX_DAILY_LOGS_PER_USER = 5000; // Giới hạn an toàn dưới 1MB/doc Firestore
+const MAX_DAILY_LOGS_PER_USER = 5000; // Giới hạn an toàn bộ đếm log ngày
+const FIREBASE_LOG_SYNC_LIMIT = 500;  // Payload Firestore tối đa mỗi user/doc
 
 if (!fs.existsSync(LOGS_DAILY_DIR)) {
   try { fs.mkdirSync(LOGS_DAILY_DIR, { recursive: true }); } catch { /* ignore */ }
@@ -170,7 +181,31 @@ function slugifyAccount(name) {
     .replace(/^_+|_+$/g, '') || 'system';
 }
 
-let dailyLogs = { date: vnDateDDMMYYYY(), users: {}, allLogs: [] };
+// ── Lưu log append-only (NDJSON) ──
+// I/O file nằm trong logStore.js (testable). `logs.json` cũ vẫn được ĐỌC để
+// tương thích ngược nhưng KHÔNG bị ghi đè.
+let logIdCounter = 0;
+function makeLogId() {
+  logIdCounter = (logIdCounter + 1) % 0xffffff;
+  return `log_${Date.now().toString(36)}_${logIdCounter.toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
+// Đọc log của một ngày: ngày hôm nay lấy từ bộ nhớ, ngày cũ đọc qua logStore.
+function readDailyLogEntries(date) {
+  if (!date) return [];
+  if (date === vnDateDDMMYYYY()) return dailyLogs.allLogs || [];
+  return readDailyLogFile(LOGS_DAILY_DIR, date);
+}
+
+function appendDailyLogEntries(date, entries) {
+  return appendDailyLogFile(LOGS_DAILY_DIR, date, entries);
+}
+
+function uniqueLogAccounts(entries) {
+  return [...new Set((entries || []).map(entry => (entry && entry.account) || 'system'))].sort();
+}
+
+let dailyLogs = { date: vnDateDDMMYYYY(), users: {}, allLogs: [], _flushedCount: 0 };
 let dailyLogsDirtyUsers = new Set();
 let latestLogsDirty = false;
 
@@ -209,13 +244,16 @@ function initDailyLogsStore() {
     console.error('[LOGS] Lỗi migrate legacy daily logs:', e.message);
   }
 
-  // Load today's logs from logs/daily/DD-MM-YYYY/logs.json
-  const todayFile = path.join(todayDir, 'logs.json');
+  // Ưu tiên NDJSON mới; fallback về logs.json cũ. Chỉ nạp ngày HÔM NAY (ngày
+  // đang mở để ghi thêm) — không migrate hàng loạt file lịch sử lúc khởi động.
+  const todayNdjson = ndjsonPath(LOGS_DAILY_DIR, today);
+  const todayLegacy = legacyLogsPath(LOGS_DAILY_DIR, today);
   let loadedEntries = [];
-  if (fs.existsSync(todayFile)) {
+  if (fs.existsSync(todayNdjson)) {
+    try { loadedEntries = parseNdjson(fs.readFileSync(todayNdjson, 'utf8'), today); } catch { loadedEntries = []; }
+  } else if (fs.existsSync(todayLegacy)) {
     try {
-      const fileEntries = JSON.parse(fs.readFileSync(todayFile, 'utf8'));
-      loadedEntries = filterLogsForDate(fileEntries, today, true)
+      loadedEntries = filterLogsForDate(JSON.parse(fs.readFileSync(todayLegacy, 'utf8')), today, true)
         .map(entry => ({ ...entry, date: today }));
     } catch { loadedEntries = []; }
   }
@@ -231,7 +269,15 @@ function initDailyLogsStore() {
     date: today,
     users: usersMap,
     allLogs: loadedEntries,
+    _flushedCount: loadedEntries.length,
   };
+
+  // Lazy-migrate riêng ngày hôm nay sang NDJSON nếu trước đây chỉ có logs.json.
+  if (!fs.existsSync(todayNdjson) && loadedEntries.length > 0) {
+    try { appendDailyLogEntries(today, loadedEntries); } catch (e) {
+      console.error('[LOGS] Không thể chuyển log hôm nay sang NDJSON:', e.message);
+    }
+  }
 }
 
 initDailyLogsStore();
@@ -243,42 +289,45 @@ function ensureDailyLogsCurrent() {
   if (dailyLogs.date === today) return false;
 
   const oldStore = dailyLogs;
-  dailyLogs = { date: today, users: {}, allLogs: [] };
+  dailyLogs = { date: today, users: {}, allLogs: [], _flushedCount: 0 };
   dailyLogsDirtyUsers.clear();
   logHistory.length = 0; // Không để live stream của ngày cũ bị ghép vào ngày mới.
   try { flushDailyLogsFor(oldStore); } catch { /* ignore */ }
+  clearLogStoreCache(LOGS_DAILY_DIR, formatToDDMMYYYY(oldStore.date));
   return true;
 }
 
-function flushDailyLogsFor(store) {
+// Ghi log: CHỈ APPEND các dòng mới vào NDJSON (không ghi lại cả ngày mỗi phút).
+// `dirtyUsers` giới hạn đồng bộ Firebase cho user vừa đổi.
+function flushDailyLogsFor(store, dirtyUsers = null) {
   if (!store || !store.date) return;
   const folderName = formatToDDMMYYYY(store.date);
-  const dirPath = path.join(LOGS_DAILY_DIR, folderName);
-  if (!fs.existsSync(dirPath)) {
-    try { fs.mkdirSync(dirPath, { recursive: true }); } catch { /* ignore */ }
-  }
-
-  const logsFilePath = path.join(dirPath, 'logs.json');
   const entries = store.allLogs || [];
-  try {
-    fs.writeFileSync(logsFilePath, JSON.stringify(entries, null, 2), 'utf8');
-    fs.writeFileSync(DAILY_LOGS_FILE, JSON.stringify(store), 'utf8');
-  } catch (e) {
-    console.error('[LOGS] Không thể lưu daily-logs local:', e.message);
+  const start = Math.max(0, Math.min(Number(store._flushedCount) || 0, entries.length));
+  const pending = entries.slice(start);
+  if (pending.length > 0) {
+    try {
+      appendDailyLogEntries(folderName, pending);
+      store._flushedCount = entries.length;
+    } catch (e) {
+      console.error('[LOGS] Không thể ghi NDJSON log:', e.message);
+    }
   }
 
   const fbConfig = fbService.getFirebaseAdminConfiguration();
   if (!fbConfig.enabled) return;
-  const users = store.users ? Object.keys(store.users) : [];
-  for (const account of users) {
-    const userEntries = store.users[account];
+  // Chỉ đồng bộ user vừa đổi để tránh serialize lại toàn bộ mỗi 60 giây.
+  const accounts = dirtyUsers ? [...dirtyUsers] : Object.keys(store.users || {});
+  for (const account of accounts) {
+    const userEntries = store.users ? store.users[account] : null;
     if (!userEntries || userEntries.length === 0) continue;
     const docId = `${folderName}_${slugifyAccount(account)}`;
     fbService.syncToFirebase('system_logs_daily', docId, {
       date: folderName,
       account,
       count: userEntries.length,
-      logs: userEntries,
+      // Payload Firestore có biên; NDJSON local là nguồn lịch sử chính thức.
+      logs: userEntries.slice(-FIREBASE_LOG_SYNC_LIMIT),
       updatedAt: new Date().toISOString(),
     });
   }
@@ -297,16 +346,21 @@ function recordDailyLog(entry) {
 
   if (!dailyLogs.allLogs) dailyLogs.allLogs = [];
   dailyLogs.allLogs.push(entryWithDate);
-  if (dailyLogs.allLogs.length > 20000) dailyLogs.allLogs.shift();
+  if (dailyLogs.allLogs.length > 20000) {
+    dailyLogs.allLogs.shift();
+    // Giữ con trỏ flush khớp khi mảng bị cắt đầu (xem flushDailyLogsFor).
+    dailyLogs._flushedCount = Math.max(0, (Number(dailyLogs._flushedCount) || 0) - 1);
+  }
 
   dailyLogsDirtyUsers.add(key);
 }
 
-// Flush daily logs định kỳ mỗi 60 giây
+// Flush daily logs định kỳ mỗi 60 giây (chỉ user vừa đổi)
 setInterval(() => {
   if (dailyLogsDirtyUsers.size === 0) return;
+  const dirty = new Set(dailyLogsDirtyUsers);
   dailyLogsDirtyUsers.clear();
-  try { flushDailyLogsFor(dailyLogs); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
+  try { flushDailyLogsFor(dailyLogs, dirty); } catch (e) { console.error('[LOGS] Lỗi flush daily logs:', e.message); }
 }, 60 * 1000);
 
 // Sync system_logs/latest (100 dòng gần nhất) debounce 15 giây
@@ -321,7 +375,11 @@ setInterval(() => {
 
 function addLog(entry) {
   ensureDailyLogsCurrent();
-  const datedEntry = { ...entry, date: vnDateDDMMYYYY() };
+  const datedEntry = {
+    ...entry,
+    id: entry.id || makeLogId(),
+    date: vnDateDDMMYYYY(),
+  };
   logHistory.push(datedEntry);
   if (logHistory.length > MAX_LOG) logHistory.shift();
   io.emit('log', datedEntry);
@@ -1549,15 +1607,20 @@ app.get('/api/auto-presets', (req, res) => {
 // Tạo Mẫu Preset Auto-Scan (lưu toàn bộ cấu hình form)
 app.post('/api/auto-presets', async (req, res) => {
   const { name, config } = req.body;
-  if (!name || !config || !Array.isArray(config.courses) || config.courses.length === 0) {
-    return res.status(400).json({ error: 'Cần nhập tên Preset và danh sách khóa học hợp lệ' });
+  // Khóa học thủ công là TUỲ CHỌN — hệ thống tự phát hiện khóa sau khi login.
+  // Preset chỉ cần tên hợp lệ + cấu hình có cấu trúc; `courses: []` là hợp lệ.
+  if (!name || !name.trim() || !config || typeof config !== 'object' || Array.isArray(config)) {
+    return res.status(400).json({ error: 'Cần nhập tên Preset và cấu hình hợp lệ' });
   }
 
   const presets = loadAutoPresets();
   const newPreset = {
     id: `autopreset_${Date.now()}`,
-    name,
-    config,
+    name: String(name).trim(),
+    config: {
+      ...config,
+      courses: Array.isArray(config.courses) ? config.courses : [],
+    },
     createdAt: new Date().toISOString(),
   };
 
@@ -2097,6 +2160,10 @@ app.post('/api/auto-scan/start', async (req, res) => {
   // `courses` chỉ còn là fallback tương thích cho tài liệu Firestore cũ.
   const initialCourses = Array.isArray(courses) ? courses : [];
 
+  // Tham số vận hành an toàn (Cài đặt nâng cao) — luôn chuẩn hoá lại phía server,
+  // KHÔNG tin giá trị từ frontend.
+  const surplusOptions = normalizeSurplusOptions(req.body);
+
   const allAccounts = loadAccounts();
   const requestedIndices = Array.isArray(accountIndices) ? accountIndices : [];
   if (requestedIndices.length === 0) {
@@ -2243,6 +2310,7 @@ app.post('/api/auto-scan/start', async (req, res) => {
       initialDailyMinutesToggle: initialDailyMinutesToggle === true,
       initialDailyMinutes: parseInt(initialDailyMinutes, 10) || 0,
       initialDailyDate: vnTodayStr,
+      ...surplusOptions,
     });
 
     startAutoScanWhenFree(autoSession, 'api-start');
@@ -2638,81 +2706,93 @@ app.put('/api/edit-queue/:id', async (req, res) => {
   return respondAfterStateSync(res, updateQueue(queue), { ok: true, totalPairs: queue.pairs.length });
 });
 
-// Lấy danh sách các folder logs theo ngày (DD-MM-YYYY)
-app.get('/api/logs/folders', (req, res) => {
-  try {
-    ensureDailyLogsCurrent();
-    const today = vnDateDDMMYYYY();
-    const folderMap = new Map();
+// Metadata danh sách ngày (CHỈ trả metadata, KHÔNG trả dòng log) — dùng cho
+// sidebar và dropdown ngày. Không đọc toàn bộ nội dung log khi liệt kê.
+function listLogDates() {
+  ensureDailyLogsCurrent();
+  const today = vnDateDDMMYYYY();
+  const folderMap = new Map();
+  const todayEntries = dailyLogs.allLogs || [];
+  folderMap.set(today, {
+    date: today,
+    count: todayEntries.length,
+    isToday: true,
+    accounts: uniqueLogAccounts(todayEntries),
+  });
 
-    folderMap.set(today, {
-      date: today,
-      count: dailyLogs.allLogs ? dailyLogs.allLogs.length : 0,
-      isToday: true,
-    });
-
-    if (fs.existsSync(LOGS_DAILY_DIR)) {
-      const dirs = fs.readdirSync(LOGS_DAILY_DIR, { withFileTypes: true });
-      for (const d of dirs) {
-        if (d.isDirectory()) {
-          const folderName = formatToDDMMYYYY(d.name);
-          const logsFile = path.join(LOGS_DAILY_DIR, d.name, 'logs.json');
-          let count = 0;
-          if (folderName === today && dailyLogs.allLogs) {
-            count = dailyLogs.allLogs.length;
-          } else if (fs.existsSync(logsFile)) {
-            try {
-              const fileData = JSON.parse(fs.readFileSync(logsFile, 'utf8'));
-              count = filterLogsForDate(fileData, folderName, true).length;
-            } catch { count = 0; }
-          }
-          folderMap.set(folderName, {
-            date: folderName,
-            count,
-            isToday: folderName === today,
-          });
-        }
-      }
+  if (fs.existsSync(LOGS_DAILY_DIR)) {
+    for (const d of fs.readdirSync(LOGS_DAILY_DIR, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      const folderName = formatToDDMMYYYY(d.name);
+      if (!folderName || folderName === today) continue;
+      const entries = readDailyLogEntries(folderName);
+      folderMap.set(folderName, {
+        date: folderName,
+        count: entries.length,
+        isToday: false,
+        accounts: uniqueLogAccounts(entries),
+      });
     }
+  }
 
-    const folders = Array.from(folderMap.values()).sort((a, b) => {
-      const [da, ma, ya] = a.date.split('-').map(Number);
-      const [db, mb, yb] = b.date.split('-').map(Number);
-      const ta = (ya || 0) * 10000 + (ma || 0) * 100 + (da || 0);
-      const tb = (yb || 0) * 10000 + (mb || 0) * 100 + (db || 0);
-      return tb - ta;
-    });
+  return [...folderMap.values()].sort((a, b) => {
+    const [da, ma, ya] = a.date.split('-').map(Number);
+    const [db, mb, yb] = b.date.split('-').map(Number);
+    return ((yb || 0) * 10000 + (mb || 0) * 100 + (db || 0))
+      - ((ya || 0) * 10000 + (ma || 0) * 100 + (da || 0));
+  });
+}
 
-    res.json(folders);
+// Danh sách ngày + metadata (kèm tài khoản) — KHÔNG kèm dòng log.
+app.get('/api/logs/dates', (req, res) => {
+  try {
+    res.json(listLogDates());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Lấy toàn bộ logs theo ngày (date=DD-MM-YYYY hoặc YYYY-MM-DD)
+// Back-compat: danh sách folder (shape cũ {date,count,isToday}).
+app.get('/api/logs/folders', (req, res) => {
+  try {
+    res.json(listLogDates().map(({ date, count, isToday }) => ({ date, count, isToday })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Lịch sử có phân trang (newest-first), lọc server-side theo tài khoản/level.
+app.get('/api/logs/history', (req, res) => {
+  ensureDailyLogsCurrent();
+  const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
+  if (!reqDate) return res.status(400).json({ error: 'Ngày log không hợp lệ' });
+
+  const entries = filterLogEntries(readDailyLogEntries(reqDate), {
+    account: req.query.account ? String(req.query.account) : '',
+    level: req.query.level ? String(req.query.level) : '',
+  });
+  const page = paginateNewestFirst(entries, { limit: req.query.limit, cursor: req.query.cursor });
+  res.json({ date: reqDate, isToday: reqDate === vnDateDDMMYYYY(), ...page });
+});
+
+// Export tường minh — được phép trả toàn bộ ngày (chỉ gọi khi người dùng bấm).
+app.get('/api/logs/export', (req, res) => {
+  ensureDailyLogsCurrent();
+  const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
+  if (!reqDate) return res.status(400).json({ error: 'Ngày log không hợp lệ' });
+  const entries = filterLogEntries(readDailyLogEntries(reqDate), {
+    account: req.query.account ? String(req.query.account) : '',
+    level: req.query.level ? String(req.query.level) : '',
+  });
+  res.json({ date: reqDate, total: entries.length, logs: entries });
+});
+
+// Back-compat: trả toàn bộ logs theo ngày. Giữ cho client/preset cũ.
 app.get('/api/logs/by-date', (req, res) => {
   ensureDailyLogsCurrent();
   const reqDate = formatToDDMMYYYY(req.query.date || vnDateDDMMYYYY());
   if (!reqDate) return res.status(400).json({ error: 'Ngày log không hợp lệ' });
-  const today = vnDateDDMMYYYY();
-
-  if (reqDate === today && dailyLogs.allLogs) {
-    return res.json({ date: today, logs: filterLogsForDate(dailyLogs.allLogs, today, true), isToday: true });
-  }
-
-  const targetDir = path.join(LOGS_DAILY_DIR, reqDate);
-  const targetFile = path.join(targetDir, 'logs.json');
-
-  if (fs.existsSync(targetFile)) {
-    try {
-      const logs = JSON.parse(fs.readFileSync(targetFile, 'utf8'));
-      return res.json({ date: reqDate, logs: filterLogsForDate(logs, reqDate, true), isToday: false });
-    } catch (e) {
-      return res.status(500).json({ error: 'Lỗi đọc file log: ' + e.message });
-    }
-  }
-
-  res.json({ date: reqDate, logs: [], isToday: reqDate === today });
+  res.json({ date: reqDate, logs: readDailyLogEntries(reqDate), isToday: reqDate === vnDateDDMMYYYY() });
 });
 
 // Xóa folder / xóa logs của một ngày
@@ -2724,6 +2804,7 @@ app.delete('/api/logs/by-date', async (req, res) => {
   if (reqDate === today) {
     dailyLogs.users = {};
     dailyLogs.allLogs = [];
+    dailyLogs._flushedCount = 0;
     logHistory.length = 0;
   }
 
@@ -2735,14 +2816,7 @@ app.delete('/api/logs/by-date', async (req, res) => {
       return res.status(500).json({ error: 'Không thể xóa folder log: ' + e.message });
     }
   }
-
-  if (reqDate === today) {
-    try {
-      writeJsonAtomicSync(DAILY_LOGS_FILE, dailyLogs);
-    } catch (e) {
-      return res.status(500).json({ error: 'Không thể cập nhật daily logs local: ' + e.message });
-    }
-  }
+  clearLogStoreCache(LOGS_DAILY_DIR, reqDate);
 
   const fbConfig = fbService.getFirebaseAdminConfiguration();
   if (fbConfig.enabled) {

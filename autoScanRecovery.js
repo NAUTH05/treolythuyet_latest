@@ -76,7 +76,10 @@ function applyAutoScanRestoreState(session, restoreState = {}) {
   // Trạng thái surplus per-course (nguồn chân lý mới): khôi phục để resume đúng
   // khóa/mục tiêu/tiến độ. normalize chịu được document Firestore cũ.
   if (restoreState.surplusCourseStates && typeof restoreState.surplusCourseStates === 'object') {
-    session.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(restoreState.surplusCourseStates);
+    session.surplusCourseStates = AutoCourseSession._normalizeSurplusCourseStates(
+      restoreState.surplusCourseStates,
+      session._surplusTargetBounds()
+    );
   }
   if (restoreState.surplusCurrentCourseIndex != null) {
     const idx = Number(restoreState.surplusCurrentCourseIndex);

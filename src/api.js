@@ -79,6 +79,25 @@ export const fetchLogFolders = () => apiGet('/api/logs/folders');
 export const fetchLogsByDate = (date) => apiGet(`/api/logs/by-date?date=${encodeURIComponent(date)}`);
 export const deleteLogFolder = (date) => apiSend(`/api/logs/by-date?date=${encodeURIComponent(date)}`, 'DELETE');
 
+function logParams({ date, account, level, limit, cursor } = {}) {
+  const params = new URLSearchParams();
+  if (date) params.set('date', date);
+  if (account) params.set('account', account);
+  if (level) params.set('level', level);
+  if (limit) params.set('limit', String(limit));
+  if (cursor) params.set('cursor', String(cursor));
+  return params.toString();
+}
+
+// Metadata danh sách ngày (kèm accounts) — KHÔNG tải dòng log.
+export const fetchLogDates = () => apiGet('/api/logs/dates');
+
+// Phân trang lịch sử (server-side filter + newest-first).
+export const fetchLogHistory = (opts = {}) => apiGet(`/api/logs/history?${logParams(opts)}`);
+
+// Export tường minh (trả toàn bộ ngày) — chỉ gọi khi người dùng bấm Export.
+export const fetchLogExport = (opts = {}) => apiGet(`/api/logs/export?${logParams(opts)}`);
+
 // Đăng xuất — thu hồi token trên server rồi xóa client (không reload ở đây, App xử lý)
 export async function logout() {
   try {

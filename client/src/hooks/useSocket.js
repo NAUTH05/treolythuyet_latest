@@ -38,7 +38,8 @@ export function useSocket() {
     socket.on('log', (entry) => {
       setLogs(prev => {
         const next = [...prev, entry];
-        return next.length > 300 ? next.slice(-300) : next;
+        // Trần bộ nhớ realtime: lịch sử đầy đủ được tải theo trang qua /api/logs/history.
+        return next.length > 500 ? next.slice(-500) : next;
       });
     });
 

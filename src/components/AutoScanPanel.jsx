@@ -1,7 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import * as api from '../api';
 import { formatAutoScanStartFeedback } from '../autoscanStartFeedback.mjs';
 import { formatMinutes, courseRowDisplay } from '../courseProgressDisplay.mjs';
+import {
+  serializeSelectedDates,
+  parseAllowedDateRanges,
+  validateAllowedDateText,
+  referenceYearVN,
+} from '../autoscanCalendar.mjs';
+import AllowedDateCalendar from './AllowedDateCalendar';
 
 const AUTO_STATUS = {
   idle:         { text: 'Chờ khởi động', badge: 'badge-idle' },
@@ -260,7 +267,41 @@ const EMPTY_COURSE = { courseUrl: '', targetHours: '', targetMinutes: '' };
 export default function AutoScanPanel({ accounts, autoScans, toast }) {
   const [courses, setCourses] = useState([{ ...EMPTY_COURSE }]);
 
-  const [allowedDateRanges, setAllowedDateRanges] = useState('');
+  const refYear = useMemo(() => referenceYearVN(), []);
+  const [selectedDates, setSelectedDates] = useState([]);
+  const [manualDateText, setManualDateText] = useState('');
+  const [dateTextError, setDateTextError] = useState('');
+  const [showManualDates, setShowManualDates] = useState(false);
+  const serializedDates = useMemo(
+    () => serializeSelectedDates(selectedDates, { referenceYear: refYear }),
+    [selectedDates, refYear]
+  );
+
+  // Tham số vận hành an toàn (Cài đặt nâng cao) — mặc định khớp backend.
+  const [surplusStrategy, setSurplusStrategy] = useState('schedule');
+  const [surplusMinBlockMinutes, setSurplusMinBlockMinutes] = useState('5');
+  const [surplusMaxUnconfirmedAttempts, setSurplusMaxUnconfirmedAttempts] = useState('2');
+  const [courseDiscoveryRetryMinutes, setCourseDiscoveryRetryMinutes] = useState('10');
+  const [postTargetGraceMinutes, setPostTargetGraceMinutes] = useState('5');
+  const [surplusMaxPerCourseMinutes, setSurplusMaxPerCourseMinutes] = useState('');
+
+  const handleCalendarChange = (dates) => {
+    setSelectedDates(dates);
+    setManualDateText(serializeSelectedDates(dates, { referenceYear: refYear }));
+    setDateTextError('');
+  };
+
+  const handleManualDateChange = (text) => {
+    setManualDateText(text);
+    const result = validateAllowedDateText(text, { referenceYear: refYear });
+    if (result.valid) {
+      setSelectedDates(result.dates);
+      setDateTextError('');
+    } else {
+      setDateTextError(result.error || 'Định dạng ngày không hợp lệ');
+    }
+  };
+
   const [dailyMaxHours, setDailyMaxHours] = useState('8');
   const [newDayStartTime, setNewDayStartTime] = useState('06:00');
   const [randomStartEnabled, setRandomStartEnabled] = useState(false);
@@ -327,7 +368,15 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         targetMinutes: c.targetMinutes != null ? String(c.targetMinutes) : '',
       })));
     }
-    if (cfg.allowedDateRanges != null) setAllowedDateRanges(cfg.allowedDateRanges);
+    if (cfg.allowedDateRanges != null) {
+      const rawRanges = Array.isArray(cfg.allowedDateRanges)
+        ? cfg.allowedDateRanges.join(', ')
+        : String(cfg.allowedDateRanges);
+      const dates = parseAllowedDateRanges(rawRanges, { referenceYear: refYear });
+      setSelectedDates(dates);
+      setManualDateText(serializeSelectedDates(dates, { referenceYear: refYear }));
+      setDateTextError('');
+    }
     if (cfg.dailyMaxHours != null) setDailyMaxHours(String(cfg.dailyMaxHours));
     if (cfg.newDayStartTime != null) setNewDayStartTime(cfg.newDayStartTime);
     if (cfg.randomStartEnabled != null) setRandomStartEnabled(!!cfg.randomStartEnabled);
@@ -340,6 +389,14 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
     if (cfg.initialDailyMinutesToggle != null) setInitialDailyMinutesToggle(!!cfg.initialDailyMinutesToggle);
     if (cfg.initialDailyHours != null) setInitialDailyHours(String(cfg.initialDailyHours));
     if (cfg.initialDailyMinutes != null) setInitialDailyMinutes(String(cfg.initialDailyMinutes));
+    // Cài đặt nâng cao (thiếu trong preset cũ → giữ mặc định an toàn).
+    if (cfg.surplusStrategy != null) setSurplusStrategy(cfg.surplusStrategy === 'legacy-random' ? 'legacy-random' : 'schedule');
+    if (cfg.surplusMinBlockMinutes != null) setSurplusMinBlockMinutes(String(cfg.surplusMinBlockMinutes));
+    if (cfg.surplusMaxUnconfirmedAttempts != null) setSurplusMaxUnconfirmedAttempts(String(cfg.surplusMaxUnconfirmedAttempts));
+    if (cfg.courseDiscoveryRetryMinutes != null) setCourseDiscoveryRetryMinutes(String(cfg.courseDiscoveryRetryMinutes));
+    if (cfg.postTargetGraceMinutes != null) setPostTargetGraceMinutes(String(cfg.postTargetGraceMinutes));
+    if (cfg.surplusMaxPerCourseMinutes != null) setSurplusMaxPerCourseMinutes(String(cfg.surplusMaxPerCourseMinutes));
+    else setSurplusMaxPerCourseMinutes('');
   };
 
   const handleSavePresetSubmit = async (e) => {
@@ -352,7 +409,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         name: newPresetName.trim(),
         config: {
           courses: courses.filter(c => c.courseUrl.trim()),
-          allowedDateRanges,
+          allowedDateRanges: serializedDates,
           dailyMaxHours,
           newDayStartTime,
           randomStartEnabled,
@@ -365,6 +422,12 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           initialDailyMinutesToggle,
           initialDailyHours,
           initialDailyMinutes,
+          surplusStrategy,
+          surplusMinBlockMinutes,
+          surplusMaxUnconfirmedAttempts,
+          courseDiscoveryRetryMinutes,
+          postTargetGraceMinutes,
+          surplusMaxPerCourseMinutes,
         },
       });
 
@@ -454,6 +517,11 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
       ? (parseInt(initialDailyHours, 10) || 0) * 60 + (parseInt(initialDailyMinutes, 10) || 0)
       : 0;
 
+    const parsedMaxPerCourse = surplusMaxPerCourseMinutes.trim() === ''
+      ? null
+      : parseInt(surplusMaxPerCourseMinutes, 10);
+    const parsedGrace = parseInt(postTargetGraceMinutes, 10);
+
     setLoading(true);
     try {
       const data = await api.startAutoScan({
@@ -462,7 +530,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           targetHours: parseInt(c.targetHours, 10) || 0,
           targetMinutes: parseInt(c.targetMinutes, 10) || 0,
         })),
-        allowedDateRanges: allowedDateRanges.split(',').map(s => s.trim()).filter(Boolean),
+        allowedDateRanges: serializedDates.split(',').map(s => s.trim()).filter(Boolean),
         dailyMaxMinutes: (parseInt(dailyMaxHours, 10) || 8) * 60,
         newDayStartTime: newDayStartTime.trim() || '06:00',
         randomStartEnabled,
@@ -472,6 +540,12 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
         stealth,
         initialDailyMinutesToggle,
         initialDailyMinutes: initDailyMins,
+        surplusStrategy,
+        surplusMinBlockMinutes: parseInt(surplusMinBlockMinutes, 10) || 5,
+        surplusMaxUnconfirmedAttempts: parseInt(surplusMaxUnconfirmedAttempts, 10) || 2,
+        courseDiscoveryRetryMinutes: parseInt(courseDiscoveryRetryMinutes, 10) || 10,
+        postTargetGraceMinutes: Number.isFinite(parsedGrace) ? parsedGrace : 5,
+        surplusMaxPerCourseMinutes: Number.isFinite(parsedMaxPerCourse) ? parsedMaxPerCourse : null,
         ...(timeWindows.length > 0 && { timeWindows }),
         customTimeRules: validCustomRules,
         accountIndices: [...selectedAccounts],
@@ -545,7 +619,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
               className="btn btn-sm btn-outline"
               onClick={() => setShowSavePresetModal(true)}
               style={{ marginLeft: 'auto' }}
-              disabled={!courses.some(c => c.courseUrl.trim())}
+              title="Lưu cấu hình hiện tại (khóa học thủ công là tuỳ chọn)"
             >
               Lưu Preset mới
             </button>
@@ -557,8 +631,9 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
               <div className="modal">
                 <div className="modal-title">Lưu mẫu Preset Auto-Scan</div>
                 <p className="modal-desc">
-                  Lưu lại toàn bộ cấu hình hiện tại ({courses.filter(c => c.courseUrl.trim()).length} khóa học,
-                  lịch ngày học, giới hạn giờ, khung giờ) để nạp lại nhanh cho lần sau.
+                  Lưu lại toàn bộ cấu hình hiện tại (lịch ngày học, giới hạn giờ, khung giờ,
+                  cài đặt nâng cao) để nạp lại nhanh cho lần sau. Danh sách khóa học thủ công
+                  là tuỳ chọn — hệ thống tự phát hiện khóa sau khi đăng nhập.
                 </p>
 
                 <form onSubmit={handleSavePresetSubmit}>
@@ -588,6 +663,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
           )}
 
           {/* Courses List Form */}
+          <div className="form-section-title">KHÓA HỌC</div>
           <div className="form-group">
             <label>Danh sách khóa học thủ công (tuỳ chọn)</label>
             <p className="muted" style={{ fontSize: 12, marginTop: -4, marginBottom: 8 }}>
@@ -646,15 +722,38 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             </button>
           </div>
 
-          {/* Date Ranges & Daily Cap & New Day Start Time */}
+          {/* STUDY CALENDAR — calendar-first, text là advanced fallback */}
+          <div className="form-section-title">LỊCH HỌC</div>
           <div className="form-group">
-            <label>Lịch ngày học được phép (phân cách bằng dấu phẩy)</label>
-            <input
-              type="text"
-              placeholder="VD: 25/07-28/07, 30/07, 01/08-02/08..."
-              value={allowedDateRanges}
-              onChange={e => setAllowedDateRanges(e.target.value)}
+            <label>Lịch ngày học được phép</label>
+            <AllowedDateCalendar
+              value={selectedDates}
+              onChange={handleCalendarChange}
             />
+            <div className="hint" style={{ marginTop: 8 }}>
+              Đã chọn: <strong>{serializedDates || '(tất cả các ngày)'}</strong>
+            </div>
+            <button
+              type="button"
+              className="btn btn-sm btn-ghost"
+              style={{ marginTop: 4, padding: '2px 6px' }}
+              onClick={() => setShowManualDates(v => !v)}
+            >
+              {showManualDates ? '▼' : '▶'} Chỉnh thủ công
+            </button>
+            {showManualDates && (
+              <div style={{ marginTop: 6 }}>
+                <input
+                  type="text"
+                  placeholder="VD: 25/07-28/07, 30/07, 01/08-02/08..."
+                  value={manualDateText}
+                  onChange={e => handleManualDateChange(e.target.value)}
+                />
+                {dateTextError
+                  ? <div className="hint" style={{ color: 'var(--danger, #e5534b)' }}>⚠️ {dateTextError} — giữ nguyên lựa chọn hợp lệ gần nhất</div>
+                  : <div className="hint">Ô nhập này đồng bộ với lịch. Bỏ trống = không giới hạn ngày.</div>}
+              </div>
+            )}
             <div className="hint">
               Nếu ngày hiện tại là ngày nghỉ, bot sẽ tự chờ đến giờ bắt đầu ngày học hợp lệ tiếp theo.
             </div>
@@ -746,6 +845,7 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             </div>
           </div>
 
+          <div className="form-section-title">HÀNH VI TREO</div>
           <div className="form-group">
             <label>Thời gian F5 reload trang (lưu checkpoint & giữ phiên)</label>
             <div className="input-row">
@@ -765,6 +865,21 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             </div>
           </div>
 
+          <div className="form-group">
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={stealth}
+                onChange={e => setStealth(e.target.checked)}
+              />
+              <span>Stealth / Anti-detection (mặc định TẮT cho Auto-Scan)</span>
+            </label>
+            <div className="hint">
+              Khi bật: giả lập di chuột/cuộn trang, che dấu hiệu tự động hóa. Mặc định tắt để chạy nhẹ và ổn định.
+            </div>
+          </div>
+
+          <div className="form-section-title">KHUNG GIỜ</div>
           <div className="form-group">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
               <label style={{ margin: 0, fontWeight: 600 }}>Cấu hình Ca học / Khung giờ theo Ngày (Tùy chọn)</label>
@@ -825,19 +940,72 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             </div>
           </div>
 
-          <div className="form-group">
-            <label className="check-row">
-              <input
-                type="checkbox"
-                checked={stealth}
-                onChange={e => setStealth(e.target.checked)}
-              />
-              <span>Stealth / Anti-detection (mặc định TẮT cho Auto-Scan)</span>
-            </label>
-            <div className="hint">
-              Khi bật: giả lập di chuột/cuộn trang, che dấu hiệu tự động hóa. Mặc định tắt để chạy nhẹ và ổn định.
+          <div className="form-section-title">CÀI ĐẶT NÂNG CAO</div>
+          <details className="form-group" style={{ padding: '10px 12px', border: '1px solid var(--border-color, rgba(255,255,255,0.12))', borderRadius: 8 }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 600 }}>Tham số vận hành an toàn (mặc định đã tối ưu)</summary>
+            <div className="hint" style={{ marginTop: 8 }}>
+              Chỉ chỉnh khi cần. Mọi giá trị được chuẩn hoá lại phía server.
             </div>
-          </div>
+
+            <div className="form-group" style={{ marginTop: 10 }}>
+              <label>Chiến lược Surplus (học thừa)</label>
+              <select value={surplusStrategy} onChange={e => setSurplusStrategy(e.target.value)}>
+                <option value="schedule">Dùng năng lực lịch còn lại (mặc định)</option>
+                <option value="legacy-random">Tương thích cũ — ngẫu nhiên 15–60 phút/khóa</option>
+              </select>
+            </div>
+
+            <div className="form-group">
+              <label>Khối học surplus tối thiểu</label>
+              <div className="input-row">
+                <input type="number" min="1" max="60" value={surplusMinBlockMinutes} onChange={e => setSurplusMinBlockMinutes(e.target.value)} style={{ width: 90 }} />
+                <span className="unit">phút (1–60)</span>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>Số lần xác minh website tối đa trước khi bỏ bài</label>
+              <div className="input-row">
+                <input type="number" min="1" max="10" value={surplusMaxUnconfirmedAttempts} onChange={e => setSurplusMaxUnconfirmedAttempts(e.target.value)} style={{ width: 90 }} />
+                <span className="unit">lần (1–10)</span>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>Chờ quét lại khóa học khi website chưa trả khóa</label>
+              <div className="input-row">
+                <input type="number" min="1" max="120" value={courseDiscoveryRetryMinutes} onChange={e => setCourseDiscoveryRetryMinutes(e.target.value)} style={{ width: 90 }} />
+                <span className="unit">phút (1–120)</span>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>Gia hạn tối đa sau khi đạt mục tiêu</label>
+              <div className="input-row">
+                <input type="number" min="0" max="30" value={postTargetGraceMinutes} onChange={e => setPostTargetGraceMinutes(e.target.value)} style={{ width: 90 }} />
+                <span className="unit">phút (0–30)</span>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>Giới hạn surplus tối đa mỗi khóa (tuỳ chọn)</label>
+              <div className="input-row">
+                <input
+                  type="number"
+                  min="1"
+                  placeholder="Trống = không giới hạn"
+                  value={surplusMaxPerCourseMinutes}
+                  onChange={e => setSurplusMaxPerCourseMinutes(e.target.value)}
+                  style={{ width: 170 }}
+                />
+                <span className="unit">phút</span>
+              </div>
+              <div className="hint">
+                Trống = dùng toàn bộ phần năng lực lịch được chia. Nếu đặt, mỗi khóa chỉ nhận tối đa
+                số phút này; phần dư vẫn được chia cho các khóa còn lại.
+              </div>
+            </div>
+          </details>
 
           {/* Accounts Selector */}
           <div className="form-group">
