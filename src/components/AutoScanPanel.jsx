@@ -9,6 +9,7 @@ import {
   referenceYearVN,
 } from '../autoscanCalendar.mjs';
 import AllowedDateCalendar from './AllowedDateCalendar';
+import { accountScanState, accountStateClass, accountStateLabel, accountStateMark } from '../accountCompletion.mjs';
 
 const AUTO_STATUS = {
   idle:         { text: 'Chờ khởi động', badge: 'badge-idle' },
@@ -1013,11 +1014,15 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
             <div className="chip-group">
               {accounts.map(acc => {
                 const isSelected = selectedAccounts.has(acc.index);
+                // Trạng thái hiển thị: hoàn thành (thủ công) > đang học/đã hẹn lịch > chưa.
+                // Không tự chọn sẵn, không khoá, không chặn tài khoản đã hoàn thành.
+                const state = accountScanState(acc, scanList);
+                const label = accountStateLabel(state);
                 return (
                   <button
                     key={acc.index}
                     type="button"
-                    className={`chip ${isSelected ? 'selected' : ''}`}
+                    className={`chip ${accountStateClass(state)} ${isSelected ? 'selected' : ''}`}
                     onClick={() => {
                       setSelectedAccounts(prev => {
                         const next = new Set(prev);
@@ -1026,8 +1031,11 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
                         return next;
                       });
                     }}
+                    title={label}
+                    aria-pressed={isSelected}
                   >
-                    {acc.name}
+                    <span className="chip-state" aria-hidden="true">{accountStateMark(state)}</span>
+                    <span className="chip-name">{acc.name}</span>
                   </button>
                 );
               })}
@@ -1035,6 +1043,13 @@ export default function AutoScanPanel({ accounts, autoScans, toast }) {
                 <span className="hint" style={{ marginTop: 0 }}>Chưa có tài khoản nào — thêm ở mục Tài khoản.</span>
               )}
             </div>
+            {accounts.length > 0 && (
+              <div className="hint">
+                <span className="chip-legend chip-legend-completed">✓ Hoàn thành</span>
+                <span className="chip-legend chip-legend-learning">● Đang học / đã lên lịch</span>
+                <span className="chip-legend chip-legend-incomplete">○ Chưa hoàn thành</span>
+              </div>
+            )}
           </div>
 
           <button

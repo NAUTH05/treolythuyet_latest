@@ -38,6 +38,9 @@ async function apiSend(pathStr, method, body) {
 export const fetchAccounts = () => apiGet('/api/accounts');
 export const addAccount = (data) => apiSend('/api/accounts', 'POST', data);
 export const deleteAccount = (index) => apiSend(`/api/accounts/${index}`, 'DELETE');
+// Sửa tài khoản theo index (hợp đồng index sẵn có). Dùng cho cờ `completed`
+// do admin đặt thủ công: updateAccount(index, { completed: true | false }).
+export const updateAccount = (index, data) => apiSend(`/api/accounts/${index}`, 'PUT', data);
 
 // ── Queue thủ công ──
 export const startBot = (payload) => apiSend('/api/start', 'POST', payload);

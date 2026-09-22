@@ -783,6 +783,57 @@ input.input-num,
   font-weight: 600;
 }
 
+/* ── Trạng thái tài khoản trên chip Auto-Scan ──────────────
+   ✓ hoàn thành (xanh) · ● đang học/đã lên lịch (xanh dương) · ○ chưa (xám).
+   `account.completed` do admin đặt thủ công là nguồn chân lý của màu xanh. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.chip .chip-state {
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.chip-name { white-space: nowrap; }
+
+.chip-completed { border-color: var(--success); color: var(--success); }
+.chip-completed .chip-state { color: var(--success); }
+
+.chip-learning { border-color: var(--accent); color: var(--accent); }
+.chip-learning .chip-state { color: var(--accent); }
+
+.chip-incomplete { color: var(--text3); }
+.chip-incomplete .chip-state { color: var(--text3); }
+
+/* Chip đang chọn phải nổi bật hơn màu trạng thái, nhưng vẫn giữ được dấu trạng
+   thái: nền primary + viền trong đúng màu trạng thái. */
+.chip.selected.chip-completed,
+.chip.selected.chip-learning,
+.chip.selected.chip-incomplete {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-contrast);
+}
+
+.chip.selected .chip-state { color: var(--primary-contrast); }
+.chip.selected.chip-completed { box-shadow: inset 0 0 0 2px var(--success); }
+.chip.selected.chip-learning { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* Chú giải trạng thái dưới bộ chọn tài khoản */
+.chip-legend {
+  display: inline-block;
+  margin-right: 12px;
+  white-space: nowrap;
+}
+
+.chip-legend-completed { color: var(--success); }
+.chip-legend-learning { color: var(--accent); }
+.chip-legend-incomplete { color: var(--text3); }
+
 /* ── Badge trạng thái ───────────────────────────────────── */
 .session-badge {
   padding: 3px 9px;
@@ -1302,6 +1353,51 @@ input.input-num,
 }
 
 .account-item:hover .account-delete { opacity: 1; }
+
+/* ── Tài khoản đã hoàn thành (admin đặt thủ công) ───────── */
+.account-item-completed {
+  background: rgba(61, 214, 140, 0.05);
+  border-left: 2px solid var(--success);
+}
+
+.account-item-completed:hover { background: rgba(61, 214, 140, 0.09); }
+
+.account-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.account-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  padding: 2px 7px;
+  border-radius: 20px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.account-badge-completed {
+  color: var(--success);
+  border-color: var(--success);
+  background: rgba(61, 214, 140, 0.1);
+}
+
+.account-badge-incomplete {
+  color: var(--text3);
+  border-color: var(--border-strong);
+}
+
+.account-toggle-done {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.account-toggle-done:hover:not(:disabled) {
+  background: rgba(61, 214, 140, 0.12);
+}
 
 /* ── Trạng thái rỗng ────────────────────────────────────── */
 .empty {

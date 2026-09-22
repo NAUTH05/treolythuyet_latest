@@ -259,6 +259,54 @@ export function monthLabel(year, month) {
   return `Tháng ${month}/${year}`;
 }
 
+// ── Chọn năm trực tiếp ──
+// Khoảng năm gợi ý quanh năm hiện tại (giờ VN): hiện tại − 5 … hiện tại + 10.
+export const YEAR_RANGE_BACK = 5;
+export const YEAR_RANGE_FORWARD = 10;
+
+// Chuẩn hoá một năm: null/undefined/'' và mọi giá trị không phải số nguyên dương
+// đều trả về null. (Number(null) === 0 nên không thể chỉ dựa vào Number.isInteger.)
+function toValidYear(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const year = Number(value);
+  return Number.isInteger(year) && year >= 1 && year <= 9999 ? year : null;
+}
+
+// Danh sách năm cho <select>: khoảng mặc định quanh năm tham chiếu, cộng mọi năm
+// đang có trong ngày đã chọn (để preset ngoài khoảng vẫn chọn được) và năm đang
+// hiển thị. Luôn tăng dần và không trùng.
+export function buildYearOptions({
+  referenceYear = referenceYearVN(),
+  selectedDates = [],
+  displayedYear = null,
+} = {}) {
+  const years = new Set();
+  const ref = toValidYear(referenceYear);
+  if (ref !== null) {
+    for (let year = ref - YEAR_RANGE_BACK; year <= ref + YEAR_RANGE_FORWARD; year++) years.add(year);
+  }
+  for (const iso of selectedDates || []) {
+    const parts = parseISODate(iso);
+    if (parts) years.add(parts.year);
+  }
+  const shown = toValidYear(displayedYear);
+  if (shown !== null) years.add(shown);
+  return [...years].sort((a, b) => a - b);
+}
+
+// Đổi năm đang hiển thị nhưng GIỮ NGUYÊN tháng đang xem. Năm không hợp lệ bị bỏ
+// qua (trả về view cũ). Hàm thuần nên không đụng tới danh sách ngày đã chọn —
+// người dùng đổi năm qua lại không làm mất lựa chọn hiện có.
+export function changeCalendarYear(view, year) {
+  const current = view && Number.isInteger(view.year) && Number.isInteger(view.month)
+    ? { year: view.year, month: view.month }
+    : null;
+  if (!current) return view;
+  const next = toValidYear(year);
+  if (next === null) return current;
+  return { year: next, month: current.month };
+}
+
 export function todayISO(now = new Date()) {
   try {
     const parts = new Intl.DateTimeFormat('en-CA', {

@@ -1,11 +1,30 @@
 import { useState } from 'react';
 import * as api from '../api';
+import { isAccountCompleted } from '../accountCompletion.mjs';
+
+function formatCompletedAt(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('vi-VN', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
 
 export default function AccountPanel({ accounts, onRefresh, toast }) {
   const [showModal, setShowModal] = useState(false);
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  // Index (1-based) của tài khoản đang lưu cờ hoàn thành → khoá nút trong lúc chờ.
+  const [savingIndex, setSavingIndex] = useState(null);
 
   const handleAdd = async () => {
     if (!email || !password) {
@@ -30,6 +49,31 @@ export default function AccountPanel({ accounts, onRefresh, toast }) {
     onRefresh();
   };
 
+  // Trạng thái hoàn thành CHỈ đổi khi admin bấm — không bao giờ tự suy ra từ
+  // tiến độ Auto-Scan/AutoCourse.
+  const handleToggleCompleted = async (account) => {
+    const nextCompleted = !isAccountCompleted(account);
+    setSavingIndex(account.index);
+    try {
+      const res = await api.updateAccount(account.index, { completed: nextCompleted });
+      if (res && res.error) {
+        toast(res.error, 'error');
+      } else {
+        toast(
+          nextCompleted
+            ? `Đã đánh dấu hoàn thành: ${account.name}`
+            : `Đã bỏ đánh dấu hoàn thành: ${account.name}`,
+          nextCompleted ? 'success' : 'info'
+        );
+        await onRefresh();
+      }
+    } catch (err) {
+      toast(`Lỗi: ${err.message}`, 'error');
+    } finally {
+      setSavingIndex(null);
+    }
+  };
+
   return (
     <>
       <div className="card">
@@ -48,16 +92,43 @@ export default function AccountPanel({ accounts, onRefresh, toast }) {
             </div>
           ) : (
             <ul className="account-list">
-              {accounts.map((a, i) => (
-                <li key={a.index} className="account-item">
-                  <div className="account-index">{i + 1}</div>
-                  <div className="account-info">
-                    <div className="account-name">{a.name}</div>
-                    <div className="account-email">{a.email}</div>
-                  </div>
-                  <button className="btn btn-sm btn-danger account-delete" onClick={() => handleDelete(a.index)}>Xóa</button>
-                </li>
-              ))}
+              {accounts.map((a, i) => {
+                const completed = isAccountCompleted(a);
+                const saving = savingIndex === a.index;
+                return (
+                  <li key={a.index} className={`account-item ${completed ? 'account-item-completed' : ''}`}>
+                    <div className="account-index">{i + 1}</div>
+                    <div className="account-info">
+                      <div className="account-name">
+                        {a.name}
+                        <span
+                          className={`account-badge ${completed ? 'account-badge-completed' : 'account-badge-incomplete'}`}
+                          title={completed && a.completedAt ? `Hoàn thành lúc ${formatCompletedAt(a.completedAt)}` : undefined}
+                        >
+                          {completed ? '✓ Đã hoàn thành' : '○ Chưa hoàn thành'}
+                        </span>
+                      </div>
+                      <div className="account-email">{a.email}</div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`btn btn-sm ${completed ? 'btn-outline account-toggle-done' : 'btn-outline'}`}
+                      onClick={() => handleToggleCompleted(a)}
+                      disabled={saving}
+                      title="Chỉ admin đặt được trạng thái này — không tự động theo Auto-Scan"
+                    >
+                      {saving ? 'Đang lưu...' : completed ? 'Bỏ hoàn thành' : 'Đánh dấu hoàn thành'}
+                    </button>
+                    <button
+                      className="btn btn-sm btn-danger account-delete"
+                      onClick={() => handleDelete(a.index)}
+                      disabled={saving}
+                    >
+                      Xóa
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>

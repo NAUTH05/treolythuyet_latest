@@ -9,10 +9,16 @@
 
 // Snapshot chuẩn của một phiên để gửi ra client. `getStatus()` là nguồn chân lý
 // của engine; chỉ bổ sung các trường vòng đời nằm ngoài engine.
+//
+// `accountEmail` được thêm ở đây (không sửa engine) để Dashboard ghép phiên với
+// tài khoản theo email thay vì chỉ dựa vào tên hiển thị. Phiên khôi phục từ
+// Firestore cũ có thể thiếu email → trả null và client tự lùi về so tên.
 function autoScanSnapshot(session) {
   if (!session || typeof session.getStatus !== 'function') return null;
+  const account = session.account || {};
   return {
     ...session.getStatus(),
+    accountEmail: account.email || null,
     nextRunTime: session.nextRunTime || null,
     completedAt: session.completedAt || null,
   };

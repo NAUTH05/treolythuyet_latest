@@ -6,6 +6,9 @@ import {
   toggleDateSelection,
   paintDateSelection,
   todayISO,
+  referenceYearVN,
+  buildYearOptions,
+  changeCalendarYear,
 } from '../autoscanCalendar.mjs';
 
 const WEEKDAYS = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'CN'];
@@ -13,9 +16,13 @@ const WEEKDAYS = ['T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'CN'];
 // Lịch chọn ngày học được phép:
 //   - Click 1 ngày: bật/tắt ngày đó.
 //   - Giữ + kéo: "tô" một dải liên tục (chọn hoặc bỏ chọn tuỳ ô bắt đầu).
+//   - Chọn năm trực tiếp ở header: chỉ đổi năm đang xem, GIỮ NGUYÊN tháng và
+//     toàn bộ ngày đã chọn (đổi năm qua lại không làm mất lựa chọn).
 // Dùng Pointer Events để chạy được cả chuột lẫn cảm ứng.
 export default function AllowedDateCalendar({ value = [], onChange }) {
   const today = useMemo(() => todayISO(), []);
+  // Năm tham chiếu theo giờ Việt Nam (Asia/Ho_Chi_Minh) — dùng cho khoảng năm.
+  const refYear = useMemo(() => referenceYearVN(), []);
   const anchorIso = value.length > 0 ? [...value].sort()[0] : today;
   const [view, setView] = useState(() => {
     const [y, m] = anchorIso.split('-').map(Number);
@@ -23,6 +30,13 @@ export default function AllowedDateCalendar({ value = [], onChange }) {
   });
   const selectedSet = useMemo(() => new Set(value), [value]);
   const dragRef = useRef({ active: false, mode: 'select', anchor: null });
+
+  // Khoảng năm mặc định quanh năm hiện tại + mọi năm đang có trong ngày đã chọn,
+  // để preset ngoài khoảng mặc định vẫn chọn được.
+  const yearOptions = useMemo(
+    () => buildYearOptions({ referenceYear: refYear, selectedDates: value, displayedYear: view.year }),
+    [refYear, value, view.year]
+  );
 
   // Kết thúc kéo dù pointerup xảy ra ngoài lịch → không bao giờ kẹt trạng thái.
   useEffect(() => {
@@ -42,6 +56,9 @@ export default function AllowedDateCalendar({ value = [], onChange }) {
 
   const goMonth = (delta) => setView(v => addMonths(v.year, v.month, delta));
 
+  // Đổi năm: giữ nguyên tháng đang xem và không đụng tới ngày đã chọn.
+  const goYear = (year) => setView(v => changeCalendarYear(v, year));
+
   const handlePointerDown = (iso) => (event) => {
     if (event.button != null && event.button !== 0) return;
     event.preventDefault(); // chặn bôi đen text khi kéo
@@ -58,9 +75,22 @@ export default function AllowedDateCalendar({ value = [], onChange }) {
 
   return (
     <div className="acal" style={styles.wrap}>
-      <div style={styles.header}>
+      <div className="acal-header" style={styles.header}>
         <button type="button" style={styles.navBtn} onClick={() => goMonth(-1)} aria-label="Tháng trước">‹</button>
         <span style={styles.title}>{monthLabel(view.year, view.month)}</span>
+        <label style={styles.yearLabel} title="Chọn năm đang xem">
+          <span style={styles.yearLabelText}>Năm</span>
+          <select
+            style={styles.yearSelect}
+            value={view.year}
+            onChange={e => goYear(e.target.value)}
+            aria-label="Chọn năm đang xem"
+          >
+            {yearOptions.map(year => (
+              <option key={year} value={year}>{year}</option>
+            ))}
+          </select>
+        </label>
         <button type="button" style={styles.navBtn} onClick={() => goMonth(1)} aria-label="Tháng sau">›</button>
       </div>
 
@@ -114,12 +144,26 @@ const styles = {
     userSelect: 'none',
     touchAction: 'none',
   },
-  header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 },
-  title: { fontWeight: 600 },
+  // flexWrap để trên màn hình hẹp cụm "‹ Tháng 9/2026 [Năm ▾] ›" tự xuống dòng
+  // thay vì bị bóp méo.
+  header: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    gap: 6, flexWrap: 'wrap', marginBottom: 8,
+  },
+  title: { fontWeight: 600, flex: '1 1 auto', textAlign: 'center', minWidth: 90 },
+  yearLabel: { display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '0.78rem', opacity: 0.85 },
+  yearLabelText: { whiteSpace: 'nowrap' },
+  yearSelect: {
+    padding: '3px 6px', borderRadius: 8, cursor: 'pointer',
+    border: '1px solid var(--border-color, rgba(255,255,255,0.15))',
+    background: 'transparent', color: 'inherit', fontFamily: 'inherit',
+    fontSize: '0.82rem', maxWidth: 96,
+  },
   navBtn: {
     width: 30, height: 30, borderRadius: 8, cursor: 'pointer',
     border: '1px solid var(--border-color, rgba(255,255,255,0.15))',
     background: 'transparent', color: 'inherit', fontSize: 18, lineHeight: 1,
+    flexShrink: 0,
   },
   weekRow: { display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 4, marginBottom: 4 },
   weekLabel: { textAlign: 'center', fontSize: '0.72rem', opacity: 0.65, padding: '2px 0' },

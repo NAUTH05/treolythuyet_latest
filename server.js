@@ -19,6 +19,7 @@ const fbService = require('./firebase-service');
 const { SerializedStateSync } = require('./stateSync');
 const { operatingWindow, assignDistributedStartTimes } = require('./autoScanScheduling');
 const { normalizeSurplusOptions } = require('./autoScanSurplus');
+const { accountCompletionState, newAccountRecord, applyCompletionUpdate } = require('./accountCompletion');
 const { filterLogEntries, paginateNewestFirst } = require('./logQuery');
 const {
   readDailyLogFile,
@@ -1254,12 +1255,14 @@ app.post('/api/admin/firebase-config', async (req, res) => {
 // Lấy danh sách tài khoản
 app.get('/api/accounts', (req, res) => {
   const accounts = loadAccounts();
-  // Ẩn password khi trả về
+  // Ẩn password khi trả về. `completed`/`completedAt` là cờ admin đặt thủ công;
+  // tài khoản cũ chưa có trường này được trả về như chưa hoàn thành.
   res.json(accounts.map((a, i) => ({
     index: i + 1,
     name: a.name,
     email: a.email,
     hasPassword: !!a.password,
+    ...accountCompletionState(a),
   })));
 });
 
@@ -1268,7 +1271,7 @@ app.post('/api/accounts', async (req, res) => {
   const { name, email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Cần email và mật khẩu' });
   const accounts = loadAccounts();
-  accounts.push({ name: name || email, email, password });
+  accounts.push(newAccountRecord({ name: name || email, email, password }));
   return respondAfterStateSync(res, saveAccounts(accounts), { ok: true, count: accounts.length });
 });
 
@@ -1286,10 +1289,13 @@ app.put('/api/accounts/:index', async (req, res) => {
   const idx = parseInt(req.params.index) - 1;
   const accounts = loadAccounts();
   if (idx < 0 || idx >= accounts.length) return res.status(404).json({ error: 'Không tìm thấy' });
-  const { name, email, password } = req.body;
+  const { name, email, password, completed } = req.body;
   if (name) accounts[idx].name = name;
   if (email) accounts[idx].email = email;
   if (password) accounts[idx].password = password;
+  // Cờ hoàn thành CHỈ đổi khi client gửi boolean thật; mọi giá trị khác bị bỏ qua
+  // để không vô tình xoá cờ. name/email/password được giữ nguyên như trước.
+  applyCompletionUpdate(accounts[idx], completed);
   return respondAfterStateSync(res, saveAccounts(accounts), { ok: true });
 });
 
