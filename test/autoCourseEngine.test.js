@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const {
   AutoCourseSession,
   courseReachedTarget,
+  courseCompletionDecision,
   createCourseFinalizationPlan,
   getCourseTargetRemainingMs,
   POST_TARGET_GRACE_MINUTES,
@@ -1712,5 +1713,331 @@ test('schedule strategy: khóa kiệt khẩu → năng lực chưa dùng dồn c
     session.surplusCourseStates['https://x/c2'].targetMinutes >= 479,
     `C2 phải nhận lại năng lực chưa dùng (nhận ${session.surplusCourseStates['https://x/c2'].targetMinutes})`
   );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THẨM QUYỀN HOÀN THÀNH KHÓA NORMAL Ở CHECKPOINT
+//
+// Khóa NORMAL tự động phát hiện (targetMinutes = 0) lấy TRẠNG THÁI KHÓA CẤP
+// WEBSITE làm thẩm quyền. "Mọi bài đã 100%" KHÔNG phải thẩm quyền: trên thực tế
+// khóa có thể hiển thị Completed trong khi vài bài vẫn 0%/70%. Chờ đủ 100% mọi
+// bài khiến bot treo tiếp vô ích dù khóa đã xong.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function checkpointFixture({
+  scan = {},
+  targetMinutes = 0,
+  runId = 21,
+  continueStudying = true,
+  courseUrl = 'https://x/slides/course-1',
+} = {}) {
+  const session = new AutoCourseSession(
+    `checkpoint-${runId}`,
+    { name: 'Checkpoint', email: 'c@x.vn' },
+    [{ courseUrl, targetMinutes }],
+  );
+  session.courseProgress[courseUrl] = {
+    title: 'Course',
+    targetMinutes,
+    studiedMinutes: 0,
+    completed: false,
+    finalizationState: COURSE_FINALIZATION_STATES.NORMAL_STUDY,
+  };
+  session._phase = PHASE_RUNNING;
+  session._activeCourseRunId = runId;
+
+  const logs = [];
+  const statuses = [];
+  session.on('log', entry => logs.push(entry.msg));
+  session.on('status', s => statuses.push(s));
+
+  session._scanCourseDetailsForCheckpoint = async () => ({
+    courseTitle: 'Course',
+    actualStudiedMinutes: 0,
+    totalLessons: 5,
+    allLessons: [],
+    // Mặc định: còn bài chưa xong (đúng thực tế production — khóa Completed nhưng
+    // bài 4 vẫn 40%).
+    uncompletedLessons: [{ title: 'Lesson 4', url: `${courseUrl}/lesson-4`, progressPercent: 40 }],
+    ...scan,
+  });
+
+  return { session, courseUrl, logs, statuses, runId, targetMinutes, continueStudying };
+}
+
+function runCheckpoint({ session, courseUrl, targetMinutes, runId, continueStudying = true }) {
+  return session._verifyCourseProgressAfterCheckpoint({
+    courseUrl,
+    targetMinutes,
+    courseTitle: 'Course',
+    courseRunId: runId,
+    continueStudying,
+  });
+}
+
+test('courseCompletionDecision: trạng thái website là thẩm quyền, không dùng "mọi bài 100%"', () => {
+  // Website biết rõ → website quyết định.
+  assert.equal(courseCompletionDecision({ websiteState: 'completed', targetMinutes: 0, verifiedMinutes: 0 }), true);
+  assert.equal(courseCompletionDecision({ websiteState: 'incomplete', targetMinutes: 0, verifiedMinutes: 0 }), false);
+  assert.equal(
+    courseCompletionDecision({ websiteState: 'incomplete', targetMinutes: 756, verifiedMinutes: 99999 }),
+    false,
+    'website In Progress không được thành Completed chỉ vì đồng hồ phút đã đủ',
+  );
+  // Website unknown → chỉ lùi về mốc phút thủ công khi có mốc.
+  assert.equal(courseCompletionDecision({ websiteState: 'unknown', targetMinutes: 756, verifiedMinutes: 756 }), true);
+  assert.equal(courseCompletionDecision({ websiteState: 'unknown', targetMinutes: 756, verifiedMinutes: 755 }), false);
+  assert.equal(
+    courseCompletionDecision({ websiteState: 'unknown', targetMinutes: 0, verifiedMinutes: 100000 }),
+    false,
+    'không có mốc phút và website không rõ → không đoán bừa Completed',
+  );
+});
+
+test('checkpoint: khóa tự động Completed trên website → xác nhận NGAY dù bài 4 mới 40%', async () => {
+  const fixture = checkpointFixture({
+    scan: {
+      courseCompletionState: 'completed',
+      courseLevelCompleted: true,
+      courseProgressPercent: 100,
+      actualStudiedMinutes: 769,
+      actualStudiedText: '12h49m',
+    },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, true, 'khóa Completed phải được xác nhận ngay tại checkpoint');
+  assert.equal(result.stale, false);
+  const progress = fixture.session.courseProgress[fixture.courseUrl];
+  assert.equal(progress.completed, true);
+  assert.equal(progress.websiteCourseCompleted, true);
+  assert.equal(progress.websiteCourseCompletionState, 'completed');
+  assert.equal(progress.finalizationState, COURSE_FINALIZATION_STATES.COMPLETED);
+});
+
+test('checkpoint: khóa tự động Completed → không cần bài hiện tại đạt 100%', async () => {
+  // Bài học chỉ 40% và danh sách bài chưa xong vẫn còn — đây chính là tình huống
+  // production từng làm bot treo tiếp mãi.
+  const fixture = checkpointFixture({
+    scan: {
+      courseCompletionState: 'completed',
+      courseProgressPercent: 100,
+      uncompletedLessons: [
+        { title: 'Lesson 4', url: 'https://x/slides/course-1/lesson-4', progressPercent: 40 },
+        { title: 'Lesson 5', url: 'https://x/slides/course-1/lesson-5', progressPercent: 0 },
+      ],
+    },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, true);
+  assert.equal(result.scanResult.uncompletedLessons.length, 2, 'vẫn còn bài chưa xong nhưng không cản trở');
+  assert.equal(fixture.session.courseProgress[fixture.courseUrl].completed, true);
+});
+
+test('checkpoint: website In Progress 99% → KHÔNG xác nhận, lưu 99% và học tiếp', async () => {
+  const fixture = checkpointFixture({
+    scan: {
+      courseCompletionState: 'incomplete',
+      courseLevelCompleted: false,
+      courseProgressPercent: 99,
+      actualStudiedMinutes: 754,
+      actualStudiedText: '12h34m',
+    },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, false);
+  const progress = fixture.session.courseProgress[fixture.courseUrl];
+  assert.equal(progress.completed, false);
+  assert.equal(progress.websiteCourseProgressPercent, 99, 'dashboard phải lưu 99%');
+  assert.equal(progress.websiteCourseCompletionState, 'incomplete');
+  assert.equal(progress.finalizationState, COURSE_FINALIZATION_STATES.NORMAL_STUDY);
+  assert.equal(fixture.logs.some(msg => msg.includes('continue current lesson')), true);
+});
+
+test('checkpoint: MỌI bài đã 100% nhưng website chưa Completed → KHÔNG hoàn thành', async () => {
+  const fixture = checkpointFixture({
+    scan: {
+      courseCompletionState: 'incomplete',
+      courseProgressPercent: 100,
+      uncompletedLessons: [],
+    },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, false, 'mọi bài 100% không được thay thế trạng thái khóa trên website');
+  assert.equal(fixture.session.courseProgress[fixture.courseUrl].completed, false);
+});
+
+test('checkpoint: website unknown + không có mốc phút → KHÔNG hoàn thành (không đoán bừa)', async () => {
+  const fixture = checkpointFixture({
+    scan: { courseCompletionState: 'unknown', uncompletedLessons: [] },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, false);
+  assert.equal(fixture.session.courseProgress[fixture.courseUrl].completed, false);
+});
+
+test('checkpoint: khóa thủ công giữ fallback mốc phút khi website unknown', async () => {
+  const fixture = checkpointFixture({
+    targetMinutes: 756,
+    scan: {
+      courseCompletionState: 'unknown',
+      actualStudiedMinutes: 756,
+      uncompletedLessons: [{ progressPercent: 90 }],
+    },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, true, 'khóa thủ công (targetMinutes > 0) vẫn hoàn thành theo mốc phút');
+  assert.equal(fixture.session.courseProgress[fixture.courseUrl].completed, true);
+});
+
+test('checkpoint: website In Progress là thẩm quyền — vượt mốc phút thủ công vẫn KHÔNG hoàn thành', async () => {
+  const fixture = checkpointFixture({
+    targetMinutes: 756,
+    scan: {
+      courseCompletionState: 'incomplete',
+      actualStudiedMinutes: 900,
+      uncompletedLessons: [{ progressPercent: 90 }],
+    },
+  });
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, false);
+  assert.equal(fixture.session.courseProgress[fixture.courseUrl].completed, false);
+});
+
+test('checkpoint: 97% → 99% → Completed cập nhật courseProgress và phát status mỗi lần', async () => {
+  const sequence = [
+    { courseCompletionState: 'incomplete', courseProgressPercent: 97, actualStudiedMinutes: 737, actualStudiedText: '12h17m' },
+    { courseCompletionState: 'incomplete', courseProgressPercent: 99, actualStudiedMinutes: 754, actualStudiedText: '12h34m' },
+    { courseCompletionState: 'completed', courseProgressPercent: 100, actualStudiedMinutes: 769, actualStudiedText: '12h49m' },
+  ];
+  const fixture = checkpointFixture({ runId: 41 });
+  let step = 0;
+  fixture.session._scanCourseDetailsForCheckpoint = async () => ({
+    courseTitle: 'Course',
+    totalLessons: 5,
+    allLessons: [],
+    uncompletedLessons: [{ progressPercent: 40 }],
+    ...sequence[Math.min(step++, sequence.length - 1)],
+  });
+
+  const confirmations = [];
+  const percentages = [];
+  const recordedTexts = [];
+  for (let i = 0; i < sequence.length; i++) {
+    const result = await runCheckpoint(fixture);
+    confirmations.push(result.confirmed);
+    const progress = fixture.session.courseProgress[fixture.courseUrl];
+    percentages.push(progress.websiteCourseProgressPercent);
+    recordedTexts.push(progress.websiteRecordedText);
+  }
+
+  assert.deepEqual(confirmations, [false, false, true]);
+  assert.deepEqual(percentages, [97, 99, 100]);
+  assert.deepEqual(recordedTexts, ['12h17m', '12h34m', '12h49m']);
+  assert.equal(fixture.statuses.length, 3, 'mỗi checkpoint phải phát status để dashboard cập nhật');
+  const last = fixture.statuses[fixture.statuses.length - 1].courseProgress[fixture.courseUrl];
+  assert.equal(last.websiteCourseProgressPercent, 100);
+  assert.equal(last.websiteCourseCompleted, true);
+  assert.equal(last.completed, true);
+});
+
+test('checkpoint: chốt khóa KHÔNG phụ thuộc xác minh cấp bài học', async () => {
+  const fixture = checkpointFixture({
+    scan: { courseCompletionState: 'completed', courseProgressPercent: 100 },
+  });
+  let lessonLevelChecked = false;
+  fixture.session._isCurrentLessonCompleted = async () => { lessonLevelChecked = true; return false; };
+  fixture.session._verifyLessonProgressFromCourse = async () => {
+    lessonLevelChecked = true;
+    return { completed: false, progressPercent: 40 };
+  };
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.confirmed, true);
+  assert.equal(lessonLevelChecked, false, 'quyết định hoàn thành khóa không được hỏi trạng thái bài học');
+});
+
+test('checkpoint: run cũ (stale) không xác nhận hoàn thành dù website Completed', async () => {
+  const fixture = checkpointFixture({
+    runId: 21,
+    scan: { courseCompletionState: 'completed', courseProgressPercent: 100 },
+  });
+  fixture.session._activeCourseRunId = 99; // đã đổi run trong lúc I/O chờ
+
+  const result = await runCheckpoint(fixture);
+
+  assert.equal(result.stale, true);
+  assert.equal(result.confirmed, false);
+  assert.equal(fixture.session.courseProgress[fixture.courseUrl].completed, false, 'tiến độ muộn không được ghi');
+});
+
+test('log checkpoint: khóa tự động (targetMinutes = 0) KHÔNG in "X/0 minutes"', async () => {
+  const fixture = checkpointFixture({
+    scan: {
+      courseCompletionState: 'incomplete',
+      courseProgressPercent: 98,
+      actualStudiedMinutes: 754,
+      actualStudiedText: '12h34m',
+    },
+  });
+
+  await runCheckpoint(fixture);
+  const joined = fixture.logs.join('\n');
+
+  assert.doesNotMatch(joined, /\/0 minutes/, 'không được in mốc 0 phút gây hiểu nhầm');
+  assert.match(joined, /Website status: In Progress/);
+  assert.match(joined, /Course progress: 98%/);
+  assert.match(joined, /Website recorded time: 12h34m/);
+  assert.match(joined, /Decision: continue current lesson/);
+});
+
+test('log checkpoint: khóa tự động Completed → log ✅ và quyết định dừng bài hiện tại', async () => {
+  const fixture = checkpointFixture({
+    scan: {
+      courseCompletionState: 'completed',
+      courseProgressPercent: 100,
+      actualStudiedMinutes: 769,
+      actualStudiedText: '12h49m',
+    },
+  });
+
+  await runCheckpoint(fixture);
+  const joined = fixture.logs.join('\n');
+
+  assert.doesNotMatch(joined, /\/0 minutes/);
+  assert.match(joined, /✅ Checkpoint course status/);
+  assert.match(joined, /Website status: Completed/);
+  assert.match(joined, /Website recorded time: 12h49m/);
+  assert.match(joined, /Decision: stop current lesson and switch course/);
+});
+
+test('log checkpoint: khóa thủ công (targetMinutes > 0) vẫn in "755/756 minutes"', async () => {
+  const fixture = checkpointFixture({
+    targetMinutes: 756,
+    scan: {
+      courseCompletionState: 'unknown',
+      actualStudiedMinutes: 755,
+      uncompletedLessons: [{ progressPercent: 90 }],
+    },
+  });
+
+  await runCheckpoint(fixture);
+  const joined = fixture.logs.join('\n');
+
+  assert.match(joined, /755\/756 minutes/, 'khóa có mốc phút thủ công giữ nguyên định dạng log cũ');
 });
 

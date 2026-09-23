@@ -122,6 +122,34 @@ function courseReachedTarget(targetMinutes, studiedMinutes, allLessonsCompleted 
   return target > 0 ? studied >= target : allLessonsCompleted;
 }
 
+// Quyết định HOÀN THÀNH KHÓA ở checkpoint (chỉ dùng cho lượt NORMAL).
+//
+// Thẩm quyền theo thứ tự:
+//   1. Trạng thái khóa cấp website khi ĐÃ BIẾT:
+//        'completed'  → xác nhận NGAY, không cần chờ bài học đạt 100%.
+//        'incomplete' → KHÔNG xác nhận, kể cả khi đồng hồ phút thủ công đã đủ.
+//   2. Website 'unknown' → chỉ lùi về mốc phút thủ công khi targetMinutes > 0.
+//   3. Còn lại → chưa xác nhận.
+//
+// LƯU Ý QUAN TRỌNG: KHÔNG dùng "mọi bài đã 100%" để xác nhận khóa NORMAL.
+// Trên thực tế khóa có thể hiển thị Completed trong khi vài bài vẫn 0%/70%.
+// (Mức độ hoàn thành từng bài vẫn dùng cho chọn bài chưa xong / surplus /
+// xác minh bài — nhưng không phải thẩm quyền cho khóa NORMAL.)
+function courseCompletionDecision({ websiteState, targetMinutes, verifiedMinutes }) {
+  if (websiteState === 'completed') return true;
+  if (websiteState === 'incomplete') return false;
+  const target = Math.max(0, Number(targetMinutes) || 0);
+  if (target > 0) return Math.max(0, Number(verifiedMinutes) || 0) >= target;
+  return false;
+}
+
+// Nhãn hiển thị cho trạng thái khóa cấp website.
+function websiteCompletionStateLabel(state) {
+  if (state === 'completed') return 'Completed';
+  if (state === 'incomplete') return 'In Progress';
+  return 'Unknown';
+}
+
 function createCourseFinalizationPlan(existingPlan, lessonRemainingMs, elapsedMs = 0, graceMinutes = POST_TARGET_GRACE_MINUTES) {
   if (existingPlan) return existingPlan;
 
@@ -1725,9 +1753,15 @@ class AutoCourseSession extends EventEmitter {
     }
 
     const verifiedMinutes = Math.max(0, Number(verifiedScan.actualStudiedMinutes) || 0);
-    const allLessonsCompleted = verifiedScan.uncompletedLessons.length === 0;
-    const confirmed = courseReachedTarget(targetMinutes, verifiedMinutes, allLessonsCompleted);
+    // Thẩm quyền là TRẠNG THÁI KHÓA CẤP WEBSITE. "Mọi bài đã 100%" KHÔNG còn được
+    // dùng để xác nhận khóa NORMAL — website có thể báo Completed khi vài bài vẫn
+    // 0%/70%, nên chờ đủ 100% mọi bài là sai (xem courseCompletionDecision).
     const siteCompletionState = AutoCourseSession._courseCompletionStateOf(verifiedScan);
+    const confirmed = courseCompletionDecision({
+      websiteState: siteCompletionState,
+      targetMinutes,
+      verifiedMinutes,
+    });
     const recorded = AutoCourseSession._websiteRecordedTime(verifiedScan, this.courseProgress[courseUrl]);
     this.courseProgress[courseUrl] = {
       ...this.courseProgress[courseUrl],
@@ -1750,15 +1784,38 @@ class AutoCourseSession extends EventEmitter {
     };
     this.emit('status', this.getStatus());
 
-    if (confirmed) {
-      this.log(`✅ Course confirmed complete: ${verifiedMinutes}/${targetMinutes} minutes`, 'success');
+    if (targetMinutes > 0) {
+      // Khóa có mốc phút thủ công — giữ nguyên định dạng log cũ (tương thích ngược).
+      if (confirmed) {
+        this.log(`✅ Course confirmed complete: ${verifiedMinutes}/${targetMinutes} minutes`, 'success');
+      } else {
+        this.log(
+          continueStudying
+            ? `⏱️ Checkpoint reports ${verifiedMinutes}/${targetMinutes} minutes — continuing the current lesson`
+            : `⚠️ Checkpoint reports ${verifiedMinutes}/${targetMinutes} minutes for [${verifiedScan.courseTitle || courseTitle}] — not marking complete and not resuming this course in the current run`,
+          continueStudying ? 'info' : 'warn'
+        );
+      }
     } else {
-      this.log(
-        continueStudying
-          ? `⏱️ Checkpoint reports ${verifiedMinutes}/${targetMinutes} minutes — continuing the current lesson`
-          : `⚠️ Checkpoint reports ${verifiedMinutes}/${targetMinutes} minutes for [${verifiedScan.courseTitle || courseTitle}] — not marking complete and not resuming this course in the current run`,
-        continueStudying ? 'info' : 'warn'
-      );
+      // Khóa tự động phát hiện (targetMinutes = 0) KHÔNG có mốc phút thủ công — in
+      // "X/0 minutes" là vô nghĩa và gây hiểu nhầm. Báo cáo theo trạng thái website.
+      const websiteLabel = websiteCompletionStateLabel(siteCompletionState);
+      const progressLabel = verifiedScan.courseProgressPercent == null
+        ? 'không rõ'
+        : `${verifiedScan.courseProgressPercent}%`;
+      const recordedLabel = recorded.websiteRecordedText
+        || (verifiedMinutes > 0 ? `${verifiedMinutes} minutes` : 'không rõ');
+      const decisionLabel = confirmed
+        ? 'stop current lesson and switch course'
+        : continueStudying
+          ? 'continue current lesson'
+          : 'stop and do not resume this course in the current run';
+
+      this.log(`${confirmed ? '✅' : '🔍'} Checkpoint course status`, confirmed ? 'success' : 'info');
+      this.log(`   Website status: ${websiteLabel}`, 'info');
+      this.log(`   Course progress: ${progressLabel}`, 'info');
+      this.log(`   Website recorded time: ${recordedLabel}`, 'info');
+      this.log(`   Decision: ${decisionLabel}`, confirmed ? 'success' : continueStudying ? 'info' : 'warn');
     }
 
     return { confirmed, stale: false, scanResult: verifiedScan };
@@ -3080,6 +3137,8 @@ class AutoCourseSession extends EventEmitter {
 module.exports = {
   AutoCourseSession,
   courseReachedTarget,
+  courseCompletionDecision,
+  websiteCompletionStateLabel,
   createCourseFinalizationPlan,
   getCourseTargetRemainingMs,
   POST_TARGET_GRACE_MINUTES,
