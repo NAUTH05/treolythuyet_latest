@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as api from '../api';
+import {
+  LOG_MAX_RENDER,
+  logKey,
+  mergeLogStreams,
+  countLevels,
+  buildAccountList,
+  resolveFirstPageResponse,
+  prependOlderPage,
+  entryLevel,
+} from '../logStream.mjs';
 
 const LEVEL_CLASS = {
   info: 'log-info',
@@ -15,8 +25,8 @@ const LEVEL_LABELS = {
   error: 'Lỗi',
 };
 
-const PAGE_SIZE = 200;      // mỗi lần tải
-const MAX_RENDER = 2000;    // trần số dòng giữ trong DOM sau khi trộn realtime
+const PAGE_SIZE = 200;           // mỗi lần tải
+const MAX_RENDER = LOG_MAX_RENDER; // trần số dòng giữ trong DOM sau khi trộn realtime
 
 function vnDateDDMMYYYY(d = new Date()) {
   const parts = new Intl.DateTimeFormat('en-GB', {
@@ -27,23 +37,6 @@ function vnDateDDMMYYYY(d = new Date()) {
   }).formatToParts(d);
   const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
   return `${values.day}-${values.month}-${values.year}`;
-}
-
-function normalizeLogDate(value) {
-  const text = String(value || '').trim();
-  if (/^\d{2}-\d{2}-\d{4}$/.test(text)) return text;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
-    const [year, month, day] = text.split('-');
-    return `${day}-${month}-${year}`;
-  }
-  return '';
-}
-
-// Khóa ổn định để trộn realtime + lịch sử mà không trùng (khớp logQuery.logEntryKey).
-function logKey(entry) {
-  if (entry && entry.id) return String(entry.id);
-  const e = entry || {};
-  return `${e.date || ''}|${e.timestamp || ''}|${e.account || 'system'}|${e.level || 'info'}|${e.msg || ''}`;
 }
 
 export default function LogPanel({ logs: liveLogs = [], onClear }) {
@@ -77,31 +70,44 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
     }
   }, []);
 
+  // Thế hệ request: đổi ngày/bộ lọc → tăng số này. Phản hồi của request CŨ (đã bị
+  // thay thế) bị vứt bỏ, không được ghi đè kết quả mới hơn (race All → Cao → khác).
+  const requestIdRef = useRef(0);
+
   // Tải trang ĐẦU (mới nhất) cho ngày + bộ lọc hiện tại.
   const loadFirstPage = useCallback(async (date, account, level) => {
     if (!date) return;
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     try {
       const res = await api.fetchLogHistory({ date, account, level, limit: PAGE_SIZE });
-      const rows = res && Array.isArray(res.logs) ? res.logs : [];
-      setLoadedLogs(rows.slice().reverse());
-      setNextCursor(res ? res.nextCursor : null);
-      setHasMore(Boolean(res && res.hasMore));
-      setTotal(res && Number.isFinite(res.total) ? res.total : rows.length);
+      // Request đã bị thay thế trong lúc chờ → bỏ qua hoàn toàn (không ghi state).
+      const next = resolveFirstPageResponse({
+        requestId,
+        currentRequestId: requestIdRef.current,
+        response: res,
+      });
+      if (!next) return;
+      setLoadedLogs(next.loadedLogs);
+      setNextCursor(next.nextCursor);
+      setHasMore(next.hasMore);
+      setTotal(next.total);
     } catch (e) {
+      if (requestId !== requestIdRef.current) return;
       console.error(`Không thể tải log ngày ${date}:`, e.message);
       setLoadedLogs([]);
       setNextCursor(null);
       setHasMore(false);
       setTotal(0);
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) setLoading(false);
     }
   }, []);
 
   // Tải thêm trang CŨ hơn và chèn lên đầu danh sách thời gian.
   const loadMore = useCallback(async () => {
     if (!hasMore || nextCursor == null || loadingMore) return;
+    const requestId = requestIdRef.current;
     setLoadingMore(true);
     try {
       const res = await api.fetchLogHistory({
@@ -111,14 +117,16 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
         limit: PAGE_SIZE,
         cursor: nextCursor,
       });
-      const rows = res && Array.isArray(res.logs) ? res.logs : [];
-      setLoadedLogs(prev => [...rows.slice().reverse(), ...prev]);
+      // Bộ lọc/ngày đã đổi trong lúc chờ → trang cũ này không còn thuộc view hiện tại.
+      if (requestId !== requestIdRef.current) return;
+      setLoadedLogs(prev => prependOlderPage(prev, res));
       setNextCursor(res ? res.nextCursor : null);
       setHasMore(Boolean(res && res.hasMore));
     } catch (e) {
+      if (requestId !== requestIdRef.current) return;
       console.error('Không thể tải thêm log:', e.message);
     } finally {
-      setLoadingMore(false);
+      if (requestId === requestIdRef.current) setLoadingMore(false);
     }
   }, [hasMore, nextCursor, loadingMore, selectedDate, filterAccount, filterLevel]);
 
@@ -131,35 +139,36 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
     loadFirstPage(selectedDate, filterAccount, filterLevel);
   }, [selectedDate, filterAccount, filterLevel, loadFirstPage]);
 
-  // Trộn realtime (chỉ khi xem hôm nay) với lịch sử, dedupe theo id/khóa.
-  const currentLogs = useMemo(() => {
-    if (!isTodaySelected || liveLogs.length === 0) return loadedLogs;
-    const map = new Map();
-    for (const entry of loadedLogs) map.set(logKey(entry), entry);
-    for (const entry of liveLogs) {
-      const itemDate = normalizeLogDate(entry && entry.date);
-      if (itemDate && itemDate !== todayStr) continue;
-      map.set(logKey(entry), entry);
-    }
-    const merged = [...map.values()];
-    return merged.length > MAX_RENDER ? merged.slice(-MAX_RENDER) : merged;
-  }, [isTodaySelected, liveLogs, loadedLogs, todayStr]);
+  // Tập dòng ĐÚNG ngày + ĐÚNG tài khoản đang chọn (CHƯA áp bộ lọc level).
+  // Dùng cho bộ đếm level và "Tất cả": bộ đếm không phụ thuộc chính bộ lọc level,
+  // và realtime của tài khoản khác không bao giờ lọt vào đây.
+  const scopedLogs = useMemo(() => mergeLogStreams({
+    loadedLogs,
+    liveLogs,
+    date: selectedDate,
+    account: filterAccount,
+    level: '',
+    isToday: isTodaySelected,
+    maxRender: MAX_RENDER,
+  }), [loadedLogs, liveLogs, selectedDate, filterAccount, isTodaySelected]);
 
-  // Danh sách tài khoản: ưu tiên metadata server cho ngày đang chọn.
-  const accountList = useMemo(() => {
-    const fromMeta = folders.find(f => f.date === selectedDate)?.accounts;
-    if (Array.isArray(fromMeta) && fromMeta.length > 0) return [...fromMeta].sort();
-    return [...new Set(currentLogs.map(l => l.account).filter(Boolean))].sort();
-  }, [folders, selectedDate, currentLogs]);
+  // Dòng hiển thị: áp thêm bộ lọc level. Realtime đã được lọc NGAY TRONG
+  // mergeLogStreams TRƯỚC khi cap MAX_RENDER — nhờ vậy volume của tài khoản khác
+  // không thể đẩy dòng của tài khoản đang chọn ra khỏi danh sách.
+  const currentLogs = useMemo(
+    () => (filterLevel ? scopedLogs.filter(l => entryLevel(l) === filterLevel) : scopedLogs),
+    [scopedLogs, filterLevel]
+  );
 
-  const levelCounts = useMemo(() => {
-    const counts = { error: 0, warn: 0, success: 0, info: 0 };
-    currentLogs.forEach(l => {
-      const lvl = l.level || 'info';
-      if (counts[lvl] !== undefined) counts[lvl]++;
-    });
-    return counts;
-  }, [currentLogs]);
+  // Danh sách tài khoản: ưu tiên metadata server cho ngày đang chọn. Tài khoản ĐANG
+  // CHỌN luôn được giữ trong dropdown kể cả khi metadata cũ/thiếu.
+  const accountList = useMemo(() => buildAccountList({
+    metadataAccounts: folders.find(f => f.date === selectedDate)?.accounts,
+    fallbackAccounts: currentLogs.map(l => l.account).filter(Boolean),
+    selectedAccount: filterAccount,
+  }), [folders, selectedDate, currentLogs, filterAccount]);
+
+  const levelCounts = useMemo(() => countLevels(scopedLogs), [scopedLogs]);
 
   // Chỉ tìm kiếm từ khóa trên các dòng đã tải (giới hạn trong bộ nhớ).
   const filteredLogs = useMemo(() => {
@@ -171,6 +180,11 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
       return msg.includes(query) || acc.includes(query);
     });
   }, [currentLogs, searchQuery]);
+
+  // `total` là tổng ĐÃ LỌC phía server (snapshot tại lần fetch). Dòng realtime mới
+  // có thể vượt snapshot → mẫu số không bao giờ nhỏ hơn số dòng đang thấy, tránh
+  // trạng thái vô lý kiểu "Hiển thị 416 / 200 dòng".
+  const displayTotal = Math.max(total, filteredLogs.length);
 
   useEffect(() => {
     if (autoScroll && boxRef.current) {
@@ -348,7 +362,7 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
                 onChange={e => setFilterLevel(e.target.value)}
                 className="select-sm"
               >
-                <option value="">Tất cả ({currentLogs.length})</option>
+                <option value="">Tất cả ({scopedLogs.length})</option>
                 <option value="error">❌ Lỗi ({levelCounts.error})</option>
                 <option value="warn">⚠️ Cảnh báo ({levelCounts.warn})</option>
                 <option value="success">✅ Thành công ({levelCounts.success})</option>
@@ -428,7 +442,7 @@ export default function LogPanel({ logs: liveLogs = [], onClear }) {
 
             <div className="log-status-footer">
               <span>
-                Hiển thị <strong>{filteredLogs.length}</strong> / <strong>{total}</strong> dòng
+                Hiển thị <strong>{filteredLogs.length}</strong> / <strong>{displayTotal}</strong> dòng
                 {hasMore ? ' (còn dữ liệu cũ hơn)' : ''}
               </span>
               {isTodaySelected && (
