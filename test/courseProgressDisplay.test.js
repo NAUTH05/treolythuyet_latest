@@ -91,3 +91,42 @@ test('dashboard: legacy row đạt mục tiêu giữ nhãn cũ', async () => {
   assert.equal(row.label, 'Đã đạt mục tiêu');
   assert.equal(row.done, true);
 });
+
+// Production thật: [TT17] Pháp Luật Giao thông đường bộ hiển thị 100% + 62h49m
+// nhưng KHÔNG có badge hoàn thành → phải hiển thị "100% · 62h 49m" (In Progress),
+// KHÔNG được thành "Completed · 62h 49m" chỉ vì phần trăm bằng 100.
+test('dashboard: 100% + In Progress + 62h 49m KHÔNG hiển thị Completed', async () => {
+  const { courseRowDisplay } = await loadDisplay();
+  const row = courseRowDisplay({
+    websiteCourseCompleted: false,
+    websiteCourseCompletionState: 'incomplete',
+    websiteCourseProgressPercent: 100,
+    websiteRecordedMinutes: 3769,
+    websiteRecordedText: '62 giờ 49 phút',
+  });
+
+  assert.equal(row.label, '100% · 62h 49m');
+  assert.notEqual(row.label, 'Completed · 62h 49m');
+  assert.equal(row.done, false, 'không được tô xanh chỉ vì 100%');
+  assert.equal(row.websiteCompleted, false);
+  assert.equal(row.pct, 100);
+});
+
+test('dashboard: chỉ badge Completed mới cho nhãn Completed (100% không đủ)', async () => {
+  const { courseRowDisplay } = await loadDisplay();
+  const withoutBadge = courseRowDisplay({
+    websiteCourseCompletionState: 'incomplete',
+    websiteCourseProgressPercent: 100,
+    websiteRecordedMinutes: 3769,
+  });
+  const withBadge = courseRowDisplay({
+    websiteCourseCompleted: true,
+    websiteCourseCompletionState: 'completed',
+    websiteCourseProgressPercent: 100,
+    websiteRecordedMinutes: 3769,
+  });
+
+  assert.equal(withoutBadge.done, false);
+  assert.equal(withBadge.done, true);
+  assert.equal(withBadge.label, 'Completed · 62h 49m');
+});

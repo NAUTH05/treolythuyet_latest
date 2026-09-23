@@ -19,6 +19,9 @@ const scanner = require('../courseScanner');
 
 const COURSE_URL = 'https://x/slides/course-1';
 const LESSON_URL = `${COURSE_URL}/lesson-4`;
+// Bài kế tiếp trong CÙNG khóa: nếu vòng lặp không dừng ở checkpoint thì bài này
+// sẽ bị mở — đây là bằng chứng "không mở bài kế tiếp".
+const NEXT_LESSON_URL = `${COURSE_URL}/lesson-5`;
 
 // Trạng thái "website" mô phỏng — test điều khiển để tái hiện đúng chuỗi thật.
 const website = {
@@ -32,12 +35,20 @@ const website = {
 let currentPageUrl = 'about:blank';
 let scanCalls = 0;
 let domTimerCalls = 0;
+// Phần trăm từng bài trong khóa. Mặc định: còn bài chưa xong (đúng production).
+let lessonPercents = [40, 0];
 
 scanner.scanCourseDetails = async (page, courseUrl) => {
   scanCalls++;
   // Chỉ trang CHÍNH mới đổi URL hiện tại; trang checkpoint phụ không được làm lệch
   // kiểm tra "đang đứng ở đâu" của vòng lặp.
   if (courseUrl && page && page.__main) currentPageUrl = courseUrl;
+  const allLessons = lessonPercents.map((percentValue, index) => ({
+    title: `Bài ${index + 4}`,
+    url: `${COURSE_URL}/lesson-${index + 4}`,
+    progressPercent: percentValue,
+    isCompleted: percentValue >= 100,
+  }));
   return {
     courseTitle: 'Cấu tạo và sửa chữa thông thường xe - Cát Tường Minh',
     courseCompletionState: website.completionState,
@@ -47,12 +58,10 @@ scanner.scanCourseDetails = async (page, courseUrl) => {
     actualStudiedMinutes: website.recordedMinutes,
     actualStudiedText: website.recordedText,
     totalLessons: 5,
-    allLessons: [
-      { title: 'Bài 4', url: LESSON_URL, progressPercent: website.lessonPercent, isCompleted: false },
-    ],
-    uncompletedLessons: [
-      { title: 'Bài 4', url: LESSON_URL, progressPercent: website.lessonPercent, isCompleted: false },
-    ],
+    allLessons,
+    uncompletedLessons: allLessons
+      .filter(lesson => !lesson.isCompleted)
+      .map(lesson => ({ ...lesson, isCompleted: false })),
   };
 };
 
@@ -103,7 +112,7 @@ test('vòng lặp NORMAL: khóa Completed giữa checkpoint → dừng bài ngay
   website.progressPercent = 97;
   website.recordedMinutes = 737;
   website.recordedText = '12h17m';
-  website.lessonPercent = 40;
+  lessonPercents = [40, 0];
   currentPageUrl = 'about:blank';
   scanCalls = 0;
   domTimerCalls = 0;
@@ -204,7 +213,11 @@ test('vòng lặp NORMAL: khóa Completed giữa checkpoint → dừng bài ngay
   assert.equal(domTimerCalls, domTimerCallsAtStopDecision, 'không được đọc lại DOM timer (heartbeat) sau khi khóa đã Completed');
   assert.equal(harness.events.lessonChecks, 0, 'không được kiểm tra badge hoàn thành bài học');
   assert.equal(harness.events.courseLessonVerifications, 0, 'không được xác minh/gia hạn bài học');
-  assert.deepEqual(harness.events.goto, [LESSON_URL], 'chỉ mở đúng một bài — không mở bài kế tiếp');
+  assert.deepEqual(
+    harness.events.goto,
+    [LESSON_URL],
+    'khóa còn bài 5 chưa xong nhưng KHÔNG được mở bài kế tiếp sau khi khóa đã Completed',
+  );
   assert.equal(waitCount, 2, 'dừng ở checkpoint thứ hai, không treo thêm');
 
   // 5) Trạng thái cuối cùng mà dashboard đọc được.
@@ -215,6 +228,64 @@ test('vòng lặp NORMAL: khóa Completed giữa checkpoint → dừng bài ngay
   assert.equal(progress.websiteCourseProgressPercent, 100);
   assert.equal(progress.websiteRecordedText, '12h49m');
   // Bài 4 vẫn 40% — không hề cản trở việc chốt khóa NORMAL.
-  assert.equal(website.lessonPercent, 40);
+  assert.equal(lessonPercents[0], 40);
   assert.ok(scanCalls >= 3, 'phải quét lại trang khóa học ở mỗi checkpoint');
+});
+
+test('vòng lặp NORMAL: MỌI bài 100% nhưng website CHƯA Completed → KHÔNG đánh dấu hoàn thành', async () => {
+  website.completionState = 'incomplete';
+  website.progressPercent = 100;
+  website.recordedMinutes = 3769;
+  website.recordedText = '62 giờ 49 phút';
+  lessonPercents = [100, 100]; // không còn bài chưa xong
+  currentPageUrl = 'about:blank';
+  scanCalls = 0;
+  domTimerCalls = 0;
+
+  const harness = makeBrowserHarness();
+  const session = new AutoCourseSession(
+    'loop-all-lessons-complete',
+    { name: 'TT17', email: 'tt17@x.vn' },
+    [],
+    { dailyMaxMinutes: 480, refreshInterval: 15 },
+  );
+  session.login = async () => true;
+  const discovery = [{
+    courseUrl: COURSE_URL,
+    title: '[TT17] Pháp Luật Giao thông đường bộ',
+    orderIndex: 0,
+    completed: false,
+    completionState: 'incomplete',
+    progressPercent: 100,
+  }];
+  const applyDiscovery = () => {
+    session.discoveredCourses = discovery.map((c, index) => ({
+      ...c, discoveredAt: '2026-01-01T00:00:00.000Z', source: 'test-discovery', orderIndex: index,
+    }));
+    session.coursesConfig = discovery.map((c, index) => ({
+      courseUrl: c.courseUrl, title: c.title, orderIndex: index, targetHours: 0, targetMinutes: 0,
+    }));
+    session._discoveryValid = true;
+    return session.discoveredCourses;
+  };
+  applyDiscovery();
+  session._discoverCourses = async () => applyDiscovery();
+  session._waitForActiveStudyTime = async () => 60000;
+
+  const logs = [];
+  session.on('log', entry => logs.push(entry.msg));
+
+  try {
+    await session.start();
+  } finally {
+    harness.restore();
+  }
+
+  // Mọi bài 100% KHÔNG phải bằng chứng khóa hoàn thành — quyết định phải theo
+  // trạng thái khóa trên website (vẫn In Progress).
+  assert.equal(session.courseProgress[COURSE_URL].completed, false, 'mọi bài 100% không được tự chốt khóa');
+  assert.equal(session.courseProgress[COURSE_URL].websiteCourseCompleted, false);
+  assert.equal(session.courseProgress[COURSE_URL].websiteCourseCompletionState, 'incomplete');
+  assert.equal(session.courseProgress[COURSE_URL].websiteCourseProgressPercent, 100, 'dashboard vẫn thấy 100% + In Progress');
+  assert.equal(harness.events.goto.length, 0, 'không còn bài để mở nhưng khóa vẫn KHÔNG được coi là xong');
 });

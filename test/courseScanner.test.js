@@ -84,6 +84,21 @@ class FakeNode {
 
   querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
 
+  // Mô phỏng getClientRects() của trình duyệt thật: phần tử nằm trong cây bị ẩn
+  // (`d-none` / `hidden` / `aria-hidden="true"`) KHÔNG có rect → không hiển thị.
+  // Thiếu mô phỏng này, fake DOM coi con của `d-none` là đang hiển thị — khác hẳn
+  // trình duyệt thật và làm test bỏ sót bẫy "widget ẩn".
+  getClientRects() {
+    let node = this;
+    while (node) {
+      if (node.hidden === true) return [];
+      if (String(node.className || '').split(/\s+/).includes('d-none')) return [];
+      if (typeof node.getAttribute === 'function' && node.getAttribute('aria-hidden') === 'true') return [];
+      node = node.parent;
+    }
+    return [{ width: 1, height: 1 }];
+  }
+
   querySelectorAll(sel) {
     const out = [];
     const walk = (node) => {
@@ -493,4 +508,231 @@ test('My Courses incomplete cards do not invent numeric progress', async () => {
   assert.equal(results[0].completed, false);
   assert.equal(results[0].progressPercent, null);
   assert.equal(results[0].state, 'incomplete');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BẤT BIẾN PRODUCTION: CHỈ badge hoàn thành CẤP KHÓA ĐANG HIỂN THỊ mới xác nhận
+// khóa đã hoàn thành. Phần trăm tiến độ là THÔNG TIN, không bao giờ là bằng chứng.
+//
+// Production chứng minh cả hai chiều:
+//   - khóa hiển thị 100% mà KHÔNG có badge  → vẫn In Progress
+//   - khóa có badge trong khi bài vẫn 32%/0% → đã Completed
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Dựng đúng DOM production cấp khóa:
+//   badge:    .o_wslides_channel_completion_completed (ẩn bằng `d-none` khi chưa xong)
+//   progress: .o_wslides_channel_completion_progressbar (ẩn bằng `d-none` khi đã xong)
+function productionCourseDom({
+  badgeVisible = true,
+  badgeAbsent = false,
+  progressVisible = true,
+  percent = 100,
+  lessons = [],
+} = {}) {
+  const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course production' });
+  const children = [];
+
+  if (!badgeAbsent) {
+    children.push(new FakeNode({
+      tagName: 'span',
+      className: 'o_wslides_channel_completion_completed badge rounded-pill text-bg-success py-1 px-2 mx-auto'
+        + (badgeVisible ? '' : ' d-none'),
+      textContent: 'Đã hoàn thành',
+    }));
+  }
+
+  if (percent != null) {
+    const bar = new FakeNode({
+      tagName: 'div',
+      className: 'progress-bar',
+      attrs: {
+        role: 'progressbar',
+        'aria-valuemin': '0',
+        'aria-valuemax': '100',
+        'aria-valuenow': String(percent),
+      },
+      style: { width: percent + '%' },
+    });
+    const progress = new FakeNode({ tagName: 'div', className: 'progress', children: [bar] });
+    const pct = new FakeNode({
+      tagName: 'span',
+      className: 'o_wslides_progress_percentage',
+      textContent: String(percent),
+    });
+    children.push(new FakeNode({
+      tagName: 'div',
+      className: 'o_wslides_channel_completion_progressbar w-100 align-items-center'
+        + (progressVisible ? ' d-flex' : ' d-none'),
+      children: [progress, pct],
+    }));
+  }
+
+  if (lessons.length > 0) {
+    children.push(new FakeNode({
+      tagName: 'ul',
+      className: 'o_wslides_slides_list',
+      children: lessons.map((percentValue, index) => (
+        lessonLink('/slides/slide/l' + (index + 1) + '-10' + index, 'Bài ' + (index + 1), percentValue).li
+      )),
+    }));
+  }
+
+  const sidebar = new FakeNode({ tagName: 'div', className: 'o_wslides_course_sidebar', children });
+  const root = new FakeNode({ tagName: 'div', children: [h1, sidebar] });
+  return makeDocument({ root, h1 });
+}
+
+test('TEST 1 — tiến độ 99%, KHÔNG badge → incomplete 99', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({ badgeVisible: false, percent: 99 })),
+    'https://x/slides/course-99',
+  );
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseProgressPercent, 99);
+});
+
+test('TEST 2 (CRITICAL) — tiến độ 100%, KHÔNG badge → incomplete 100', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({ badgeVisible: false, percent: 100 })),
+    'https://x/slides/course-100',
+  );
+
+  assert.equal(result.courseCompletionState, 'incomplete', '100% KHÔNG được suy ra thành Completed');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseProgressPercent, 100, 'vẫn giữ phần trăm để dashboard hiển thị');
+  assert.equal(result.courseCompletionEvidence.finalState, 'incomplete');
+  assert.equal(result.courseCompletionEvidence.completedBadgeFound, true);
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
+  assert.equal(result.courseCompletionEvidence.progressBarVisible, true);
+  assert.equal(result.courseCompletionEvidence.progressAriaValueNow, '100');
+  assert.equal(result.courseCompletionEvidence.progressText, '100');
+  assert.equal(result.courseCompletionEvidence.resolvedProgressPercent, 100);
+});
+
+test('TEST 3 — badge ẩn (d-none) + thanh tiến độ 100% hiển thị → incomplete 100', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({ badgeVisible: false, progressVisible: true, percent: 100 })),
+    'https://x/slides/course-hidden-badge',
+  );
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseProgressPercent, 100);
+  // Text "Đã hoàn thành" CÓ trong DOM nhưng bị ẩn → không được dùng làm bằng chứng.
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
+  assert.equal(result.courseCompletionEvidence.completedMarkerFound, false);
+  assert.equal(result.courseCompletionEvidence.weakEvidenceBlockedReason, 'visible_course_progress');
+});
+
+test('TEST 4 — badge HIỂN THỊ + thanh tiến độ bị ẩn → completed 100', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({ badgeVisible: true, progressVisible: false, percent: 100 })),
+    'https://x/slides/course-done-badge',
+  );
+
+  assert.equal(result.courseCompletionState, 'completed');
+  assert.equal(result.courseLevelCompleted, true);
+  assert.equal(result.courseProgressPercent, 100);
+  assert.equal(result.courseCompletionSource, 'course_completed_badge_visible');
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, true);
+  assert.equal(result.courseCompletionEvidence.progressBarVisible, false, 'widget tiến độ đã bị ẩn khi khóa xong');
+  assert.equal(result.courseCompletionEvidence.finalState, 'completed');
+});
+
+test('TEST 5 — badge HIỂN THỊ + bài 32%/0% → vẫn completed (bài chưa xong không phủ định badge)', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({
+      badgeVisible: true,
+      progressVisible: false,
+      percent: 100,
+      lessons: [100, 100, 100, 32, 0],
+    })),
+    'https://x/slides/course-mixed-lessons',
+  );
+
+  assert.equal(result.courseCompletionState, 'completed');
+  assert.equal(result.courseLevelCompleted, true);
+  assert.equal(result.uncompletedLessons.length, 2);
+  assert.deepEqual(result.uncompletedLessons.map(l => l.progressPercent), [32, 0]);
+});
+
+test('TEST 6 — MỌI bài 100% nhưng KHÔNG có badge → KHÔNG completed', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({
+      badgeAbsent: true,
+      percent: null,
+      lessons: [100, 100, 100],
+    })),
+    'https://x/slides/course-all-lessons-100',
+  );
+
+  assert.equal(result.courseLevelCompleted, false);
+  assert.notEqual(result.courseCompletionState, 'completed');
+  assert.equal(result.uncompletedLessons.length, 0, 'mọi bài 100% nhưng khóa KHÔNG được coi là xong');
+});
+
+test('TEST 6b — badge ẩn + tiến độ 100% + mọi bài 100% → vẫn incomplete', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({
+      badgeVisible: false,
+      progressVisible: true,
+      percent: 100,
+      lessons: [100, 100, 100],
+    })),
+    'https://x/slides/course-hidden-all-100',
+  );
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseProgressPercent, 100);
+});
+
+test('TEST 7 — tiến độ khóa 100% + bài 48%/57% → KHÔNG completed', async () => {
+  const result = await scanCourseDetails(
+    scannerPage(productionCourseDom({
+      badgeVisible: false,
+      progressVisible: true,
+      percent: 100,
+      lessons: [48, 57, 100, 100],
+    })),
+    'https://x/slides/course-tt17',
+  );
+
+  assert.equal(result.courseCompletionState, 'incomplete');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseProgressPercent, 100);
+  assert.deepEqual(result.uncompletedLessons.map(l => l.progressPercent), [48, 57]);
+});
+
+test('badge production có mặt nhưng ẨN → text "Đã hoàn thành" chung chung KHÔNG được tự nhận completed', async () => {
+  // Không có thanh tiến độ: nếu không chặn, bằng chứng YẾU sẽ tự nhận completed.
+  const h1 = new FakeNode({ tagName: 'h1', textContent: 'Course weak blocked' });
+  const badge = new FakeNode({
+    tagName: 'span',
+    className: 'o_wslides_channel_completion_completed badge d-none',
+    textContent: 'Đã hoàn thành',
+  });
+  const weak = new FakeNode({ tagName: 'div', className: 'text-success', textContent: 'Đã hoàn thành' });
+  const sidebar = new FakeNode({
+    tagName: 'div',
+    className: 'o_wslides_course_sidebar',
+    children: [badge, weak],
+  });
+  const root = new FakeNode({ tagName: 'div', children: [h1, sidebar] });
+
+  const result = await scanCourseDetails(
+    scannerPage(makeDocument({ root, h1 })),
+    'https://x/slides/course-weak-blocked',
+  );
+
+  assert.notEqual(result.courseCompletionState, 'completed');
+  assert.equal(result.courseLevelCompleted, false);
+  assert.equal(result.courseCompletionEvidence.completedBadgeFound, true);
+  assert.equal(result.courseCompletionEvidence.completedBadgeVisible, false);
+  assert.equal(
+    result.courseCompletionEvidence.weakEvidenceBlockedReason,
+    'completed_badge_present_but_hidden',
+  );
 });

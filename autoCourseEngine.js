@@ -2449,12 +2449,18 @@ class AutoCourseSession extends EventEmitter {
         }
 
         if (scanResult.uncompletedLessons.length === 0) {
-          const reachedTarget = courseReachedTarget(targetMinutes, courseStudiedMins, true);
+          // "Mọi bài hiển thị 100%" KHÔNG phải bằng chứng khóa đã hoàn thành — thẩm
+          // quyền là badge cấp khóa trên website (xem courseCompletionDecision).
+          const reachedTarget = courseCompletionDecision({
+            websiteState: AutoCourseSession._courseCompletionStateOf(scanResult),
+            targetMinutes,
+            verifiedMinutes: courseStudiedMins,
+          });
           this.courseProgress[cConfig.courseUrl].completed = reachedTarget;
           if (reachedTarget) {
             this.log(`🎉 Tất cả ${scanResult.totalLessons} bài học trong Khóa [${scanResult.courseTitle}] đều đã hoàn thành${targetMinutes > 0 ? ' và khóa đã đạt mục tiêu thời gian' : ' 100%'}!`, 'success');
           } else {
-            this.log(`⚠️ Các bài trong Khóa [${scanResult.courseTitle}] đang hiển thị 100% nhưng thời gian tích lũy mới ${this._formatMinutes(courseStudiedMins)}/${this._formatMinutes(targetMinutes)} — chưa đánh dấu hoàn thành, sẽ quét lại vào ngày học tiếp theo.`, 'warn');
+            this.log(`⚠️ Các bài trong Khóa [${scanResult.courseTitle}] đang hiển thị 100% nhưng website CHƯA xác nhận khóa hoàn thành — chưa đánh dấu hoàn thành, sẽ quét lại vào ngày học tiếp theo.`, 'warn');
           }
           continue;
         }
@@ -3016,7 +3022,10 @@ class AutoCourseSession extends EventEmitter {
               this.log(`⏳ NORMAL Course ${cIdx + 1}/${this.coursesConfig.length} website status: ${siteState} — sẽ quét lại`, 'warn');
             }
           }
-        } else if (!this._stopped && targetMinutes === 0 && courseReachedTarget(targetMinutes, courseStudiedMins, true)) {
+        } else if (!this._stopped && targetMinutes === 0
+          && this.courseProgress[cConfig.courseUrl]?.websiteCourseCompletionState === 'completed') {
+          // Phiên không còn hoạt động: chỉ chốt hoàn thành theo trạng thái khóa đã
+          // đọc được từ website — KHÔNG suy ra từ "mọi bài đã 100%".
           this.courseProgress[cConfig.courseUrl].completed = true;
         }
       }

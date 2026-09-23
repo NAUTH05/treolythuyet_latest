@@ -451,17 +451,23 @@ async function scanCourseDetails(page, courseUrl) {
         if (best) { weakBadgeNode = best.node; break; }
       }
 
-      // ── Thứ tự ưu tiên (hai trạng thái cấp khóa loại trừ nhau) ──
-      // 1. Badge production VISIBLE            → completed 100%.
-      // 2. Tiến độ cấp khóa visible            → >=100 completed, <100 incomplete.
-      //    % hiển thị luôn thắng bằng chứng hoàn thành YẾU.
-      // 3. Text hoàn thành visible YẾU         → completed (chỉ khi không có %).
+      // ── Thứ tự ưu tiên (BẤT BIẾN PRODUCTION) ──
+      // 1. Badge production `.o_wslides_channel_completion_completed` ĐANG HIỂN THỊ
+      //    → completed 100%. Đây là nguồn CHÂN LÝ DUY NHẤT cho cấp khóa.
+      // 2. Thanh tiến độ cấp khóa ĐANG HIỂN THỊ → incomplete (kể cả 100%).
+      //    Phần trăm là THÔNG TIN, không bao giờ là bằng chứng hoàn thành:
+      //    production có khóa 100% mà KHÔNG có badge (vẫn In Progress).
+      // 3. Text hoàn thành visible YẾU → chỉ dùng cho DOM KHÔNG có widget production.
+      //    Nếu widget production có mặt trong DOM (dù đang ẩn) thì nó là thẩm quyền
+      //    → text chung chung KHÔNG được biến khóa thành Completed.
       // 4. unknown.
       let courseProgressPercent = null;
       let completionSource = null;
       let courseCompletionState = 'unknown';
       let markerSelector = null;
       let matchedLabel = null;
+      // Lý do bằng chứng YẾU bị chặn (chỉ để chẩn đoán — không đổi kết luận).
+      let weakEvidenceBlockedReason = null;
 
       if (visibleCompletedBadge) {
         courseCompletionState = 'completed';
@@ -472,13 +478,20 @@ async function scanCourseDetails(page, courseUrl) {
       } else if (explicitProgress) {
         courseProgressPercent = explicitProgress.percent;
         completionSource = explicitProgress.source;
-        courseCompletionState = explicitProgress.percent >= 100 ? 'completed' : 'incomplete';
+        // KHÔNG suy ra completed từ percent (kể cả 100): badge vắng/ẩn nghĩa là
+        // khóa CHƯA hoàn thành.
+        courseCompletionState = 'incomplete';
+        weakEvidenceBlockedReason = 'visible_course_progress';
       } else if (weakBadgeNode) {
-        courseCompletionState = 'completed';
-        courseProgressPercent = 100;
-        completionSource = 'course_sidebar_completed_badge';
-        markerSelector = describeElement(weakBadgeNode);
-        matchedLabel = String(weakBadgeNode.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+        if (completedBadgeFound) {
+          weakEvidenceBlockedReason = 'completed_badge_present_but_hidden';
+        } else {
+          courseCompletionState = 'completed';
+          courseProgressPercent = 100;
+          completionSource = 'course_sidebar_completed_badge';
+          markerSelector = describeElement(weakBadgeNode);
+          matchedLabel = String(weakBadgeNode.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+        }
       }
 
       const completedMarkerFound = courseCompletionState === 'completed';
@@ -496,6 +509,9 @@ async function scanCourseDetails(page, courseUrl) {
         completedMarkerFound,
         markerSelector,
         matchedLabel,
+        // Vì sao bằng chứng text YẾU bị chặn (visible_course_progress /
+        // completed_badge_present_but_hidden) — null khi không có bằng chứng yếu.
+        weakEvidenceBlockedReason,
         progressCandidates: progressCandidateEls.slice(0, 8).map(el => ({
           selector: describeElement(el),
           dataCourseProgress: el.getAttribute('data-course-progress'),
